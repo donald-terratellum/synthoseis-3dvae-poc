@@ -1,0 +1,13 @@
+[project]
+name = "synthoseis-3dvae-poc"
+version = "0.1.0"
+description = "Proof-of-concept 3D VAE on synthetic seismic patches"
+authors = ["Donald P. Griffith <donald@example.invalid>"]
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+dev = ["pytest", "flake8"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
