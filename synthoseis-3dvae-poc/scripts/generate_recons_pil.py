@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Generate reconstructions from a saved VAE checkpoint and create an HTML preview.
-
+"""Generate reconstructions from a saved VAE checkpoint and create an HTML preview using PIL.
 Saves reconstructions and inputs as a zarr at --out and writes an HTML file with PNG previews.
-Uses PIL to avoid matplotlib dependency.
 """
 from pathlib import Path
 import argparse
@@ -10,22 +8,16 @@ import zarr
 import numpy as np
 import torch
 from src.model import VAE3D
-try:
-    from PIL import Image
-except Exception:
-    Image = None
+from PIL import Image
 
 
 def save_png_comparison(inp, recon, outpath):
-    # inp, recon: numpy arrays shape (D,H,W) or (32,32,32)
-    # take central Z slice
     k = inp.shape[2] // 2
     inp_slice = inp[:, :, k]
     recon_slice = recon[:, :, k]
 
     def to_png(arr):
         a = np.asarray(arr, dtype=np.float32)
-        # normalize to 0-255
         lo, hi = np.nanmin(a), np.nanmax(a)
         if hi - lo < 1e-6:
             out = np.zeros(a.shape, dtype=np.uint8)
@@ -36,26 +28,20 @@ def save_png_comparison(inp, recon, outpath):
     inp_img = to_png(inp_slice)
     recon_img = to_png(recon_slice)
 
-    # stack side-by-side
     h, w = inp_img.shape
     out_img = np.zeros((h, w*2), dtype=np.uint8)
     out_img[:, :w] = inp_img
     out_img[:, w:] = recon_img
 
-    if Image is None:
-        # fallback: write raw bytes using numpy (not ideal)
-        import imageio.v2 as imageio
-        imageio.imwrite(outpath, out_img)
-    else:
-        Image.fromarray(out_img).save(outpath)
+    Image.fromarray(out_img).save(outpath)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--data', required=True, help='input patches zarr')
+    p.add_argument('--data', required=True)
     p.add_argument('--checkpoint', required=True)
-    p.add_argument('--out', required=True, help='output zarr path')
-    p.add_argument('--html', required=True, help='output html preview path')
+    p.add_argument('--out', required=True)
+    p.add_argument('--html', required=True)
     p.add_argument('--n_samples', type=int, default=8)
     args = p.parse_args()
 
@@ -89,8 +75,21 @@ def main():
         inp = arr.astype('f4')
         tensor = torch.from_numpy(inp[np.newaxis, np.newaxis, ...])
         with torch.no_grad():
-            recon, mu, logvar = model(tensor)
+            out = model(tensor)
+            # model may return (recon, mu, logvar) or just recon
+            if isinstance(out, (tuple, list)):
+                recon = out[0]
+            else:
+                recon = out
             recon_np = recon.squeeze().cpu().numpy()
+            # if model output is smaller due to downsampling, upsample to input size
+            if recon_np.shape != inp.shape:
+                import torch.nn.functional as F
+                rt = torch.from_numpy(recon_np).unsqueeze(0).unsqueeze(0).float()
+                # target size: (D, H, W) where inp.shape == (H, W, D)
+                target_size = (inp.shape[2], inp.shape[0], inp.shape[1])
+                rt_up = F.interpolate(rt, size=target_size, mode='trilinear', align_corners=False)
+                recon_np = rt_up.squeeze().cpu().numpy()
         dst['inputs'][i] = inp
         dst['recons'][i] = recon_np
         imgpath = imgdir / f'recon_{i:03d}.png'
