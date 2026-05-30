@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 import zarr
 import numpy as np
 from src.model import VAE3D
+import torch.nn.functional as F
 
 
 class ZarrPatchDataset(Dataset):
@@ -38,7 +39,11 @@ def train(args):
         for i, batch in enumerate(dl):
             batch = batch.to(device)
             recon, mu, logvar = model(batch)
+            # ensure reconstruction matches input spatial size (decoder may use different upsampling)
+            if recon.shape[2:] != batch.shape[2:]:
+                recon = F.interpolate(recon, size=batch.shape[2:], mode='trilinear', align_corners=False)
             rec_loss = torch.nn.functional.mse_loss(recon, batch)
+            # KLD normalized per-element
             kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch.numel()
             loss = rec_loss + 1e-4 * kld
             opt.zero_grad()

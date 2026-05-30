@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: synthoseis-3dvae-poc
+Version: 0.1.0
+Summary: Proof-of-concept 3D VAE on synthetic seismic patches
+Author-email: "Donald P. Griffith" <donald@example.invalid>
+License: MIT
+License-File: LICENSE
+Requires-Dist: torch
+Requires-Dist: numpy
+Requires-Dist: zarr
+Requires-Dist: xarray
+Requires-Dist: tqdm
+Requires-Dist: tensorboard
+Requires-Dist: omegaconf
+Requires-Dist: pytorch-lightning
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: flake8; extra == "dev"
+Dynamic: license-file

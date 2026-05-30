@@ -2,8 +2,24 @@
 name = "synthoseis-3dvae-poc"
 version = "0.1.0"
 description = "Proof-of-concept 3D VAE on synthetic seismic patches"
-authors = ["Donald P. Griffith <donald@example.invalid>"]
 license = {text = "MIT"}
+
+# Authors must be objects per PEP 621
+authors = [
+  { name = "Donald P. Griffith", email = "donald@example.invalid" }
+]
+
+# Runtime dependencies (kept in sync with requirements.txt)
+dependencies = [
+  "torch",
+  "numpy",
+  "zarr",
+  "xarray",
+  "tqdm",
+  "tensorboard",
+  "omegaconf",
+  "pytorch-lightning"
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "flake8"]

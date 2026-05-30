@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+src/model.py
+src/synthoseis_3dvae_poc.egg-info/PKG-INFO
+src/synthoseis_3dvae_poc.egg-info/SOURCES.txt
+src/synthoseis_3dvae_poc.egg-info/dependency_links.txt
+src/synthoseis_3dvae_poc.egg-info/requires.txt
+src/synthoseis_3dvae_poc.egg-info/top_level.txt

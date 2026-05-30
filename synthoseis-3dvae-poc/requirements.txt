@@ -1,0 +1,9 @@
+torch
+numpy
+zarr
+xarray
+tqdm
+tensorboard
+omegaconf
+pytorch-lightning
+matplotlib

@@ -1,0 +1,12 @@
+torch
+numpy
+zarr
+xarray
+tqdm
+tensorboard
+omegaconf
+pytorch-lightning
+
+[dev]
+pytest
+flake8
