@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Coding Session Summary</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f4ef;
+        <li>Archived stale duplicate <code>model.py</code> and related duplicate script files into <code>pugatory/</code> to preserve history while removing them from the active tree.</li>
+        <li>Removed generated <code>data/</code> and <code>checkpoints/</code> outputs from version control and added ignore rules so they stay out of future commits.</li>
+      --text: #1f2937;
+      --muted: #5b6472;
+      --accent: #0f766e;
+      --accent-2: #7c3aed;
+      --border: #dde3ea;
+    }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #f6f4ef 0%, #eef2ff 100%);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+    .hero {
+      background: linear-gradient(135deg, rgba(15,118,110,0.08), rgba(124,58,237,0.08));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: 0 18px 50px rgba(31, 41, 55, 0.08);
+      margin-bottom: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2rem;
+    }
+    .meta {
+      color: var(--muted);
+      margin: 0;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 22px 24px;
+      margin: 18px 0;
+      box-shadow: 0 10px 24px rgba(31, 41, 55, 0.04);
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 1.15rem;
+      color: #111827;
+    }
+    ul {
+      margin: 0;
+      padding-left: 22px;
+    }
+    li + li { margin-top: 8px; }
+    code {
+      background: #eef2ff;
+      border: 1px solid #dbe3ff;
+      border-radius: 6px;
+      padding: 0 6px;
+      font-size: 0.95em;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 14px;
+    }
+    .chip {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(15,118,110,0.1);
+      color: var(--accent);
+      font-weight: 600;
+      margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="hero">
+      <div class="chip">2026-05-31</div>
+      <div class="chip">GitHub Copilot / GPT-5.4 mini</div>
+      <h1>Agentic Coding Session Summary</h1>
+      <p class="meta">Training pipeline updates, validation flow, cleanup of stale duplicates, and documentation of a successful run.</p>
+    </div>
+
+    <section>
+      <h2>Context and Goals</h2>
+      <ul>
+        <li>Improve the 3D VAE seismic patch training pipeline.</li>
+        <li>Add dataset-level normalization and make it the default.</li>
+        <li>Add simple augmentations, validation loss reporting, checkpoint resume support, and a documented successful workflow.</li>
+        <li>Clean up stale duplicate source trees and generated artifacts without disturbing the runtime-active source files.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Was Done</h2>
+      <ul>
+        <li>Added dataset-level scaling and per-volume stats logging in <code>scripts/sample_patches.py</code>.</li>
+        <li>Added on-the-fly augmentations and validation-only extrema input handling in <code>train.py</code>.</li>
+        <li>Added <code>--resume</code> checkpoint loading support in <code>train.py</code>.</li>
+        <li>Added validation loss reporting from <code>data/validation.zarr</code> at the end of each epoch.</li>
+        <li>Updated <code>README.md</code> with a working sampling and training command sequence.</li>
+        <li>Archived unused duplicate files under <code>pugatory/</code> and removed build / cache artifacts from the active tree.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How It Was Done</h2>
+      <ul>
+        <li>Resolved the runtime-active model import path by checking what <code>uv run python train.py</code> imports.</li>
+        <li>Used targeted edits with <code>apply_patch</code> for source changes and file moves.</li>
+        <li>Validated the CLI and file edits with <code>get_errors</code> and <code>uv run python train.py --help</code>.</li>
+        <li>Separated validation into its own function for readability and ensured it runs inference-only.</li>
+        <li>Kept summary and cleanup work scoped away from generated dataset churn.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>When It Was Done and By Whom</h2>
+      <div class="grid">
+        <div>
+          <strong>Date</strong><br />
+          2026-05-31
+        </div>
+        <div>
+          <strong>Authoring agent</strong><br />
+          GitHub Copilot (GPT-5.4 mini)
+        </div>
+        <div>
+          <strong>Environment</strong><br />
+          VS Code workspace on macOS
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Basic Info</h2>
+      <ul>
+        <li>Relevant commits: <code>32411b4</code>, <code>b1b4494</code>, <code>9bc131c</code>, <code>4a46544</code>, <code>4342e82</code>.</li>
+        <li>Files involved: <code>train.py</code>, <code>src/model.py</code>, <code>scripts/sample_patches.py</code>, <code>README.md</code>, and the archived duplicates under <code>pugatory/</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Next and Future Follow-Up Work</h2>
+      <ul>
+        <li>Consider best-checkpoint saving based on validation loss.</li>
+        <li>Consider adding reproducibility controls such as fixed random seeds.</li>
+        <li>Consider documenting which generated outputs in <code>data/</code> and <code>checkpoints/</code> should remain untracked.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

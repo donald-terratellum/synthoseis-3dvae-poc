@@ -1,0 +1,12 @@
+# Generated training data and outputs
+data/
+checkpoints/
+checkpoints_retrain/
+checkpoints_smoke/
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+
+# macOS filesystem metadata
+.DS_Store

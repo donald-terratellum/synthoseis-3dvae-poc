@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Conv3dBlock(nn.Module):
@@ -15,17 +14,22 @@ class Conv3dBlock(nn.Module):
 
 
 class Encoder(nn.Module):
+    """
+    Encoder downsamples a 32^3 input to a small spatial grid (4^3) then maps to latent.
+    """
     def __init__(self, in_ch=1, base_ch=16, latent_dim=128):
         super().__init__()
+        # Downsample by factor 2 three times: 32 -> 16 -> 8 -> 4
         self.enc = nn.Sequential(
-            Conv3dBlock(in_ch, base_ch),
-            Conv3dBlock(base_ch, base_ch*2, s=2),
-            Conv3dBlock(base_ch*2, base_ch*2),
-            Conv3dBlock(base_ch*2, base_ch*4, s=2),
-            Conv3dBlock(base_ch*4, base_ch*4, s=2),
+            Conv3dBlock(in_ch, base_ch, s=1),             # 32
+            Conv3dBlock(base_ch, base_ch*2, s=2),         # 16
+            Conv3dBlock(base_ch*2, base_ch*4, s=2),       # 8
+            Conv3dBlock(base_ch*4, base_ch*4, s=2),       # 4
         )
-        self.fc_mu = nn.Linear(base_ch*4*4*4*4, latent_dim)
-        self.fc_logvar = nn.Linear(base_ch*4*4*4*4, latent_dim)
+        # feature map is (base_ch*4, 4,4,4)
+        feat_size = base_ch * 4 * 4 * 4
+        self.fc_mu = nn.Linear(feat_size, latent_dim)
+        self.fc_logvar = nn.Linear(feat_size, latent_dim)
 
     def forward(self, x):
         x = self.enc(x)
@@ -36,17 +40,21 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """
+    Decoder maps latent to a 4^3 feature map then upsamples back to 32^3.
+    """
     def __init__(self, out_ch=1, base_ch=16, latent_dim=128):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, base_ch*4*4*4*4)
+        feat_size = base_ch * 4 * 4 * 4
+        self.fc = nn.Linear(latent_dim, feat_size)
         self.dec = nn.Sequential(
-            nn.Unflatten(1, (base_ch*4, 4, 4, 4)),
+            nn.Unflatten(1, (base_ch*4, 4, 4, 4)),        # 4
             nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
-            Conv3dBlock(base_ch*4, base_ch*2),
+            Conv3dBlock(base_ch*4, base_ch*2),            # 8
             nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
-            Conv3dBlock(base_ch*2, base_ch),
+            Conv3dBlock(base_ch*2, base_ch),              # 16
             nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
-            Conv3dBlock(base_ch, base_ch),
+            Conv3dBlock(base_ch, base_ch),                # 32
             nn.Conv3d(base_ch, out_ch, kernel_size=3, padding=1),
         )
 
