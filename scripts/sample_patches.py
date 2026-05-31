@@ -211,6 +211,17 @@ def apply_scaling(patch, scaling_mode, scaling_mean, scaling_std):
     raise ValueError(f"Unsupported scaling mode: {scaling_mode}")
 
 
+def has_temp_folder_sibling(volume_zarr_path):
+    # Exclude seismic folders when a temp_folder variant exists next to them.
+    volume_dir = volume_zarr_path.parent
+    volume_name = volume_dir.name
+    if not volume_name.startswith("seismic__"):
+        return False
+    temp_name = volume_name.replace("seismic__", "temp_folder__", 1)
+    temp_dir = volume_dir.with_name(temp_name)
+    return temp_dir.exists() and temp_dir.is_dir()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True, help="directory that contains model_data.zarr folders")
@@ -258,7 +269,7 @@ def main():
         dst.create_array("patches", shape=(args.n_patches, args.patch_size, args.patch_size, args.patch_size), dtype="f4", chunks=(1, args.patch_size, args.patch_size, args.patch_size))
 
     written = 0
-    vols = list(src.rglob("model_data.zarr"))
+    vols = [vol for vol in src.rglob("model_data.zarr") if not has_temp_folder_sibling(vol)]
     if not vols:
         print("No model_data.zarr volumes found under", src)
         return

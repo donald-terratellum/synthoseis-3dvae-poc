@@ -3,6 +3,7 @@ data/
 checkpoints/
 checkpoints_retrain/
 checkpoints_smoke/
+pugatory/
 
 # Python bytecode and caches
 __pycache__/

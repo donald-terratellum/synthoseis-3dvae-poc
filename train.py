@@ -2,6 +2,8 @@ import argparse
 from pathlib import Path
 import itertools
 import math
+import csv
+from dataclasses import dataclass
 import torch
 from torch.utils.data import DataLoader, Dataset
 import zarr
@@ -112,7 +114,7 @@ class ZarrPatchDataset(Dataset):
         if self.augment:
             x, y = self._apply_pair_augmentations(x, y)
             x = self._apply_input_trace_dropout(x)
-        elif self.extrema_only:
+        if self.extrema_only:
             x = self._keep_trace_extrema_only(x)
 
         x = np.ascontiguousarray(x[np.newaxis, ...])
@@ -145,7 +147,14 @@ def resolve_device(requested_device: str) -> torch.device:
     raise ValueError("Unsupported device. Use one of: 'auto', 'cuda', 'mps', 'cpu'.")
 
 
-def compute_average_loss(model, dataloader, device, steps):
+def compute_vae_losses(recon, targets, mu, logvar, kl_weight):
+    rec_loss = torch.nn.functional.mse_loss(recon, targets)
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / targets.numel()
+    loss = rec_loss + kl_weight * kld
+    return loss, rec_loss, kld
+
+
+def compute_average_loss(model, dataloader, device, steps, kl_weight):
     model.eval()
     total_loss = 0.0
     batch_iter = iter(dataloader) if steps is None else itertools.cycle(dataloader)
@@ -155,11 +164,71 @@ def compute_average_loss(model, dataloader, device, steps):
             inputs = inputs.to(device)
             targets = targets.to(device)
             recon, mu, logvar = model(inputs)
-            rec_loss = torch.nn.functional.mse_loss(recon, targets)
-            kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / inputs.numel()
-            loss = rec_loss + 1e-4 * kld
+            loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
             total_loss += loss.item()
     return total_loss / steps
+
+
+def get_kl_weight(epoch_idx, args):
+    if args.kl_schedule == 'fixed':
+        return float(args.kl_fixed)
+
+    # Linear warmup from kl_start to kl_end.
+    warmup_epochs = max(1, int(args.kl_warmup_epochs))
+    progress = min(1.0, float(epoch_idx + 1) / float(warmup_epochs))
+    return float(args.kl_start + progress * (args.kl_end - args.kl_start))
+
+
+def build_optimizer(model, args):
+    return torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+
+def build_scheduler(optimizer, args):
+    if args.lr_scheduler == 'none':
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=args.lr_scheduler_factor,
+        patience=args.lr_scheduler_patience,
+        min_lr=args.lr_scheduler_min_lr,
+    )
+
+
+def train_one_epoch(model, dataloader, device, optimizer, steps_per_epoch, grad_clip, kl_weight):
+    model.train()
+    total_loss = 0.0
+    batch_iter = iter(dataloader) if steps_per_epoch is None else itertools.cycle(dataloader)
+
+    for _ in range(steps_per_epoch):
+        inputs, targets = next(batch_iter)
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        recon, mu, logvar = model(inputs)
+        loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        optimizer.step()
+        total_loss += loss.item()
+
+    return total_loss / steps_per_epoch
+
+
+@dataclass
+class EarlyStoppingState:
+    best_val_loss: float
+    epochs_without_improvement: int
+
+
+def update_early_stopping(state, val_loss, min_delta):
+    improved = val_loss < (state.best_val_loss - min_delta)
+    if improved:
+        state.best_val_loss = val_loss
+        state.epochs_without_improvement = 0
+    else:
+        state.epochs_without_improvement += 1
+    return improved
 
 
 def build_dataset(args, data_path, augment=False):
@@ -174,7 +243,7 @@ def build_dataset(args, data_path, augment=False):
         flip_y_prob=args.flip_y_prob,
         zero_cluster_min=args.zero_cluster_min,
         zero_cluster_max=args.zero_cluster_max,
-        extrema_only=False,
+        extrema_only=True,
     )
 
 
@@ -190,11 +259,11 @@ def validate(model, args, device, train_steps_per_epoch):
         flip_y_prob=0.0,
         zero_cluster_min=0,
         zero_cluster_max=0,
-        extrema_only=True,
+        extrema_only=args.validation_extrema_only,
     )
     validation_dl = DataLoader(validation_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
     validation_steps = max(1, int(math.ceil(0.2 * train_steps_per_epoch)))
-    return compute_average_loss(model, validation_dl, device, validation_steps)
+    return compute_average_loss(model, validation_dl, device, validation_steps, args.current_kl_weight)
 
 
 def train(args):
@@ -231,38 +300,97 @@ def train(args):
         f"flip_y_prob={args.flip_y_prob}",
         f"zero_cluster_range=[{args.zero_cluster_min},{args.zero_cluster_max}]",
     )
+    print("Train extrema-only input=True")
+    print(f"Validation extrema-only input={args.validation_extrema_only}")
     model.to(device)
 
     if args.learning_rate <= 0:
         raise ValueError('--learning_rate must be positive.')
     if args.grad_clip <= 0:
         raise ValueError('--grad_clip must be positive.')
+    if args.weight_decay < 0:
+        raise ValueError('--weight_decay must be non-negative.')
+    if args.early_stopping_patience <= 0:
+        raise ValueError('--early_stopping_patience must be positive.')
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    opt = build_optimizer(model, args)
+    scheduler = build_scheduler(opt, args)
 
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        batch_iter = iter(dl) if args.number_batches is None else itertools.cycle(dl)
-        for _ in range(steps_per_epoch):
-            inputs, targets = next(batch_iter)
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            recon, mu, logvar = model(inputs)
-            rec_loss = torch.nn.functional.mse_loss(recon, targets)
-            # KLD normalized per-element
-            kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / inputs.numel()
-            loss = rec_loss + 1e-4 * kld
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-            opt.step()
-            total_loss += loss.item()
+    early_stopping = EarlyStoppingState(best_val_loss=float('inf'), epochs_without_improvement=0)
+    best_ckpt_path = Path(args.out_dir) / args.best_checkpoint_name
 
-        train_loss = total_loss / steps_per_epoch
-        val_loss = validate(model, args, device, steps_per_epoch)
-        print(f"Epoch {epoch+1}/{args.epochs} loss={train_loss:.6f} val_loss={val_loss:.6f}")
-        torch.save(model.state_dict(), Path(args.out_dir)/f"vae_epoch{epoch+1}.pt")
+    metrics_csv_path = Path(args.out_dir) / 'training_metrics.csv'
+    csv_exists = metrics_csv_path.exists()
+    with metrics_csv_path.open('a', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        if not csv_exists:
+            writer.writerow([
+                'epoch',
+                'examples_this_epoch',
+                'cumulative_examples',
+                'train_loss',
+                'val_loss',
+                'kl_weight',
+                'learning_rate',
+                'best_model',
+            ])
+
+        for epoch in range(args.epochs):
+            kl_weight = get_kl_weight(epoch, args)
+            args.current_kl_weight = kl_weight
+
+            train_loss = train_one_epoch(
+                model,
+                dl,
+                device,
+                opt,
+                steps_per_epoch,
+                args.grad_clip,
+                kl_weight,
+            )
+            val_loss = validate(model, args, device, steps_per_epoch)
+            examples_this_epoch = samples_per_epoch
+            cumulative_examples = (epoch + 1) * samples_per_epoch
+
+            if scheduler is not None:
+                scheduler.step(val_loss)
+
+            improved = update_early_stopping(early_stopping, val_loss, args.early_stopping_min_delta)
+            if improved:
+                torch.save(model.state_dict(), best_ckpt_path)
+
+            if args.save_epoch_checkpoints:
+                torch.save(model.state_dict(), Path(args.out_dir)/f"vae_epoch{epoch+1}.pt")
+
+            current_lr = opt.param_groups[0]['lr']
+
+            writer.writerow([
+                epoch + 1,
+                examples_this_epoch,
+                cumulative_examples,
+                f"{train_loss:.6f}",
+                f"{val_loss:.6f}",
+                f"{kl_weight:.6f}",
+                f"{current_lr:.8f}",
+                'best' if improved else '',
+            ])
+            csv_file.flush()
+
+            print(
+                f"Epoch {epoch+1}/{args.epochs} "
+                f"loss={train_loss:.6f} val_loss={val_loss:.6f} "
+                f"kl_weight={kl_weight:.6f} lr={current_lr:.2e} "
+                f"best_val={early_stopping.best_val_loss:.6f}"
+            )
+
+            if early_stopping.epochs_without_improvement >= args.early_stopping_patience:
+                print(
+                    f"Early stopping triggered after epoch {epoch+1} "
+                    f"(no val improvement for {early_stopping.epochs_without_improvement} epochs)."
+                )
+                break
+
+    print(f"Best checkpoint: {best_ckpt_path} (best_val_loss={early_stopping.best_val_loss:.6f})")
 
 
 if __name__ == '__main__':
@@ -271,6 +399,7 @@ if __name__ == '__main__':
     p.add_argument('--batch_size', '--examples_per_batch', dest='batch_size', type=int, default=100)
     p.add_argument('--number_batches', type=int, default=None, help='Number of batches per epoch. If omitted, uses full dataloader length.')
     p.add_argument('--learning_rate', '--lr', dest='learning_rate', type=float, default=1e-4)
+    p.add_argument('--weight_decay', type=float, default=1e-4)
     p.add_argument('--grad_clip', type=float, default=2.0)
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--device', type=str, default='auto')
@@ -285,6 +414,24 @@ if __name__ == '__main__':
     p.add_argument('--zero_cluster_max', type=int, default=12)
     p.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint to resume training from.')
     p.add_argument('--validation_data', type=str, default='data/validation.zarr', help='Path to validation zarr patches.')
+    p.add_argument('--validation_extrema_only', dest='validation_extrema_only', action='store_true', help='Use extrema-only input transform for validation data (default).')
+    p.add_argument('--no_validation_extrema_only', dest='validation_extrema_only', action='store_false', help='Disable extrema-only input transform for validation data.')
+    p.set_defaults(validation_extrema_only=True)
+    p.add_argument('--kl_schedule', type=str, default='warmup', choices=['warmup', 'fixed'])
+    p.add_argument('--kl_start', type=float, default=0.0)
+    p.add_argument('--kl_end', type=float, default=1e-3)
+    p.add_argument('--kl_warmup_epochs', type=int, default=15)
+    p.add_argument('--kl_fixed', type=float, default=1e-3)
+    p.add_argument('--lr_scheduler', type=str, default='plateau', choices=['none', 'plateau'])
+    p.add_argument('--lr_scheduler_patience', type=int, default=3)
+    p.add_argument('--lr_scheduler_factor', type=float, default=0.5)
+    p.add_argument('--lr_scheduler_min_lr', type=float, default=1e-6)
+    p.add_argument('--early_stopping_patience', type=int, default=8)
+    p.add_argument('--early_stopping_min_delta', type=float, default=0.0)
+    p.add_argument('--best_checkpoint_name', type=str, default='vae_best.pt')
+    p.add_argument('--save_epoch_checkpoints', dest='save_epoch_checkpoints', action='store_true', help='Save per-epoch checkpoints in addition to best checkpoint.')
+    p.add_argument('--no_save_epoch_checkpoints', dest='save_epoch_checkpoints', action='store_false', help='Disable per-epoch checkpoint saving and keep only best checkpoint.')
+    p.set_defaults(save_epoch_checkpoints=True)
     p.add_argument('--out_dir', type=str, default='checkpoints')
     args = p.parse_args()
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)

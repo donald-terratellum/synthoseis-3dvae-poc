@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Session Summary - 2026-05-31</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; line-height: 1.5; color: #1f2937; }
+    h1, h2 { color: #111827; }
+    section { margin-bottom: 20px; }
+    ul { margin-top: 8px; }
+    code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Agentic Coding Session Summary</h1>
+
+  <section>
+    <h2>Context and Goals</h2>
+    <ul>
+      <li>Continue hardening training behavior for the 3D VAE pipeline.</li>
+      <li>Improve stability and comparability of training/validation behavior.</li>
+      <li>Add practical controls used in standard deep learning workflows while keeping the training loop readable.</li>
+      <li>Document and package the resulting changes for reproducible usage.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>What Was Done</h2>
+    <ul>
+      <li>Updated training to support/extensibly control validation-task behavior with extrema-only input defaults.</li>
+      <li>Added training metrics CSV enrichment with per-epoch KL, learning rate, and best-epoch marker.</li>
+      <li>Implemented optimization upgrades: AdamW + weight decay, KL scheduling, ReduceLROnPlateau, best-checkpoint + early stopping.</li>
+      <li>Refactored into helper functions to keep the epoch loop concise.</li>
+      <li>Updated README with concise knob docs and a recommended stable command.</li>
+      <li>Added sampler-side folder filtering for temp-folder sibling exclusion.</li>
+      <li>Curated training zarr composition (rename + combine).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>How It Was Done</h2>
+    <ul>
+      <li>Inspected active scripts and applied targeted edits.</li>
+      <li>Added helper functions for losses, schedules, optimizer/scheduler setup, epoch training, and early stopping state updates.</li>
+      <li>Validated with static diagnostics and CLI help checks.</li>
+      <li>Verified zarr merge outcomes via runtime shape checks.</li>
+      <li>Kept generated artifacts out of version control via ignore/index cleanup.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>When It Was Done and By Whom</h2>
+    <ul>
+      <li>Date: 2026-05-31</li>
+      <li>Author: GitHub Copilot</li>
+      <li>Environment: VS Code workspace on macOS</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Basic Info</h2>
+    <h3>Relevant Commits</h3>
+    <ul>
+      <li><code>776bb77</code> - Add session summary and ignore generated outputs</li>
+      <li><code>32411b4</code> - Document successful patch sampling and training commands</li>
+      <li><code>b1b4494</code> - Add dataset-scale normalization defaults and per-volume stats logging</li>
+    </ul>
+    <h3>Files Involved</h3>
+    <ul>
+      <li><code>.gitignore</code></li>
+      <li><code>README.md</code></li>
+      <li><code>train.py</code></li>
+      <li><code>scripts/sample_patches.py</code></li>
+      <li><code>docs/sessions/2026-05-31-vae-training-stability-upgrades.md</code></li>
+      <li><code>docs/sessions/2026-05-31-vae-training-stability-upgrades.html</code></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Next and Future Follow-Up Work Suggestions</h2>
+    <ul>
+      <li>Add resume-aware cumulative-example accounting in CSV.</li>
+      <li>Add best-checkpoint metadata sidecar (epoch, best val loss, lr, kl weight).</li>
+      <li>Add README examples for best-only checkpoint mode and fixed-KL comparisons.</li>
+      <li>Add deterministic seeding controls and include them in run logs.</li>
+      <li>Add a plotting helper for <code>training_metrics.csv</code>.</li>
+    </ul>
+  </section>
+</body>
+</html>
