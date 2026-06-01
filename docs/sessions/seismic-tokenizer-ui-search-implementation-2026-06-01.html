@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Seismic Tokenizer UI + Search Implementation Session (2026-06-01)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem auto; max-width: 980px; line-height: 1.5; color: #111; }
+    h1, h2 { line-height: 1.25; }
+    code { background: #f5f5f5; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    ul, ol { margin-top: 0.25rem; }
+    .meta { color: #444; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <h1>Seismic Tokenizer UI + Search Implementation Session (2026-06-01)</h1>
+
+  <h2>Context and Goals</h2>
+  <ul>
+    <li>Implement the seismic tokenizer desktop application plan using PySide6 + PyVista.</li>
+    <li>Deliver a responsive UI with background search execution, deterministic preprocessing, and cosine-similarity overlay rendering.</li>
+    <li>Improve visualization fidelity and usability: depth-down axis behavior, slider commit semantics, overlay scaling, and interactive point selection.</li>
+    <li>Build and validate per-phase test coverage as implementation progressed.</li>
+  </ul>
+
+  <h2>What Was Done</h2>
+  <ul>
+    <li>Added tokenizer app architecture and CLI entrypoints (<code>build-token</code>, <code>search-volume</code>, <code>ui</code>).</li>
+    <li>Implemented core modules for config, events, preprocessing, I/O/padding, model latent adapters, search engine, batching, worker jobs, and metrics.</li>
+    <li>Implemented PySide6 main window/controller/state and PyVista-based slice viewer.</li>
+    <li>Added overlay rendering enhancements: symmetric zero-centered similarity scaling, <code>bwr</code> colormap, percentile range, clip masking, and duplicate colorbar cleanup.</li>
+    <li>Added UX and interaction improvements: labeled sliders with readouts, release-commit sliders, keyboard vertical exaggeration controls, camera persistence, and in-viewer point selection mode.</li>
+    <li>Added and updated tokenizer-focused test coverage, including overlap-add Hann regression checks and UI smoke tests for new interactions.</li>
+    <li>Added/updated user and architecture documentation for tokenizer and training components.</li>
+  </ul>
+
+  <h2>How It Was Done</h2>
+  <ul>
+    <li>Implemented modular code in <code>src/tokenizer/*</code> and connected UI/controller/core event flow.</li>
+    <li>Used process-based background execution (<code>spawn</code>) for non-blocking search and progress signaling.</li>
+    <li>Refined search accumulation behavior and validated overlap-add windowing via regression tests.</li>
+    <li>Iteratively fixed rendering and interaction behavior with targeted changes and repeated <code>unittest</code> runs.</li>
+    <li>Updated docs to reflect architecture, operational commands, rationale, and future work.</li>
+  </ul>
+
+  <h2>When It Was Done and By Whom</h2>
+  <p class="meta">Date: 2026-06-01 (local workspace session).</p>
+  <p class="meta">Requested by: Donald.</p>
+  <p class="meta">Implemented by: GitHub Copilot (GPT-5.3-Codex), with user-directed iterations and validation checkpoints.</p>
+
+  <h2>Basic Info (Relevant Commits, Files Involved)</h2>
+  <ul>
+    <li>Branch: <code>feat/seismic-tokenizer-app</code>.</li>
+    <li>Scope includes core tokenizer implementation, UI/viewer integration, tests, and docs.</li>
+    <li>Representative files:
+      <ul>
+        <li><code>scripts/tokenize.py</code></li>
+        <li><code>src/tokenizer/config/defaults.py</code></li>
+        <li><code>src/tokenizer/core/{batching.py,events.py,io_zarr.py,jobs.py,metrics.py,model_adapter.py,preprocess.py,search_engine.py,similarity.py,token_picker.py}</code></li>
+        <li><code>src/tokenizer/ui/{controller.py,main_window.py,slice_viewer.py,state.py}</code></li>
+        <li><code>tests/test_tokenizer_*.py</code>, <code>tests/test_tokenize_cli.py</code></li>
+        <li><code>docs/seismic_tokenizer/{README.md,user_guide.md,code_description.md,decisions_and_rationale.md,future_work.md}</code></li>
+        <li><code>docs/training/README.md</code>, <code>README.md</code></li>
+      </ul>
+    </li>
+    <li>Commit hash for this session work is reported in the terminal/session handoff after commit and push.</li>
+  </ul>
+
+  <h2>Next and/or Future Follow-Up Work Suggestions</h2>
+  <ol>
+    <li>Add targeted source-slice-only pick filtering to avoid overlay geometry affecting mouse picks.</li>
+    <li>Add true dual-volume mode in UI (source seismic vs search/output seismic) to reduce semantic confusion with similarity overlays.</li>
+    <li>Add automated visual-regression checks for colorbars/camera persistence/selection overlays.</li>
+    <li>Add benchmark dashboards from emitted JSON reports.</li>
+    <li>Harden E2E tests around long-running search cancellation/restart scenarios.</li>
+  </ol>
+</body>
+</html>

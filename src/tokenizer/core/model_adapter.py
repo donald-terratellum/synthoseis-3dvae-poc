@@ -1,0 +1,71 @@
+import numpy as np
+import torch
+
+from src.model import VAE3D
+
+
+def cube_to_latent_128(cube: np.ndarray) -> np.ndarray:
+    """Map a 32^3 preprocessed cube to a deterministic 128-D latent vector.
+
+    This adapter is a stable fallback used for Phase 4 integration while full
+    model-backed encoder inference is integrated.
+    """
+    arr = np.asarray(cube, dtype=np.float32)
+    if arr.shape != (32, 32, 32):
+        raise ValueError(f"expected cube shape (32, 32, 32), got {arr.shape}")
+
+    # Mean-pool into 8x8x2 blocks => 128 features.
+    pooled = arr.reshape(8, 4, 8, 4, 2, 16).mean(axis=(1, 3, 5))
+    latent = pooled.reshape(128)
+    return np.ascontiguousarray(latent, dtype=np.float32)
+
+
+def choose_torch_device(requested: str = "auto") -> torch.device:
+    req = requested.lower()
+    if req == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if req == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but unavailable")
+        return torch.device("cuda")
+    if req == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS requested but unavailable")
+        return torch.device("mps")
+    if req == "cpu":
+        return torch.device("cpu")
+    raise ValueError("device must be one of: auto, cuda, mps, cpu")
+
+
+class VaeLatentAdapter:
+    def __init__(self, checkpoint_path, device: str = "auto"):
+        self.device = choose_torch_device(device)
+        self.model = VAE3D(in_ch=1, out_ch=1, base_ch=16, latent_dim=128)
+
+        checkpoint = torch.load(str(checkpoint_path), map_location=self.device)
+        state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
+        self.model.eval()
+
+    @torch.inference_mode()
+    def encode_batch(self, cubes: np.ndarray) -> np.ndarray:
+        arr = np.asarray(cubes, dtype=np.float32)
+        if arr.ndim != 4 or arr.shape[1:] != (32, 32, 32):
+            raise ValueError(f"expected cubes shape (B,32,32,32), got {arr.shape}")
+
+        batch = torch.from_numpy(arr[:, None, :, :, :]).to(self.device)
+        mu, _ = self.model.encoder(batch)
+        return mu.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    @torch.inference_mode()
+    def encode_cube(self, cube: np.ndarray) -> np.ndarray:
+        arr = np.asarray(cube, dtype=np.float32)
+        if arr.shape != (32, 32, 32):
+            raise ValueError(f"expected cube shape (32,32,32), got {arr.shape}")
+        out = self.encode_batch(arr[None, ...])
+        return np.ascontiguousarray(out[0], dtype=np.float32)
