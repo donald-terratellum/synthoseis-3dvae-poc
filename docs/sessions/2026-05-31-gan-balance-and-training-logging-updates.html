@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Session Summary - 2026-05-31 - GAN Balance and Training Logging Updates</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem auto; max-width: 900px; line-height: 1.55; color: #111; }
+    h1, h2, h3 { line-height: 1.25; }
+    code { background: #f5f5f5; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    ul { margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>Agentic Coding Session Summary</h1>
+
+  <h2>Context and Goals</h2>
+  <p>
+    This session focused on extending and stabilizing GAN-assisted 3D VAE training while improving day-to-day operability.
+    Primary goals were to add and validate on-the-fly augmentation improvements (including vertical warp), refactor augmentation code
+    for readability, introduce discriminator diagnostics and control signals, improve stdout formatting for long runs,
+    add adaptive GAN balancing controls, and update documentation for discriminator usage and interpretation.
+  </p>
+
+  <h2>What Was Done</h2>
+  <ul>
+    <li>Refactored augmentation logic out of <code>train.py</code> into <code>src/augmentations.py</code>.</li>
+    <li>Added vertical warp augmentation controls and kept paired-vs-input-only augmentation behavior explicit.</li>
+    <li>Added discriminator metrics to training outputs: <code>d_gan_acc</code> in stdout and <code>d_gan_acc_pct</code> in CSV.</li>
+    <li>Added <code>discriminator_learning_rate</code> as a CSV column.</li>
+    <li>Implemented an automatic GAN balance controller that adjusts <code>gan_weight</code> and discriminator LR from epoch discriminator accuracy.</li>
+    <li>Added controller CLI flags for target band, multipliers, and min/max bounds.</li>
+    <li>Improved epoch logging layout with aligned table rows, padded epoch index formatting, periodic header repeat, and inline elapsed/ETA reporting.</li>
+    <li>Updated <code>README.md</code> with concise discriminator setup, augmentation behavior notes, and a successful discriminator command.</li>
+    <li>Updated <code>.gitignore</code> to include <code>purgatory/</code> naming variant.</li>
+  </ul>
+
+  <h2>How Was It Done</h2>
+  <ul>
+    <li>Applied focused edits in <code>train.py</code> for discriminator loss/accuracy, CSV schema, adaptive controller, and logging format behavior.</li>
+    <li>Introduced augmentation module boundaries in <code>src/augmentations.py</code> and switched dataset code to imported helpers.</li>
+    <li>Added/kept tests under <code>tests/</code> and ran unit checks.</li>
+    <li>Validated repeatedly with diagnostics checks, <code>uv run python train.py --help</code>, and <code>uv run python -m unittest -q tests/test_vertical_warp.py</code>.</li>
+  </ul>
+
+  <h2>When Was It Done and By Whom</h2>
+  <ul>
+    <li>Date: 2026-05-31</li>
+    <li>Authoring agent: GitHub Copilot (GPT-5.3-Codex)</li>
+    <li>Environment: VS Code on macOS</li>
+  </ul>
+
+  <h2>Basic Info</h2>
+  <h3>Relevant commits (prior baseline)</h3>
+  <ul>
+    <li><code>95ff582</code> Stop tracking legacy pugatory folder</li>
+    <li><code>3d73ae7</code> Add training stability upgrades and session summary</li>
+    <li><code>776bb77</code> Add session summary and ignore generated outputs</li>
+    <li><code>32411b4</code> Document successful patch sampling and training commands</li>
+  </ul>
+
+  <h3>Files involved</h3>
+  <ul>
+    <li><code>.gitignore</code></li>
+    <li><code>README.md</code></li>
+    <li><code>train.py</code></li>
+    <li><code>src/augmentations.py</code></li>
+    <li><code>tests/test_vertical_warp.py</code></li>
+    <li><code>docs/sessions/2026-05-31-gan-balance-and-training-logging-updates.md</code></li>
+    <li><code>docs/sessions/2026-05-31-gan-balance-and-training-logging-updates.html</code></li>
+  </ul>
+
+  <h2>Next and/or Future Follow-Up Work Suggestions</h2>
+  <ul>
+    <li>Add README examples for GAN balance controller defaults and conservative/aggressive presets.</li>
+    <li>Add unit tests for controller state transitions and clamping behavior.</li>
+    <li>Keep stdout/CSV naming aligned for downstream plotting workflows.</li>
+    <li>Optionally add a plotting utility for <code>val_loss</code>, <code>g_gan_loss</code>, <code>d_gan_acc_pct</code>, <code>gan_weight</code>, and <code>discriminator_learning_rate</code>.</li>
+  </ul>
+</body>
+</html>

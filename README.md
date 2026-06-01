@@ -43,7 +43,9 @@ uv run python train.py --data data/train.zarr --batch_size 100 --number_batches 
 
 Training knobs (concise)
 
-- `--augment`: enable train-time geometric + trace-drop augmentations.
+- `--augment`: enable on-the-fly data augmentation during training.
+- Paired (input + label) augmentations: `--swap_xy_prob`, `--flip_x_prob`, `--flip_y_prob`, `--vertical_warp_prob`.
+- Input-only augmentation: 3x3 trace-cluster zeroing (`--zero_cluster_min`, `--zero_cluster_max`) is applied to input only, never to label.
 - `--validation_extrema_only` / `--no_validation_extrema_only`: toggle extrema-only validation input (default: on).
 - `--resume`: resume model weights from a checkpoint.
 - `--weight_decay`: AdamW regularization strength.
@@ -55,6 +57,15 @@ Training knobs (concise)
 - `--early_stopping_patience`, `--early_stopping_min_delta`: stop criteria on validation loss.
 - `--best_checkpoint_name`: filename for best checkpoint in `--out_dir`.
 - `--save_epoch_checkpoints` / `--no_save_epoch_checkpoints`: keep per-epoch checkpoints or best-only.
+
+Discriminator (GAN) setup (concise)
+
+- Enable with `--use_discriminator`.
+- Generator objective becomes `VAE loss + gan_weight * g_gan_loss` (`--gan_weight`).
+- Discriminator learns real-label vs reconstructed-fake classification each train step; validation path stays augmentation-free and does not use discriminator loss.
+- Optional discriminator-specific optimizer knobs: `--discriminator_learning_rate`, `--discriminator_weight_decay`, `--discriminator_base_ch`.
+- Per-epoch logs include `d_gan_acc` in stdout and `d_gan_acc_pct` in `training_metrics.csv`.
+- `d_gan_acc` interpretation on balanced real/fake batches: ~50% means chance-level discrimination; higher values mean stronger separation.
 
 Recommended stable config
 
@@ -77,4 +88,30 @@ uv run python train.py \
 	--early_stopping_patience 8 \
 	--best_checkpoint_name vae_best.pt \
 	--out_dir checkpoints
+```
+
+Successful discriminator config (reported)
+
+```bash
+uv run python train.py \
+	--data data/train.zarr \
+	--batch_size 100 \
+	--number_batches 50 \
+	--epochs 150 \
+	--augment \
+	--vertical_warp_prob 0.5 \
+	--learning_rate 1e-4 \
+	--weight_decay 1e-4 \
+	--kl_schedule warmup \
+	--kl_start 0.0 \
+	--kl_end 1e-3 \
+	--kl_warmup_epochs 15 \
+	--lr_scheduler plateau \
+	--lr_scheduler_patience 3 \
+	--lr_scheduler_factor 0.5 \
+	--early_stopping_patience 8 \
+	--best_checkpoint_name vae_best.pt \
+	--use_discriminator \
+	--gan_weight 0.2 \
+	--out_dir checkpoints_gan_vwarp
 ```
