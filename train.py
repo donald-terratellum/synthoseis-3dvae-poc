@@ -13,8 +13,10 @@ import zarr
 import numpy as np
 from typing import Any, cast
 from src.augmentations import apply_input_trace_dropout
+from src.augmentations import apply_input_extrema_mixup
 from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
+from src.augmentations import sample_mixup_corpus_index
 from src.model import VAE3D
 
 
@@ -33,9 +35,11 @@ class ZarrPatchDataset(Dataset):
         zero_cluster_min=8,
         zero_cluster_max=12,
         extrema_only=False,
+        mixup_augment_prob=0.10,
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
         self.data = cast(Any, z['patches'])
+        self.num_examples = int(self.data.shape[0])
         self.scaling = scaling
         self.scaling_mean = float(scaling_mean)
         self.scaling_std = float(scaling_std)
@@ -47,6 +51,7 @@ class ZarrPatchDataset(Dataset):
         self.zero_cluster_min = int(zero_cluster_min)
         self.zero_cluster_max = int(zero_cluster_max)
         self.extrema_only = bool(extrema_only)
+        self.mixup_augment_prob = float(mixup_augment_prob)
 
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
             raise ValueError("--input_scaling must be one of: none, divide_by_std, zscore")
@@ -58,17 +63,26 @@ class ZarrPatchDataset(Dataset):
             raise ValueError('--zero_cluster_min must be <= --zero_cluster_max.')
         if not 0.0 <= self.vertical_warp_prob <= 1.0:
             raise ValueError('--vertical_warp_prob must be in [0, 1].')
+        if not 0.0 <= self.mixup_augment_prob <= 1.0:
+            raise ValueError('--mixup_augment_prob must be in [0, 1].')
 
-    def __len__(self):
-        return self.data.shape[0]
+    def _apply_scaling(self, arr):
+        if self.scaling == 'divide_by_std':
+            return arr / self.scaling_std
+        if self.scaling == 'zscore':
+            return (arr - self.scaling_mean) / self.scaling_std
+        return arr
 
-    def __getitem__(self, idx):
+    def _load_scaled_example(self, idx):
         arr = self.data[idx]
         arr = np.asarray(arr, dtype='f4')
-        if self.scaling == 'divide_by_std':
-            arr = arr / self.scaling_std
-        elif self.scaling == 'zscore':
-            arr = (arr - self.scaling_mean) / self.scaling_std
+        return self._apply_scaling(arr)
+
+    def __len__(self):
+        return self.num_examples
+
+    def __getitem__(self, idx):
+        arr = self._load_scaled_example(int(idx))
 
         # For denoising-style augmentation, label stays clean while input is perturbed.
         x = arr.copy()
@@ -85,6 +99,13 @@ class ZarrPatchDataset(Dataset):
             x = apply_input_trace_dropout(x, self.zero_cluster_min, self.zero_cluster_max)
         if self.extrema_only:
             x = keep_trace_extrema_only(x)
+
+        if self.augment and np.random.random() < self.mixup_augment_prob:
+            mixup_idx = sample_mixup_corpus_index(int(idx), self.num_examples)
+            mixup_arr = self._load_scaled_example(mixup_idx)
+            x = apply_input_extrema_mixup(x, mixup_arr)
+
+        x = x.astype('f4', copy=False)
 
         x = np.ascontiguousarray(x[np.newaxis, ...])
         y = np.ascontiguousarray(y[np.newaxis, ...])
@@ -388,6 +409,7 @@ def build_dataset(args, data_path, augment=False):
         zero_cluster_min=args.zero_cluster_min,
         zero_cluster_max=args.zero_cluster_max,
         extrema_only=True,
+        mixup_augment_prob=args.mixup_augment_prob,
     )
 
 
@@ -405,6 +427,7 @@ def validate(model, args, device, train_steps_per_epoch):
         zero_cluster_min=0,
         zero_cluster_max=0,
         extrema_only=args.validation_extrema_only,
+        mixup_augment_prob=0.0,
     )
     validation_dl = DataLoader(validation_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
     validation_steps = max(1, int(math.ceil(0.2 * train_steps_per_epoch)))
@@ -445,6 +468,7 @@ def train(args):
         f"flip_x_prob={args.flip_x_prob}",
         f"flip_y_prob={args.flip_y_prob}",
         f"vertical_warp_prob={args.vertical_warp_prob}",
+        f"mixup_augment_prob={args.mixup_augment_prob}",
         f"zero_cluster_range=[{args.zero_cluster_min},{args.zero_cluster_max}]",
     )
     print("Train extrema-only input=True")
@@ -462,6 +486,8 @@ def train(args):
         raise ValueError('--weight_decay must be non-negative.')
     if not 0.0 <= args.vertical_warp_prob <= 1.0:
         raise ValueError('--vertical_warp_prob must be in [0, 1].')
+    if not 0.0 <= args.mixup_augment_prob <= 1.0:
+        raise ValueError('--mixup_augment_prob must be in [0, 1].')
     if args.early_stopping_patience <= 0:
         raise ValueError('--early_stopping_patience must be positive.')
     if args.gan_weight < 0:
@@ -681,6 +707,7 @@ if __name__ == '__main__':
     p.add_argument('--flip_x_prob', type=float, default=0.5)
     p.add_argument('--flip_y_prob', type=float, default=0.5)
     p.add_argument('--vertical_warp_prob', type=float, default=0.5, help='Probability of applying non-linear depth stretch/squeeze to label and paired input.')
+    p.add_argument('--mixup_augment_prob', type=float, default=0.10, help='Probability of adding extrema-only signal from a random second zarr example into the input volume.')
     p.add_argument('--zero_cluster_min', type=int, default=8)
     p.add_argument('--zero_cluster_max', type=int, default=12)
     p.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint to resume training from.')

@@ -7,6 +7,9 @@ DEFAULT_VERTICAL_WARP_EDGE_PAD = 5.0
 DEFAULT_VERTICAL_WARP_Z_LOW_RATIO = 12.5 / 15.5
 DEFAULT_VERTICAL_WARP_Z_MODE_RATIO = 1.0
 DEFAULT_VERTICAL_WARP_Z_HIGH_RATIO = 18.5 / 15.5
+DEFAULT_MIXUP_SCALE_LOW = 1.0 / 150.0
+DEFAULT_MIXUP_SCALE_MODE = 1.0 / 110.0
+DEFAULT_MIXUP_SCALE_HIGH = 1.0 / 75.0
 
 
 def sample_vertical_warp_target_indices(
@@ -105,6 +108,29 @@ def apply_pair_augmentations(x, y, swap_xy_prob, flip_x_prob, flip_y_prob, verti
         y = apply_vertical_warp_to_cube(y, target_indices)
         x = y.copy()
     return x, y
+
+
+def sample_mixup_corpus_index(current_idx, num_examples):
+    if num_examples <= 1:
+        return int(current_idx)
+
+    mixup_idx = int(np.random.randint(0, int(num_examples) - 1))
+    if mixup_idx >= int(current_idx):
+        mixup_idx += 1
+    return mixup_idx
+
+
+def apply_input_extrema_mixup(
+    x,
+    mixup_source,
+    scale_low=DEFAULT_MIXUP_SCALE_LOW,
+    scale_mode=DEFAULT_MIXUP_SCALE_MODE,
+    scale_high=DEFAULT_MIXUP_SCALE_HIGH,
+):
+    # Keep only peak/trough amplitudes in the secondary example before blending.
+    mixup_extrema = keep_trace_extrema_only(mixup_source)
+    mixup_scale = np.float32(np.random.triangular(scale_low, scale_mode, scale_high))
+    return (x + mixup_scale * mixup_extrema).astype(np.float32, copy=False)
 
 
 def apply_input_trace_dropout(x, zero_cluster_min, zero_cluster_max):

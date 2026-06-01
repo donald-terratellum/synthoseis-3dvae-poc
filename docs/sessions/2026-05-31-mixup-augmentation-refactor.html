@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Coding Session Summary</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f4ee;
+      --panel: rgba(255, 255, 255, 0.86);
+      --text: #18212f;
+      --muted: #596372;
+      --accent: #0f766e;
+      --accent-2: #7c3aed;
+      --border: #d8e0e8;
+      --shadow: 0 18px 50px rgba(24, 33, 47, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.12), transparent 34%),
+        radial-gradient(circle at top right, rgba(124, 58, 237, 0.10), transparent 28%),
+        linear-gradient(180deg, #f7f4ee 0%, #eef3fb 100%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+
+    .hero {
+      background: linear-gradient(135deg, rgba(15, 118, 110, 0.10), rgba(124, 58, 237, 0.08));
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 28px;
+      box-shadow: var(--shadow);
+      margin-bottom: 22px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2rem;
+      line-height: 1.15;
+    }
+
+    .meta {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 22px 24px;
+      margin: 18px 0;
+      box-shadow: 0 10px 24px rgba(24, 33, 47, 0.05);
+      backdrop-filter: blur(8px);
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 1.15rem;
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 22px;
+    }
+
+    li + li { margin-top: 8px; }
+
+    code {
+      background: #eef2ff;
+      border: 1px solid #dbe3ff;
+      border-radius: 6px;
+      padding: 0 6px;
+      font-size: 0.95em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+    }
+
+    .chip {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.1);
+      color: var(--accent);
+      font-weight: 600;
+      margin-right: 8px;
+      margin-bottom: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="hero">
+      <div class="chip">2026-05-31</div>
+      <div class="chip">GitHub Copilot / GPT-5.4 mini</div>
+      <h1>Agentic Coding Session Summary</h1>
+      <p class="meta">Mixup augmentation was added to the training pipeline and the logic was moved into the shared augmentation module.</p>
+    </div>
+
+    <section>
+      <h2>Context and Goals</h2>
+      <ul>
+        <li>Add mixup augmentation to the 3D VAE training pipeline.</li>
+        <li>Expose a CLI knob with a 10% default probability.</li>
+        <li>Sample a second random zarr example, keep the extrema-only transform, scale the added signal with a triangular distribution, and leave the label untouched.</li>
+        <li>Place the augmentation logic in <code>src/augmentations.py</code> rather than keeping it in <code>train.py</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Was Done</h2>
+      <ul>
+        <li>Added <code>--mixup_augment_prob</code> to the training CLI with a default of <code>0.10</code>.</li>
+        <li>Implemented random second-example sampling from the full zarr corpus.</li>
+        <li>Applied extrema-only filtering to the secondary example before it is blended into the input.</li>
+        <li>Used a triangular scaling distribution with parameters <code>(1/150, 1/110, 1/75)</code>.</li>
+        <li>Kept the label unchanged so mixup only affects the input volume.</li>
+        <li>Moved the mixup-specific code into <code>src/augmentations.py</code> and left <code>train.py</code> as the orchestration layer.</li>
+        <li>Documented the new flag in <code>README.md</code> alongside the other training knobs.</li>
+        <li>Validated the refactor with diagnostics and a CLI help smoke test.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How Was It Done</h2>
+      <ul>
+        <li>Started from the dataset path in <code>train.py</code>, where the input and label tensors are assembled.</li>
+        <li>Added helper functions in <code>src/augmentations.py</code> for sampling a second corpus index and blending the extrema-only signal.</li>
+        <li>Reused the existing extrema helper rather than duplicating trace-selection code.</li>
+        <li>Updated the dataset constructor and validation path to pass the new mixup probability explicitly.</li>
+        <li>Checked the result with <code>python train.py --help</code> after the refactor.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>When Was It Done and By Whom</h2>
+      <div class="grid">
+        <div>
+          <strong>Date</strong><br />
+          2026-05-31
+        </div>
+        <div>
+          <strong>Authoring agent</strong><br />
+          GitHub Copilot (GPT-5.4 mini)
+        </div>
+        <div>
+          <strong>Environment</strong><br />
+          VS Code workspace on macOS
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Basic Info</h2>
+      <ul>
+        <li>Relevant commits: session changes were prepared for a new commit in this branch during the current run.</li>
+        <li>Files involved: <code>train.py</code>, <code>src/augmentations.py</code>, <code>README.md</code>, and the new session summary files in <code>docs/sessions</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Next and Future Follow-Up Work Suggestions</h2>
+      <ul>
+        <li>Add a unit test that verifies mixup does not modify the label.</li>
+        <li>Add a deterministic test for the mixup probability path and corpus index sampling.</li>
+        <li>Consider documenting the new augmentation flag in the training README if you want it discoverable for users.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

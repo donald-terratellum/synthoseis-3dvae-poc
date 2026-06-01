@@ -46,6 +46,7 @@ Training knobs (concise)
 - `--augment`: enable on-the-fly data augmentation during training.
 - Paired (input + label) augmentations: `--swap_xy_prob`, `--flip_x_prob`, `--flip_y_prob`, `--vertical_warp_prob`.
 - Input-only augmentation: 3x3 trace-cluster zeroing (`--zero_cluster_min`, `--zero_cluster_max`) is applied to input only, never to label.
+- Input-only mixup augmentation: `--mixup_augment_prob` blends in extrema-only signal from a second random zarr example into the input only (default: 0.10).
 - `--validation_extrema_only` / `--no_validation_extrema_only`: toggle extrema-only validation input (default: on).
 - `--resume`: resume model weights from a checkpoint.
 - `--weight_decay`: AdamW regularization strength.
