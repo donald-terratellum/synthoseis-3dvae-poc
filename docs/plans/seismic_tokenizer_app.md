@@ -12,7 +12,7 @@ Constraints:
 2. A temporary progress bar must appear in the left menu tree during background inference.
 
 ## 2) Existing Code and Constraints
-- Reuse preprocessing behavior from docs/train.py and src/augmentations.py:
+- Reuse preprocessing behavior from scripts/train.py and src/augmentations.py:
   - Input scaling mode: divide by standard deviation for inference path.
   - Extrema-only transform: keep_trace_extrema_only.
   - Validation-like input path should be deterministic (no random training augmentations).

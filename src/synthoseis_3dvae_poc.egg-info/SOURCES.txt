@@ -27,6 +27,7 @@ src/tokenizer/ui/controller.py
 src/tokenizer/ui/main_window.py
 src/tokenizer/ui/slice_viewer.py
 src/tokenizer/ui/state.py
+tests/test_patch_size_shape_generalization.py
 tests/test_tokenize_cli.py
 tests/test_tokenizer_config.py
 tests/test_tokenizer_events.py

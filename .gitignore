@@ -1,6 +1,6 @@
 # Generated training data and outputs
 data/
-checkpoints/
+checkpoints*/
 checkpoints_retrain/
 checkpoints_smoke/
 purgatory/

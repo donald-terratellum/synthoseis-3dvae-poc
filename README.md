@@ -23,5 +23,5 @@ uv sync
 - [docs/seismic_tokenizer/user_guide.md](docs/seismic_tokenizer/user_guide.md): End-user commands, UI workflow, troubleshooting, and test commands.
 - [docs/seismic_tokenizer/code_description.md](docs/seismic_tokenizer/code_description.md): Architecture and module responsibilities.
 - [scripts/sample_patches.py](scripts/sample_patches.py): Build training patch datasets from seismic sources.
-- [docs/train.py](docs/train.py): VAE training CLI and training loop implementation.
+- [scripts/train.py](scripts/train.py): VAE training CLI and training loop implementation.
 - [scripts/tokenize.py](scripts/tokenize.py): Pattern-search CLI (`build-token`, `search-volume`, `ui`).

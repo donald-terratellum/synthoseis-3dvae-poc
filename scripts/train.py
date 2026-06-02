@@ -1,5 +1,15 @@
 import argparse
 from pathlib import Path
+import sys
+from typing import Any, cast
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR in sys.path:
+    sys.path.remove(SCRIPT_DIR)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import itertools
 import math
 import csv
@@ -9,15 +19,42 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 import zarr
 import numpy as np
-from typing import Any, cast
 from src.augmentations import apply_input_trace_dropout
 from src.augmentations import apply_input_extrema_mixup
 from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
 from src.model import VAE3D
+
+
+def normalize_patch_size(values):
+    if len(values) == 1:
+        v = int(values[0])
+        dims = (v, v, v)
+    elif len(values) == 3:
+        dims = tuple(int(v) for v in values)
+    else:
+        raise ValueError("--patch_size expects either 1 value or 3 values: X Y Z")
+    if any(v <= 0 for v in dims):
+        raise ValueError("patch_size values must be positive")
+    if any(v % 8 != 0 for v in dims):
+        raise ValueError("patch_size values must be divisible by 8 for VAE3D")
+    return dims
+
+
+def resolve_patch_size_xyz(requested_values, dataset_patch_shape):
+    dataset_shape = tuple(int(v) for v in dataset_patch_shape)
+    if requested_values is None:
+        return dataset_shape
+    requested_shape = normalize_patch_size(requested_values)
+    if requested_shape != dataset_shape:
+        raise ValueError(
+            f"training patch shape {dataset_shape} does not match --patch_size {requested_shape}"
+        )
+    return requested_shape
 
 
 class ZarrPatchDataset(Dataset):
@@ -39,6 +76,9 @@ class ZarrPatchDataset(Dataset):
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
         self.data = cast(Any, z['patches'])
+        if len(self.data.shape) != 4:
+            raise ValueError("zarr patches array must have shape [N, X, Y, Z]")
+        self.patch_shape = tuple(int(v) for v in self.data.shape[1:4])
         self.num_examples = int(self.data.shape[0])
         self.scaling = scaling
         self.scaling_mean = float(scaling_mean)
@@ -263,6 +303,237 @@ def clamp_float(value, lower, upper):
     return max(lower, min(upper, value))
 
 
+def build_checkpoint_payload(model):
+    return {
+        'model_state_dict': model.state_dict(),
+        'patch_shape': [int(v) for v in model.patch_shape],
+        'latent_dim': int(model.latent_dim),
+        'base_ch': int(model.base_ch),
+    }
+
+
+@dataclass
+class BatchSnapshot:
+    inputs: torch.Tensor
+    targets: torch.Tensor
+    recon: torch.Tensor
+    per_example_mse: torch.Tensor
+
+
+@dataclass
+class RepresentativeExample:
+    split: str
+    percentile: int
+    source_epoch: int
+    batch_index: int
+    selection_mse: float
+    input_cube: torch.Tensor
+    target_cube: torch.Tensor
+
+
+def compute_per_example_mse(recon, targets):
+    return ((recon - targets) ** 2).mean(dim=(1, 2, 3, 4))
+
+
+def _build_representative_examples(snapshot, split, epoch_number, percentiles):
+    if snapshot is None:
+        return []
+    batch_size = int(snapshot.per_example_mse.shape[0])
+    if batch_size == 0:
+        return []
+
+    mse_values = snapshot.per_example_mse.detach().cpu().numpy()
+    selected = []
+    used_indices = set()
+    candidate_indices = np.arange(batch_size)
+    for percentile in percentiles:
+        percentile_mse = float(np.percentile(mse_values, percentile))
+        rank_order = np.argsort(np.abs(mse_values - percentile_mse))
+        chosen_idx = None
+        for rank_idx in rank_order.tolist():
+            idx = int(candidate_indices[rank_idx])
+            if idx not in used_indices:
+                chosen_idx = idx
+                break
+        if chosen_idx is None:
+            chosen_idx = int(candidate_indices[int(rank_order[0])])
+        used_indices.add(chosen_idx)
+
+        selected.append(
+            RepresentativeExample(
+                split=split,
+                percentile=int(percentile),
+                source_epoch=int(epoch_number),
+                batch_index=int(chosen_idx),
+                selection_mse=float(mse_values[chosen_idx]),
+                input_cube=snapshot.inputs[chosen_idx:chosen_idx+1].detach().cpu().clone(),
+                target_cube=snapshot.targets[chosen_idx:chosen_idx+1].detach().cpu().clone(),
+            )
+        )
+    return selected
+
+
+def _build_composite_slices(input_cube, pred_cube, target_cube):
+    mid_x = int(input_cube.shape[0] // 2)
+    mid_y = int(input_cube.shape[1] // 2)
+
+    # Use [depth, lateral] orientation so plots are 64 (vertical) x 32 (horizontal).
+    inline_input = input_cube[:, mid_y, :].T
+    inline_pred = pred_cube[:, mid_y, :].T
+    inline_target = target_cube[:, mid_y, :].T
+    inline_composite = np.concatenate([inline_input, inline_pred, inline_target], axis=1)
+
+    crossline_input = input_cube[mid_x, :, :].T
+    crossline_pred = pred_cube[mid_x, :, :].T
+    crossline_target = target_cube[mid_x, :, :].T
+    crossline_composite = np.concatenate([crossline_input, crossline_pred, crossline_target], axis=1)
+
+    return inline_composite, crossline_composite
+
+
+def _format_latent_percentiles(name, latent_values):
+    percentile_levels = [5, 20, 50, 80, 95]
+    stats = [f"{level}%={np.percentile(latent_values, level):.4f}" for level in percentile_levels]
+    return f"{name:>10}[" + ", ".join(stats) + "]"
+
+
+def _plot_representative_example(model, device, example, epoch_number, vmin=-3.1, vmax=3.1):
+    import matplotlib
+
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    model.eval()
+    with torch.no_grad():
+        x = example.input_cube.to(device)
+        y = example.target_cube.to(device)
+        recon, _, _ = model(x)
+        mse_value = float(compute_per_example_mse(recon, y)[0].item())
+        latent_input_mu, _ = model.encoder(x)
+        latent_pred_mu, _ = model.encoder(recon)
+        latent_label_mu, _ = model.encoder(y)
+
+    input_cube = example.input_cube[0, 0].cpu().numpy()
+    pred_cube = recon[0, 0].detach().cpu().numpy()
+    target_cube = example.target_cube[0, 0].cpu().numpy()
+    latent_input = latent_input_mu[0].detach().cpu().numpy()
+    latent_pred = latent_pred_mu[0].detach().cpu().numpy()
+    latent_label = latent_label_mu[0].detach().cpu().numpy()
+    # header = (
+    #     f"Representative example | split={example.split} | epoch={epoch_number} | "
+    #     f"percentile={example.percentile}% | batch_idx={example.batch_index} |"
+    # )
+    # input_stats = _format_latent_percentiles('input', latent_input)
+    # pred_stats = _format_latent_percentiles('prediction', latent_pred)
+    # label_stats = _format_latent_percentiles('label', latent_label)
+    # print(f"{header}\n{input_stats} |\n{pred_stats} |\n{label_stats}")
+
+    inline_composite, crossline_composite = _build_composite_slices(input_cube, pred_cube, target_cube)
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(16, 5),
+        constrained_layout=True,
+        gridspec_kw={'width_ratios': [3.0, 0.56, 3.0]},
+    )
+    im0 = axes[0].imshow(inline_composite, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto', origin='upper')
+    axes[0].set_title('Middle inline: input | prediction | label')
+    axes[0].set_xlabel('Trace / Section')
+    axes[0].set_ylabel('Depth sample')
+
+    latent_axis = axes[1]
+    latent_positions = np.arange(latent_input.shape[0], dtype=np.float32)
+    shade_color = (50.0 / 255.0, 50.0 / 255.0, 50.0 / 255.0)
+    input_baseline = -20.0
+    pred_baseline = 0.0
+    label_baseline = 20.0
+    latent_input_shifted = latent_input - 20.0
+    latent_pred_shifted = latent_pred
+    latent_label_shifted = latent_label + 20.0
+
+    # Use explicit half-sample bin edges so fill and line share identical vertical registration.
+    latent_edges = np.arange(latent_input.shape[0] + 1, dtype=np.float32) - 0.5
+    latent_axis.stairs(latent_input_shifted, latent_edges, orientation='horizontal', baseline=input_baseline, fill=True, color=shade_color, alpha=0.9)
+    latent_axis.stairs(latent_pred_shifted, latent_edges, orientation='horizontal', baseline=pred_baseline, fill=True, color=shade_color, alpha=0.9)
+    latent_axis.stairs(latent_label_shifted, latent_edges, orientation='horizontal', baseline=label_baseline, fill=True, color=shade_color, alpha=0.9)
+    latent_axis.stairs(latent_input_shifted, latent_edges, orientation='horizontal', baseline=input_baseline, fill=False, color='black', linewidth=1.0)
+    latent_axis.stairs(latent_pred_shifted, latent_edges, orientation='horizontal', baseline=pred_baseline, fill=False, color='black', linewidth=1.0)
+    latent_axis.stairs(latent_label_shifted, latent_edges, orientation='horizontal', baseline=label_baseline, fill=False, color='black', linewidth=1.0)
+
+    latent_axis.set_title('Latents I/P/L')
+    latent_axis.set_xticks([])
+    latent_axis.set_xlabel('')
+    latent_axis.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
+    latent_axis.spines['bottom'].set_visible(False)
+    latent_axis.spines['top'].set_visible(False)
+    latent_axis.spines['right'].set_visible(False)
+    latent_axis.spines['left'].set_position(('data', -50.0))
+    latent_axis.set_ylabel('Latent index')
+    latent_axis.set_yticks(np.arange(0, latent_input.shape[0], 16, dtype=int))
+    latent_axis.set_ylim(latent_input.shape[0] - 0.5, -0.5)
+    latent_axis.set_xlim(-60.0, 60.0)
+
+    im1 = axes[2].imshow(crossline_composite, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto', origin='upper')
+    axes[2].set_title('Middle crossline: input | prediction | label')
+    axes[2].set_xlabel('Trace / Section')
+    axes[2].set_ylabel('Depth sample')
+
+    fig.colorbar(im1, ax=[axes[0], axes[2]], shrink=0.9, label='Amplitude')
+    fig.suptitle(
+        (
+            f"{example.split} representative | epoch={epoch_number} | "
+            f"percentile(epoch4)={example.percentile}% | mse={mse_value:.6f} | "
+            f"epoch4_mse={example.selection_mse:.6f} | batch_idx={example.batch_index}"
+        ),
+        fontsize=10,
+    )
+    return fig, mse_value
+
+
+def _log_representative_examples(writer, model, device, examples, epoch_number, output_dir):
+    if not examples:
+        return
+    plot_root = Path(output_dir) / 'representative_plots' / f'epoch_{epoch_number:04d}'
+    plot_root.mkdir(parents=True, exist_ok=True)
+
+    for example in examples:
+        fig, mse_value = _plot_representative_example(model, device, example, epoch_number)
+        filename = f"{example.split.lower()}_p{example.percentile:02d}.png"
+        fig.savefig(plot_root / filename, dpi=140)
+        writer.add_figure(
+            f"representative/{example.split.lower()}/p{example.percentile:02d}",
+            fig,
+            global_step=epoch_number,
+        )
+        writer.add_scalar(
+            f"representative/{example.split.lower()}/p{example.percentile:02d}_mse",
+            mse_value,
+            epoch_number,
+        )
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
+
+
+def _save_representative_example_metadata(examples_by_split, output_path):
+    serializable = {}
+    for split_name, split_examples in examples_by_split.items():
+        serializable[split_name] = [
+            {
+                'split': ex.split,
+                'percentile': ex.percentile,
+                'source_epoch': ex.source_epoch,
+                'batch_index': ex.batch_index,
+                'selection_mse': ex.selection_mse,
+                'input_cube': ex.input_cube,
+                'target_cube': ex.target_cube,
+            }
+            for ex in split_examples
+        ]
+    torch.save(serializable, output_path)
+
+
 def update_gan_balance_controller(
     args,
     d_gan_acc_epoch,
@@ -333,6 +604,7 @@ def train_one_epoch(
     total_d_gan_acc = 0.0
     batch_iter = iter(dataloader) if steps_per_epoch is None else itertools.cycle(dataloader)
 
+    last_snapshot = None
     for _ in range(steps_per_epoch):
         inputs, targets = next(batch_iter)
         inputs = inputs.to(device)
@@ -370,12 +642,20 @@ def train_one_epoch(
         total_g_gan_loss += g_gan_loss_value
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
+        per_example_mse = compute_per_example_mse(recon.detach(), targets.detach()).detach().cpu()
+        last_snapshot = BatchSnapshot(
+            inputs=inputs.detach().cpu().clone(),
+            targets=targets.detach().cpu().clone(),
+            recon=recon.detach().cpu().clone(),
+            per_example_mse=per_example_mse,
+        )
 
     return (
         total_loss / steps_per_epoch,
         total_g_gan_loss / steps_per_epoch,
         total_d_gan_loss / steps_per_epoch,
         total_d_gan_acc / steps_per_epoch,
+        last_snapshot,
     )
 
 
@@ -430,12 +710,36 @@ def validate(model, args, device, train_steps_per_epoch):
         mixup_augment_prob=0.0,
     )
     validation_dl = DataLoader(validation_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    if validation_ds.patch_shape != args.patch_size_xyz:
+        raise ValueError(
+            f"validation patch shape {validation_ds.patch_shape} does not match --patch_size {args.patch_size_xyz}"
+        )
     validation_steps = max(1, int(math.ceil(0.2 * train_steps_per_epoch)))
-    return compute_average_loss(model, validation_dl, device, validation_steps, args.current_kl_weight)
+    model.eval()
+    total_loss = 0.0
+    batch_iter = itertools.cycle(validation_dl)
+    last_snapshot = None
+    with torch.no_grad():
+        for _ in range(validation_steps):
+            inputs, targets = next(batch_iter)
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            recon, mu, logvar = model(inputs)
+            loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight)
+            total_loss += float(loss.item())
+            per_example_mse = compute_per_example_mse(recon, targets).detach().cpu()
+            last_snapshot = BatchSnapshot(
+                inputs=inputs.detach().cpu().clone(),
+                targets=targets.detach().cpu().clone(),
+                recon=recon.detach().cpu().clone(),
+                per_example_mse=per_example_mse,
+            )
+    return total_loss / validation_steps, last_snapshot
 
 
 def train(args):
     ds = build_dataset(args, args.data, augment=args.augment)
+    args.patch_size_xyz = resolve_patch_size_xyz(args.patch_size, ds.patch_shape)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
     if args.number_batches is not None and args.number_batches <= 0:
@@ -443,7 +747,7 @@ def train(args):
     steps_per_epoch = args.number_batches if args.number_batches is not None else len(dl)
     samples_per_epoch = steps_per_epoch * args.batch_size
 
-    model = VAE3D(in_ch=1, out_ch=1, base_ch=16, latent_dim=128)
+    model = VAE3D(in_ch=1, out_ch=1, base_ch=16, latent_dim=128, patch_shape=args.patch_size_xyz)
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
 
@@ -452,10 +756,44 @@ def train(args):
         if not ckpt_path.exists():
             raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
         checkpoint = torch.load(ckpt_path, map_location='cpu')
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                f'Checkpoint {ckpt_path} is invalid. Expected a dict with keys '
+                "['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']."
+            )
+        required_keys = {'model_state_dict', 'patch_shape', 'latent_dim', 'base_ch'}
+        missing_keys = required_keys.difference(checkpoint.keys())
+        if missing_keys:
+            missing_keys_display = ', '.join(sorted(missing_keys))
+            raise ValueError(
+                f'Checkpoint {ckpt_path} is missing required keys: {missing_keys_display}. '
+                "Expected keys: ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']."
+            )
+
+        checkpoint_patch_shape = tuple(int(v) for v in checkpoint['patch_shape'])
+        checkpoint_latent_dim = int(checkpoint['latent_dim'])
+        checkpoint_base_ch = int(checkpoint['base_ch'])
+        expected_patch_shape = tuple(int(v) for v in args.patch_size_xyz)
+        expected_latent_dim = int(model.latent_dim)
+        expected_base_ch = int(model.base_ch)
+
+        if checkpoint_patch_shape != expected_patch_shape:
+            raise ValueError(
+                f'Resume checkpoint patch_shape {checkpoint_patch_shape} does not match '
+                f'active training patch shape {expected_patch_shape}.'
+            )
+        if checkpoint_latent_dim != expected_latent_dim:
+            raise ValueError(
+                f'Resume checkpoint latent_dim {checkpoint_latent_dim} does not match '
+                f'active model latent_dim {expected_latent_dim}.'
+            )
+        if checkpoint_base_ch != expected_base_ch:
+            raise ValueError(
+                f'Resume checkpoint base_ch {checkpoint_base_ch} does not match '
+                f'active model base_ch {expected_base_ch}.'
+            )
+
+        state_dict = checkpoint['model_state_dict']
         model.load_state_dict(state_dict)
         print(f"Resumed model weights from {ckpt_path}")
 
@@ -474,6 +812,27 @@ def train(args):
     print("Train extrema-only input=True")
     print(f"Validation extrema-only input={args.validation_extrema_only}")
     print(f"Discriminator enabled={args.use_discriminator}")
+    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']
+    print(f"Checkpoint schema keys={checkpoint_keys}")
+    print("base_ch = base channel count for the VAE's convolution layers")
+    print(
+        "Checkpoint metadata:",
+        f"patch_shape={list(model.patch_shape)}",
+        f"latent_dim={model.latent_dim}",
+        f"base_ch={model.base_ch}",
+    )
+    representative_percentiles = (10, 25, 50, 75, 90)
+    if args.representative_selection_epoch <= 0:
+        raise ValueError('--representative_selection_epoch must be a positive integer.')
+    if args.representative_plot_interval <= 0:
+        raise ValueError('--representative_plot_interval must be a positive integer.')
+    print(
+        "Representative plots:",
+        f"selection_epoch={args.representative_selection_epoch}",
+        f"plot_every={args.representative_plot_interval}",
+        f"percentiles={list(representative_percentiles)}",
+        "source=last_batch_mse_distribution",
+    )
     model.to(device)
     if discriminator is not None:
         discriminator.to(device)
@@ -549,12 +908,18 @@ def train(args):
     best_ckpt_path = Path(args.out_dir) / args.best_checkpoint_name
 
     metrics_csv_path = Path(args.out_dir) / 'training_metrics.csv'
+    tensorboard_dir = Path(args.out_dir) / 'tensorboard'
+    representative_metadata_path = Path(args.out_dir) / 'representative_examples_epoch4.pt'
+    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    print(f"TensorBoard log dir: {tensorboard_dir}")
+    print(f"Run TensorBoard: uv run tensorboard --logdir {tensorboard_dir}")
+    representative_examples = {'training': [], 'validation': []}
     csv_exists = metrics_csv_path.exists()
     training_start_time = time.time()
     with metrics_csv_path.open('a', newline='') as csv_file:
-        writer = csv.writer(csv_file)
+        csv_writer = csv.writer(csv_file)
         if not csv_exists:
-            writer.writerow([
+            csv_writer.writerow([
                 'epoch',
                 'examples_this_epoch',
                 'cumulative_examples',
@@ -588,7 +953,7 @@ def train(args):
             args.current_kl_weight = kl_weight
             gan_weight_for_epoch = current_gan_weight
 
-            train_loss, g_gan_loss_epoch, d_gan_loss_epoch, d_gan_acc_epoch = train_one_epoch(
+            train_loss, g_gan_loss_epoch, d_gan_loss_epoch, d_gan_acc_epoch, train_last_snapshot = train_one_epoch(
                 model,
                 discriminator,
                 dl,
@@ -600,7 +965,7 @@ def train(args):
                 kl_weight,
                 gan_weight_for_epoch,
             )
-            val_loss = validate(model, args, device, steps_per_epoch)
+            val_loss, val_last_snapshot = validate(model, args, device, steps_per_epoch)
             examples_this_epoch = samples_per_epoch
             cumulative_examples = (epoch + 1) * samples_per_epoch
 
@@ -620,16 +985,58 @@ def train(args):
 
             improved = update_early_stopping(early_stopping, val_loss, args.early_stopping_min_delta)
             if improved:
-                torch.save(model.state_dict(), best_ckpt_path)
+                torch.save(build_checkpoint_payload(model), best_ckpt_path)
 
             if args.save_epoch_checkpoints:
-                torch.save(model.state_dict(), Path(args.out_dir)/f"vae_epoch{epoch+1}.pt")
+                torch.save(build_checkpoint_payload(model), Path(args.out_dir)/f"vae_epoch{epoch+1}.pt")
 
             current_lr = opt.param_groups[0]['lr']
             current_disc_lr = disc_opt.param_groups[0]['lr'] if disc_opt is not None else float('nan')
+            epoch_number = epoch + 1
 
-            writer.writerow([
-                epoch + 1,
+            writer.add_scalar('train/loss', float(train_loss), epoch_number)
+            writer.add_scalar('validation/loss', float(val_loss), epoch_number)
+            writer.add_scalar('train/lr', float(current_lr), epoch_number)
+            writer.add_scalar('train/gan_weight', float(gan_weight_for_epoch), epoch_number)
+            writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
+            writer.add_scalar('train/d_gan_accuracy', float(d_gan_acc_epoch), epoch_number)
+            writer.add_scalar('train/d_gan_lr', float(current_disc_lr), epoch_number)
+
+            if epoch_number == args.representative_selection_epoch:
+                representative_examples['training'] = _build_representative_examples(
+                    train_last_snapshot,
+                    split='training',
+                    epoch_number=epoch_number,
+                    percentiles=representative_percentiles,
+                )
+                representative_examples['validation'] = _build_representative_examples(
+                    val_last_snapshot,
+                    split='validation',
+                    epoch_number=epoch_number,
+                    percentiles=representative_percentiles,
+                )
+                _save_representative_example_metadata(representative_examples, representative_metadata_path)
+                print(
+                    f"Saved representative metadata from epoch {args.representative_selection_epoch} "
+                    f"to {representative_metadata_path}"
+                )
+
+            if (
+                epoch_number % args.representative_plot_interval == 0
+                and representative_examples['training']
+                and representative_examples['validation']
+            ):
+                _log_representative_examples(
+                    writer,
+                    model,
+                    device,
+                    representative_examples['training'] + representative_examples['validation'],
+                    epoch_number,
+                    args.out_dir,
+                )
+
+            csv_writer.writerow([
+                epoch_number,
                 examples_this_epoch,
                 cumulative_examples,
                 f"{train_loss:.6f}",
@@ -644,6 +1051,7 @@ def train(args):
                 'best' if improved else '',
             ])
             csv_file.flush()
+            writer.flush()
 
             elapsed_summary = ''
             if (epoch + 1) % 5 == 0:
@@ -686,11 +1094,14 @@ def train(args):
                 )
                 break
 
+    writer.close()
+
     print(f"Best checkpoint: {best_ckpt_path} (best_val_loss={early_stopping.best_val_loss:.6f})")
 
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
+    p.add_argument('--patch_size', type=int, nargs='+', default=None, help='Patch size: one value for cubic or three values X Y Z. If omitted, infer from training dataset.')
     p.add_argument('--data', required=True)
     p.add_argument('--batch_size', '--examples_per_batch', dest='batch_size', type=int, default=100)
     p.add_argument('--number_batches', type=int, default=None, help='Number of batches per epoch. If omitted, uses full dataloader length.')
@@ -746,7 +1157,10 @@ if __name__ == '__main__':
     p.add_argument('--save_epoch_checkpoints', dest='save_epoch_checkpoints', action='store_true', help='Save per-epoch checkpoints in addition to best checkpoint.')
     p.add_argument('--no_save_epoch_checkpoints', dest='save_epoch_checkpoints', action='store_false', help='Disable per-epoch checkpoint saving and keep only best checkpoint.')
     p.set_defaults(save_epoch_checkpoints=True)
+    p.add_argument('--representative_selection_epoch', type=int, default=4, help='Epoch number used to select representative examples from last-batch MSE percentiles.')
+    p.add_argument('--representative_plot_interval', type=int, default=5, help='Generate representative plots every N epochs, reusing the selected examples.')
     p.add_argument('--out_dir', type=str, default='checkpoints')
     args = p.parse_args()
+    args.patch_size_xyz = normalize_patch_size(args.patch_size) if args.patch_size is not None else None
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     train(args)

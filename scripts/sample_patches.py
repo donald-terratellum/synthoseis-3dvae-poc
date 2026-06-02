@@ -3,11 +3,17 @@
 """Sample 3D patches from existing model_data.zarr stores into a destination zarr store.
 
 Usage:
-  python scripts/sample_patches.py --source /path/to/fake_data --out data/train.zarr --patch_size 32 --n_patches 5000 \
-    --seismic_key seismicCubes_cumsum__fullstack --geoscore_key geologic_score --n_per_volume 100
+    python scripts/sample_patches.py --source /path/to/fake_data --out data/train.zarr --patch_size 32 32 32 --n_patches 5000 \
+        --seismic_key seismicCubes_cumsum__fullstack --geoscore_key geologic_score --n_per_volume 100
 """
 
 from pathlib import Path
+import sys
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR in sys.path:
+    sys.path.remove(SCRIPT_DIR)
+
 import argparse
 import random
 import numpy as np
@@ -16,10 +22,24 @@ import math
 from typing import Any, cast
 
 
+def normalize_patch_size(values):
+    if len(values) == 1:
+        v = int(values[0])
+        dims = (v, v, v)
+    elif len(values) == 3:
+        dims = tuple(int(v) for v in values)
+    else:
+        raise ValueError("--patch_size expects either 1 value or 3 values: X Y Z")
+    if any(v <= 0 for v in dims):
+        raise ValueError("patch_size values must be positive")
+    return dims
+
+
 def candidate_positions(shape, patch_size, n_candidates=500):
-    max_x = shape[0] - patch_size
-    max_y = shape[1] - patch_size
-    max_z = shape[2] - patch_size
+    sx, sy, sz = patch_size
+    max_x = shape[0] - sx
+    max_y = shape[1] - sy
+    max_z = shape[2] - sz
     if max_x < 0 or max_y < 0 or max_z < 0:
         return []
     candidates = []
@@ -36,10 +56,11 @@ def pick_weighted_positions(geoscore, sampling_shape, patch_size, n_picks, n_can
     candidates = candidate_positions(sampling_shape, patch_size, n_candidates=n_candidates)
     if not candidates:
         return []
+    sx, sy, sz = patch_size
     scores = []
     for (i,j,k) in candidates:
         # geoscore can have different extents than seismic; out-of-range slices get zero weight.
-        patch_score = geoscore[i:i+patch_size, j:j+patch_size, k:k+patch_size]
+        patch_score = geoscore[i:i+sx, j:j+sy, k:k+sz]
         score = float(patch_score.sum()) if patch_score.size > 0 else 0.0
         scores.append(score)
     scores = np.array(scores)
@@ -79,6 +100,7 @@ def sample_patches_from_model(zvol, seismic_key, geoscore_key, patch_size, n_pat
         geoscore = np.zeros(shape, dtype='f4')
     # clip geoscore to non-negative
     geoscore = np.nan_to_num(geoscore, nan=0.0)
+    sx, sy, sz = patch_size
     picks = pick_weighted_positions(
         geoscore,
         shape,
@@ -89,8 +111,8 @@ def sample_patches_from_model(zvol, seismic_key, geoscore_key, patch_size, n_pat
     )
     patches = []
     for (i,j,k) in picks:
-        patch = seismic[i:i+patch_size, j:j+patch_size, k:k+patch_size]
-        if patch.shape == (patch_size, patch_size, patch_size):
+        patch = seismic[i:i+sx, j:j+sy, k:k+sz]
+        if patch.shape == (sx, sy, sz):
             patches.append(patch)
     return patches
 
@@ -226,7 +248,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True, help="directory that contains model_data.zarr folders")
     p.add_argument("--out", required=True)
-    p.add_argument("--patch_size", type=int, default=32)
+    p.add_argument("--patch_size", type=int, nargs='+', default=[32], help="Patch size: one value for cubic or three values X Y Z")
     p.add_argument("--n_patches", type=int, default=5000)
     p.add_argument("--n_per_volume", type=int, default=100)
     p.add_argument("--seismic_key", type=str, default="seismicCubes_cumsum__fullstack")
@@ -255,6 +277,7 @@ def main():
     p.add_argument("--allow_overlap", dest="allow_overlap", action="store_true", help="Allow overlapping/duplicate patch centers (default).")
     p.add_argument("--no_overlap", dest="allow_overlap", action="store_false", help="Disallow overlapping by sampling unique candidate centers.")
     args = p.parse_args()
+    patch_size = normalize_patch_size(args.patch_size)
 
     src = Path(args.source)
     out = Path(args.out)
@@ -264,9 +287,9 @@ def main():
     dst = cast(Any, zarr.open(str(out), mode="w"))
     # zarr 2.x uses create_dataset on groups, zarr 3.x uses create_array
     if hasattr(dst, 'create_dataset'):
-        dst.create_dataset("patches", shape=(args.n_patches, args.patch_size, args.patch_size, args.patch_size), dtype="f4", chunks=(1, args.patch_size, args.patch_size, args.patch_size))
+        dst.create_dataset("patches", shape=(args.n_patches, patch_size[0], patch_size[1], patch_size[2]), dtype="f4", chunks=(1, patch_size[0], patch_size[1], patch_size[2]))
     else:
-        dst.create_array("patches", shape=(args.n_patches, args.patch_size, args.patch_size, args.patch_size), dtype="f4", chunks=(1, args.patch_size, args.patch_size, args.patch_size))
+        dst.create_array("patches", shape=(args.n_patches, patch_size[0], patch_size[1], patch_size[2]), dtype="f4", chunks=(1, patch_size[0], patch_size[1], patch_size[2]))
 
     written = 0
     vols = [vol for vol in src.rglob("model_data.zarr") if not has_temp_folder_sibling(vol)]
@@ -308,7 +331,7 @@ def main():
                 z,
                 args.seismic_key,
                 args.geoscore_key,
-                args.patch_size,
+                patch_size,
                 n_patches_per_vol=args.n_per_volume,
                 allow_overlap=args.allow_overlap,
             )
