@@ -855,9 +855,18 @@ def train(args):
         missing_keys = required_keys.difference(checkpoint.keys())
         if missing_keys:
             missing_keys_display = ', '.join(sorted(missing_keys))
+            available_keys_display = ', '.join(sorted(str(k) for k in checkpoint.keys()))
+            if {'training', 'validation'}.issubset(checkpoint.keys()):
+                raise ValueError(
+                    f'Checkpoint {ckpt_path} looks like representative-example metadata, not model weights. '
+                    'Pass a VAE checkpoint such as vae_best.pt or vae_epoch<N>.pt to --resume. '
+                    f'Available keys in the provided file: [{available_keys_display}].'
+                )
             raise ValueError(
                 f'Checkpoint {ckpt_path} is missing required keys: {missing_keys_display}. '
-                "Expected keys: ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']."
+                "Expected keys: ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']. "
+                f'Available keys in the provided file: [{available_keys_display}]. '
+                'If you intended to resume training, pass a VAE checkpoint such as vae_best.pt or vae_epoch<N>.pt.'
             )
 
         checkpoint_patch_shape = tuple(int(v) for v in checkpoint['patch_shape'])
