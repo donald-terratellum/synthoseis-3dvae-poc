@@ -39,6 +39,7 @@ Optional useful flags:
 - `--patch-size 32`
 - `--stride 16`
 - `--batch-size 32`
+- `--similarity-mode cosine|dot`
 - `--x --y --z` (token center override)
 - `--benchmark-json /path/to/benchmark.json`
 
@@ -66,6 +67,20 @@ Benchmark JSON includes:
 uv run python scripts/tokenize.py ui --source /path/to/source.zarr
 ```
 
+Optional useful flags:
+- `--latent-mode vae|pooled` (default `pooled`)
+- `--model-path <checkpoint.pt>` (used when `--latent-mode vae`)
+- `--device auto|cpu|cuda|mps`
+
+Example (UI search using a trained VAE checkpoint):
+```bash
+uv run python scripts/tokenize.py ui \
+  --source /path/to/source.zarr \
+  --latent-mode vae \
+  --model-path checkpoints_gan_vwarp_mixup_32-32-64/vae_epoch21.pt \
+  --device auto
+```
+
 ## UI workflow
 1. Load source volume.
 2. Move slice/display controls.
@@ -74,10 +89,20 @@ uv run python scripts/tokenize.py ui --source /path/to/source.zarr
 5. Watch progress panel and status messages.
 6. Load or auto-load output similarity overlay.
 7. Adjust output clip and alpha controls.
+8. Use Overlay Threshold to hide low-magnitude overlay values.
+9. Select Similarity Metric (Cosine or Dot Product) before running search.
+
+## UI state persistence
+- UI state is saved automatically to `~/.synthoseis_tokenizer_ui_state.json`.
+- Saved state includes source/output paths, selected token point, display sliders, and vertical exaggeration.
+- On next launch, state is restored automatically.
+- If `--source` is provided on the CLI, that source path overrides the saved source for that run.
+- Use the Reset UI State button in the UI to remove the saved state file.
 
 ## Interpreting results
 - Higher cosine similarity means stronger latent-pattern match to the selected token.
 - Overlay clip/alpha change how strongly output is represented in preview state.
+- Overlay threshold makes values below the selected level transparent.
 - Overlap + Hann taper smoothing reduces seam artifacts.
 
 ## Troubleshooting

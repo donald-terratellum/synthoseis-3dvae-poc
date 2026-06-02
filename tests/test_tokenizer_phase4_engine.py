@@ -90,6 +90,38 @@ class Phase4EngineTests(unittest.TestCase):
         self.assertEqual(out.shape, padded.shape)
         self.assertTrue(np.isfinite(out).all())
 
+    def test_overlap_search_similarity_mode_switch_changes_values(self):
+        padded = np.ones((2, 2, 2), dtype=np.float32)
+        token_latent = np.array([2.0], dtype=np.float32)
+
+        def identity_preprocess(cube: np.ndarray) -> np.ndarray:
+            return cube
+
+        def latent_scalar(cube: np.ndarray) -> np.ndarray:
+            return np.array([float(cube.reshape(-1)[0])], dtype=np.float32)
+
+        out_cos = run_similarity_search_on_padded_volume(
+            padded_volume=padded,
+            token_latent=token_latent,
+            patch_size=1,
+            stride=1,
+            preprocess_fn=identity_preprocess,
+            latent_fn=latent_scalar,
+            similarity_mode="cosine",
+        )
+        out_dot = run_similarity_search_on_padded_volume(
+            padded_volume=padded,
+            token_latent=token_latent,
+            patch_size=1,
+            stride=1,
+            preprocess_fn=identity_preprocess,
+            latent_fn=latent_scalar,
+            similarity_mode="dot",
+        )
+
+        self.assertTrue(np.allclose(out_cos, 1.0, atol=1e-6))
+        self.assertTrue(np.allclose(out_dot, 2.0, atol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()

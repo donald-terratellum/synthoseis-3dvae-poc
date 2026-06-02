@@ -11,7 +11,7 @@ import zarr
 
 from src.tokenizer.core.batching import adaptive_batch_map
 from src.tokenizer.core.events import JobEvent
-from src.tokenizer.core.io_zarr import compute_padding, remove_padding
+from src.tokenizer.core.io_zarr import compute_padding, normalize_patch_size, remove_padding
 from src.tokenizer.core.metrics import write_benchmark_report
 from src.tokenizer.core.model_adapter import VaeLatentAdapter, cube_to_latent_128
 from src.tokenizer.core.preprocess import preprocess_for_token
@@ -35,20 +35,21 @@ def compute_windows_per_axis(axis_len: int, patch_size: int = 32, stride: int = 
 
 def compute_total_windows_from_padded_shape(
     padded_shape: Sequence[int],
-    patch_size: int = 32,
+    patch_size: int | Sequence[int] = 32,
     stride: int = 16,
 ) -> int:
     if len(padded_shape) != 3:
         raise ValueError("padded_shape must have 3 axes")
-    wx = compute_windows_per_axis(int(padded_shape[0]), patch_size=patch_size, stride=stride)
-    wy = compute_windows_per_axis(int(padded_shape[1]), patch_size=patch_size, stride=stride)
-    wz = compute_windows_per_axis(int(padded_shape[2]), patch_size=patch_size, stride=stride)
+    sx, sy, sz = normalize_patch_size(patch_size)
+    wx = compute_windows_per_axis(int(padded_shape[0]), patch_size=sx, stride=stride)
+    wy = compute_windows_per_axis(int(padded_shape[1]), patch_size=sy, stride=stride)
+    wz = compute_windows_per_axis(int(padded_shape[2]), patch_size=sz, stride=stride)
     return int(wx * wy * wz)
 
 
 def estimate_total_windows_for_source_shape(
     volume_shape: Sequence[int],
-    patch_size: int = 32,
+    patch_size: int | Sequence[int] = 32,
     stride: int = 16,
     base_pad: int = 16,
 ) -> int:
@@ -65,11 +66,12 @@ def estimate_total_windows_for_source_shape(
 class SearchExecutionSpec:
     search_volume: np.ndarray
     token_latent: np.ndarray
-    patch_size: int = 32
+    patch_size: int | Sequence[int] = 32
     stride: int = 16
     batch_size: int = 32
     output_zarr_path: Optional[str] = None
     latent_mode: str = "pooled"
+    similarity_mode: str = "cosine"
     model_path: Optional[str] = None
     device: str = "auto"
     keep_partial_output: bool = False
@@ -187,6 +189,7 @@ def _search_worker(
             stride=spec.stride,
             preprocess_fn=preprocess_for_token,
             latent_batch_fn=latent_batch_fn,
+            similarity_mode=spec.similarity_mode,
             batch_size=spec.batch_size,
             progress_callback=on_progress,
             should_cancel=should_cancel,
@@ -216,10 +219,11 @@ def _search_worker(
                         "total_windows": int(total_for_metrics),
                         "elapsed_s": float(elapsed),
                         "windows_per_sec": float(windows_per_sec),
-                        "patch_size": int(spec.patch_size),
+                        "patch_size": list(normalize_patch_size(spec.patch_size)),
                         "stride": int(spec.stride),
                         "batch_size": int(spec.batch_size),
                         "latent_mode": str(spec.latent_mode),
+                        "similarity_mode": str(spec.similarity_mode),
                         "device": str(spec.device),
                     },
                 )
@@ -253,6 +257,7 @@ def _search_worker(
                     "stride": int(spec.stride),
                     "batch_size": int(spec.batch_size),
                     "latent_mode": str(spec.latent_mode),
+                    "similarity_mode": str(spec.similarity_mode),
                     "device": str(spec.device),
                     "output_shape": list(similarity.shape),
                     "output_min": float(similarity.min()),

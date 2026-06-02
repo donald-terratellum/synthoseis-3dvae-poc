@@ -15,6 +15,11 @@ Interactive seismic pattern search application built on the trained VAE latent s
 uv run python scripts/tokenize.py ui --source /path/to/source.zarr
 ```
 
+Optional UI flags:
+- `--latent-mode vae|pooled`
+- `--model-path /path/to/checkpoint.pt` (used when `--latent-mode vae`)
+- `--device auto|cpu|cuda|mps`
+
 ## CLI modes
 ```bash
 uv run python scripts/tokenize.py build-token ...

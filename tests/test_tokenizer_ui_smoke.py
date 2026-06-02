@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+import json
 
 import numpy as np
 import zarr
@@ -252,6 +253,58 @@ class TokenizerUiSmokeTests(unittest.TestCase):
 
         self.assertTrue(window.job_progress_bar.isHidden())
         self.assertIn("Search", window.status_label.text())
+
+    def test_controller_state_payload_save_restore_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "ui_state.json"
+
+            window_a = MainWindow()
+            controller_a = TokenizerController(window_a, state_file=state_path)
+            volume = np.zeros((12, 13, 14), dtype=np.float32)
+            controller_a.set_volume(volume)
+
+            window_a.source_path.setText("/tmp/source.zarr")
+            window_a.inline_slider.setValue(7)
+            window_a.crossline_slider.setValue(8)
+            window_a.z_slider.setValue(9)
+            window_a.input_clip_slider.setValue(33)
+            window_a.output_clip_slider.setValue(44)
+            window_a.overlay_threshold_slider.setValue(55)
+            window_a.overlay_alpha_slider.setValue(66)
+            window_a.x_spin.setValue(3)
+            window_a.y_spin.setValue(4)
+            window_a.z_spin.setValue(5)
+            controller_a.save_session_state()
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("display_state", payload)
+            self.assertEqual(payload["display_state"]["overlay_threshold"], 0.55)
+
+            window_b = MainWindow()
+            controller_b = TokenizerController(window_b, state_file=state_path)
+            controller_b.restore_session_state(auto_load_source=False)
+            controller_b.set_volume(np.zeros((12, 13, 14), dtype=np.float32))
+
+            self.assertEqual(window_b.source_path.text(), "/tmp/source.zarr")
+            self.assertEqual(window_b.inline_slider.value(), 7)
+            self.assertEqual(window_b.crossline_slider.value(), 8)
+            self.assertEqual(window_b.z_slider.value(), 9)
+            self.assertEqual(window_b.overlay_threshold_slider.value(), 55)
+            self.assertEqual(window_b.overlay_alpha_slider.value(), 66)
+
+    def test_reset_ui_state_button_removes_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "ui_state.json"
+
+            window = MainWindow()
+            controller = TokenizerController(window, state_file=state_path)
+            controller.save_session_state()
+            self.assertTrue(state_path.exists())
+
+            window.reset_state_button.click()
+
+            self.assertFalse(state_path.exists())
+            self.assertIn("UI state reset", window.status_label.text())
 
 
 if __name__ == "__main__":

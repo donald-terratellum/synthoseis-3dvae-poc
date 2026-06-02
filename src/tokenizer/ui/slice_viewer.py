@@ -17,6 +17,7 @@ class SliceViewState:
     z_index: int = 0
     input_clip: float = 0.5
     output_clip: float = 0.5
+    overlay_threshold: float = 0.5
     overlay_alpha: float = 0.6
 
 
@@ -39,6 +40,7 @@ class SliceViewer(QWidget):
         self._point_pick_mode = False
         self._pick_drag_active = False
         self._headless = os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen"
+        self._patch_shape: tuple[int, int, int] = (32, 32, 32)
         self.plotter: Optional[Any] = None
         self._pv_module: Optional[Any] = None
         self._cell_picker: Optional[Any] = None
@@ -80,6 +82,23 @@ class SliceViewer(QWidget):
 
         self._markers: list[Any] = []
 
+    def set_patch_shape(self, patch_size: int | tuple[int, int, int] | list[int]) -> None:
+        if isinstance(patch_size, int):
+            dims = (int(patch_size), int(patch_size), int(patch_size))
+        elif isinstance(patch_size, list) and len(patch_size) == 3:
+            dims = (int(patch_size[0]), int(patch_size[1]), int(patch_size[2]))
+        elif isinstance(patch_size, tuple) and len(patch_size) == 3:
+            dims = (int(patch_size[0]), int(patch_size[1]), int(patch_size[2]))
+        else:
+            raise ValueError("patch_size must be an int or a length-3 tuple/list")
+
+        px, py, pz = dims
+        if px <= 0 or py <= 0 or pz <= 0:
+            raise ValueError("patch_size values must be positive")
+
+        self._patch_shape = dims
+        self._render_scene()
+
     def set_source_volume(self, volume: np.ndarray) -> None:
         src = np.asarray(volume, dtype=np.float32)
         shape = (int(src.shape[0]), int(src.shape[1]), int(src.shape[2]))
@@ -116,7 +135,7 @@ class SliceViewer(QWidget):
 
         display_volume = self._build_display_volume(self._output)
         lo, hi = self._output_clim if self._output_clim is not None else (0.0, 1.0)
-        clip_fraction = float(np.clip(self._state.output_clip, 0.0, 1.0))
+        clip_fraction = float(np.clip(self._state.overlay_threshold, 0.0, 1.0))
         span = max(abs(lo), abs(hi), 1e-6)
         threshold = clip_fraction * span
         masked = np.where(np.abs(display_volume) >= threshold, display_volume, np.nan)
@@ -356,14 +375,14 @@ class SliceViewer(QWidget):
         self.plotter.add_mesh(y_line, color="red", line_width=3.0, show_scalar_bar=False)
         self.plotter.add_mesh(z_line, color="red", line_width=3.0, show_scalar_bar=False)
 
-        half = 16
         if self._pv_module is None:
             raise RuntimeError("PyVista module is not initialized")
+        px, py, pz = self._patch_shape
         cube = self._pv_module.Cube(
             center=(float(sx), float(sy), sz_plot),
-            x_length=float(2 * half),
-            y_length=float(2 * half),
-            z_length=float(2 * half) * z_scale,
+            x_length=float(px),
+            y_length=float(py),
+            z_length=float(pz) * z_scale,
         )
         self.plotter.add_mesh(cube, style="wireframe", color="red", line_width=2.0)
 
@@ -375,7 +394,11 @@ class SliceViewer(QWidget):
             out_x = out.slice(normal="x", origin=(ox, 0, 0))
             out_y = out.slice(normal="y", origin=(0, oy, 0))
             out_z = out.slice(normal="z", origin=(0, 0, z_plot))
-            out_clim = self._output_clim if self._output_clim is not None else (0.0, 1.0)
+            base_clim = self._output_clim if self._output_clim is not None else (0.0, 1.0)
+            base_span = max(abs(float(base_clim[0])), abs(float(base_clim[1])), 1e-6)
+            clip_scale = max(0.01, float(np.clip(self._state.output_clip, 0.0, 1.0)))
+            clip_span = base_span * clip_scale
+            out_clim = (-clip_span, clip_span)
             self.plotter.add_mesh(
                 out_x,
                 cmap="bwr",

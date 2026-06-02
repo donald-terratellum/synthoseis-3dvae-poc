@@ -5,6 +5,22 @@ import numpy as np
 import zarr
 
 
+def normalize_patch_size(patch_size: int | Sequence[int]) -> tuple[int, int, int]:
+    if isinstance(patch_size, int):
+        dims = (int(patch_size), int(patch_size), int(patch_size))
+    else:
+        values = tuple(int(v) for v in patch_size)
+        if len(values) == 1:
+            dims = (values[0], values[0], values[0])
+        elif len(values) == 3:
+            dims = values
+        else:
+            raise ValueError("patch_size expects either 1 value or 3 values")
+    if any(v <= 0 for v in dims):
+        raise ValueError("patch_size values must be > 0")
+    return dims
+
+
 def open_volume_array(zarr_path: Path, key: Optional[str] = None):
     root = zarr.open(str(zarr_path), mode="r")
 
@@ -29,22 +45,27 @@ def load_volume_numpy(zarr_path: Path, key: Optional[str] = None) -> np.ndarray:
     return np.asarray(arr, dtype=np.float32)
 
 
-def extract_centered_cube(volume: np.ndarray, x: int, y: int, z: int, patch_size: int = 32) -> np.ndarray:
-    if patch_size <= 0:
-        raise ValueError("patch_size must be > 0")
+def extract_centered_cube(
+    volume: np.ndarray,
+    x: int,
+    y: int,
+    z: int,
+    patch_size: int | Sequence[int] = 32,
+) -> np.ndarray:
+    sx, sy, sz = normalize_patch_size(patch_size)
     if volume.ndim != 3:
         raise ValueError("volume must be a 3D array")
 
-    half = patch_size // 2
-    x0, x1 = x - half, x - half + patch_size
-    y0, y1 = y - half, y - half + patch_size
-    z0, z1 = z - half, z - half + patch_size
+    hx, hy, hz = sx // 2, sy // 2, sz // 2
+    x0, x1 = x - hx, x - hx + sx
+    y0, y1 = y - hy, y - hy + sy
+    z0, z1 = z - hz, z - hz + sz
 
     xs0, xs1 = max(0, x0), min(volume.shape[0], x1)
     ys0, ys1 = max(0, y0), min(volume.shape[1], y1)
     zs0, zs1 = max(0, z0), min(volume.shape[2], z1)
 
-    out = np.zeros((patch_size, patch_size, patch_size), dtype=np.float32)
+    out = np.zeros((sx, sy, sz), dtype=np.float32)
 
     ox0, oy0, oz0 = xs0 - x0, ys0 - y0, zs0 - z0
     ox1, oy1, oz1 = ox0 + (xs1 - xs0), oy0 + (ys1 - ys0), oz0 + (zs1 - zs0)
@@ -72,7 +93,11 @@ def compute_axis_padding(axis_len: int, patch_size: int = 32, base_pad: int = 16
 def compute_padding(volume_shape: Sequence[int], patch_size: int = 32, base_pad: int = 16) -> Tuple[Tuple[int, int], ...]:
     if len(volume_shape) != 3:
         raise ValueError("volume_shape must have 3 axes")
-    return tuple(compute_axis_padding(int(axis), patch_size=patch_size, base_pad=base_pad) for axis in volume_shape)
+    patch_shape = normalize_patch_size(patch_size)
+    return tuple(
+        compute_axis_padding(int(axis), patch_size=int(patch_axis), base_pad=base_pad)
+        for axis, patch_axis in zip(volume_shape, patch_shape)
+    )
 
 
 def resolve_chunk_shape(volume_shape: Sequence[int], chunk_spec: Sequence[int]) -> Tuple[int, ...]:
@@ -93,7 +118,7 @@ def resolve_chunk_shape(volume_shape: Sequence[int], chunk_spec: Sequence[int]) 
 def prepare_temp_search_volume(
     source_volume: np.ndarray,
     out_zarr_path: Path,
-    patch_size: int = 32,
+    patch_size: int | Sequence[int] = 32,
     base_pad: int = 16,
     chunk_spec: Sequence[int] = (16, 16, -1),
 ) -> tuple[np.ndarray, tuple[tuple[int, int], ...], tuple[int, ...]]:

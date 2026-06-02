@@ -44,10 +44,29 @@ def choose_torch_device(requested: str = "auto") -> torch.device:
 class VaeLatentAdapter:
     def __init__(self, checkpoint_path, device: str = "auto"):
         self.device = choose_torch_device(device)
-        self.model = VAE3D(in_ch=1, out_ch=1, base_ch=16, latent_dim=128)
 
         checkpoint = torch.load(str(checkpoint_path), map_location=self.device)
-        state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                f"Checkpoint {checkpoint_path} is invalid. Expected dict with keys "
+                "['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']."
+            )
+        required_keys = {"model_state_dict", "patch_shape", "latent_dim", "base_ch"}
+        missing = required_keys.difference(checkpoint.keys())
+        if missing:
+            raise ValueError(f"Checkpoint {checkpoint_path} missing required keys: {sorted(missing)}")
+
+        self.patch_shape = tuple(int(v) for v in checkpoint["patch_shape"])
+        self.latent_dim = int(checkpoint["latent_dim"])
+        self.base_ch = int(checkpoint["base_ch"])
+        self.model = VAE3D(
+            in_ch=1,
+            out_ch=1,
+            base_ch=self.base_ch,
+            latent_dim=self.latent_dim,
+            patch_shape=self.patch_shape,
+        )
+        state_dict = checkpoint["model_state_dict"]
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
@@ -55,8 +74,8 @@ class VaeLatentAdapter:
     @torch.inference_mode()
     def encode_batch(self, cubes: np.ndarray) -> np.ndarray:
         arr = np.asarray(cubes, dtype=np.float32)
-        if arr.ndim != 4 or arr.shape[1:] != (32, 32, 32):
-            raise ValueError(f"expected cubes shape (B,32,32,32), got {arr.shape}")
+        if arr.ndim != 4 or arr.shape[1:] != self.patch_shape:
+            raise ValueError(f"expected cubes shape (B,{self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}")
 
         batch = torch.from_numpy(arr[:, None, :, :, :]).to(self.device)
         mu, _ = self.model.encoder(batch)
@@ -65,7 +84,9 @@ class VaeLatentAdapter:
     @torch.inference_mode()
     def encode_cube(self, cube: np.ndarray) -> np.ndarray:
         arr = np.asarray(cube, dtype=np.float32)
-        if arr.shape != (32, 32, 32):
-            raise ValueError(f"expected cube shape (32,32,32), got {arr.shape}")
+        if arr.shape != self.patch_shape:
+            raise ValueError(
+                f"expected cube shape ({self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}"
+            )
         out = self.encode_batch(arr[None, ...])
         return np.ascontiguousarray(out[0], dtype=np.float32)

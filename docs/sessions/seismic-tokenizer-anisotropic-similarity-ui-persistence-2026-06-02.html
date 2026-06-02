@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Session Summary: Seismic Tokenizer Anisotropic Search, Similarity Modes, and UI Persistence (2026-06-02)</title>
+  <style>
+    :root {
+      --bg: #f7f9fc;
+      --card: #ffffff;
+      --text: #1c2430;
+      --muted: #5a6678;
+      --accent: #0b6bcb;
+      --border: #dce3ee;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    main {
+      max-width: 980px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      margin-bottom: 1rem;
+    }
+    h1, h2 {
+      margin-top: 0;
+      color: #132033;
+    }
+    h1 {
+      font-size: 1.4rem;
+      margin-bottom: 0.75rem;
+    }
+    h2 {
+      font-size: 1.05rem;
+      margin-bottom: 0.5rem;
+    }
+    p, li { color: var(--text); }
+    .muted { color: var(--muted); }
+    code {
+      background: #eef3fb;
+      border: 1px solid #d9e6fa;
+      border-radius: 6px;
+      padding: 0.05rem 0.35rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Session Summary: Seismic Tokenizer Anisotropic Search, Similarity Modes, and UI Persistence (2026-06-02)</h1>
+      <p class="muted">Repository: <code>synthoseis-3dvae-poc</code> | Branch: <code>feat/seismic-tokenizer-app</code></p>
+    </section>
+
+    <section class="card">
+      <h2>Context And Goals</h2>
+      <p>The session focused on extending the seismic tokenizer workflow so search and UI behavior are more flexible and production-ready.</p>
+      <ul>
+        <li>Support anisotropic patch sizes across CLI, core search, and UI-driven workflows.</li>
+        <li>Add selectable similarity metrics (cosine or dot product) for latent search.</li>
+        <li>Improve VAE checkpoint compatibility by reading model metadata from checkpoints.</li>
+        <li>Improve desktop UI usability with overlay thresholding and persisted state.</li>
+        <li>Expand tests and docs to match the new behavior.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>What Was Done</h2>
+      <ul>
+        <li>Added patch-size normalization and propagated tuple patch support through centered extraction, padding, and total-window calculations.</li>
+        <li>Added similarity mode support (<code>cosine</code>, <code>dot</code>) through CLI options, search engine scoring, and job metrics.</li>
+        <li>Updated VAE adapter to require checkpoint metadata (<code>model_state_dict</code>, <code>patch_shape</code>, <code>latent_dim</code>, <code>base_ch</code>) and enforce shape-aware encoding.</li>
+        <li>Extended UI controls with Overlay Threshold slider, Similarity Metric selector, Reset UI State button, and window-closing persistence signal.</li>
+        <li>Implemented persistent UI state save/restore for source/output paths, selected point, display controls, and vertical exaggeration.</li>
+        <li>Updated SliceViewer to render token marker dimensions from dynamic patch shape and apply overlay threshold masking.</li>
+        <li>Added/updated tests for similarity mode behavior, UI state save/restore compatibility, and reset-state behavior.</li>
+        <li>Updated tokenizer docs for new CLI flags, UI controls, and persistence behavior.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>How Was It Done</h2>
+      <ul>
+        <li>Refactored patch-size handling to a normalized <code>(x, y, z)</code> shape and threaded this through search preparation, overlap windowing, and worker metrics.</li>
+        <li>Replaced hardwired cosine scoring call sites with a mode-dispatched similarity helper.</li>
+        <li>Made the VAE adapter instantiate <code>VAE3D</code> from checkpoint metadata and validate compatibility before encoding.</li>
+        <li>Wired UI controls into controller state updates and background search execution spec.</li>
+        <li>Added persistence read/write helpers in controller and restoration logic that applies volume-dependent state after source load.</li>
+        <li>Extended smoke/unit tests to cover new paths and preserve regression confidence.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>When Was It Done And By Whom</h2>
+      <ul>
+        <li>Date: 2026-06-02</li>
+        <li>Session author: GitHub Copilot (GPT-5.3-Codex)</li>
+        <li>Collaborator/requestor: Donald PG</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Basic Info</h2>
+      <ul>
+        <li>Relevant baseline commits: <code>1ab548b</code>, <code>1a7e46e</code>.</li>
+        <li>Session-related files include tokenizer core, UI, docs, and tests touched in this working session.</li>
+      </ul>
+      <p><strong>Files involved:</strong></p>
+      <ul>
+        <li><code>docs/seismic_tokenizer/README.md</code></li>
+        <li><code>docs/seismic_tokenizer/user_guide.md</code></li>
+        <li><code>scripts/tokenize.py</code></li>
+        <li><code>src/tokenizer/core/io_zarr.py</code></li>
+        <li><code>src/tokenizer/core/jobs.py</code></li>
+        <li><code>src/tokenizer/core/model_adapter.py</code></li>
+        <li><code>src/tokenizer/core/search_engine.py</code></li>
+        <li><code>src/tokenizer/core/similarity.py</code></li>
+        <li><code>src/tokenizer/core/token_picker.py</code></li>
+        <li><code>src/tokenizer/ui/controller.py</code></li>
+        <li><code>src/tokenizer/ui/main_window.py</code></li>
+        <li><code>src/tokenizer/ui/slice_viewer.py</code></li>
+        <li><code>src/tokenizer/ui/state.py</code></li>
+        <li><code>tests/test_tokenizer_phase4_engine.py</code></li>
+        <li><code>tests/test_tokenizer_ui_smoke.py</code></li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Next Or Future Follow-Up Suggestions</h2>
+      <ol>
+        <li>Add explicit tests for anisotropic patch sizes in end-to-end search-volume flows.</li>
+        <li>Add tests covering VAE-checkpoint metadata validation failure modes.</li>
+        <li>Consider exposing patch-size and stride controls in the UI for advanced search tuning.</li>
+        <li>Add docs/examples showing when to prefer <code>dot</code> vs <code>cosine</code> similarity.</li>
+        <li>Evaluate whether pooled latent mode should support non-<code>32x32x32</code> patches or present clearer UX messaging.</li>
+      </ol>
+    </section>
+  </main>
+</body>
+</html>

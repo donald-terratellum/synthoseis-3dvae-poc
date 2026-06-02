@@ -4,6 +4,7 @@ import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -25,6 +26,8 @@ class MainWindow(QMainWindow):
     sourceLoadRequested = Signal(str)
     outputLoadRequested = Signal(str)
     displayStateChanged = Signal(dict)
+    windowClosing = Signal()
+    resetUiStateRequested = Signal()
     startSearchRequested = Signal()
     cancelSearchRequested = Signal()
 
@@ -168,6 +171,24 @@ class MainWindow(QMainWindow):
         )
         self._bind_slider_commit(self.output_clip_slider, self._on_display_control_changed)
 
+        self.overlay_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.overlay_threshold_slider.setMinimum(0)
+        self.overlay_threshold_slider.setMaximum(100)
+        self.overlay_threshold_slider.setValue(50)
+        self.overlay_threshold_slider.setTracking(True)
+        self.overlay_threshold_value_label = QLabel()
+        controls_layout.addLayout(
+            self._create_labeled_slider_row(
+                "Overlay Threshold", self.overlay_threshold_value_label, self.overlay_threshold_slider
+            )
+        )
+        self._bind_slider_readout(
+            self.overlay_threshold_slider,
+            self.overlay_threshold_value_label,
+            lambda value: f"{value / 100.0:.2f}",
+        )
+        self._bind_slider_commit(self.overlay_threshold_slider, self._on_display_control_changed)
+
         self.overlay_alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.overlay_alpha_slider.setMinimum(0)
         self.overlay_alpha_slider.setMaximum(100)
@@ -185,6 +206,15 @@ class MainWindow(QMainWindow):
             lambda value: f"{value / 100.0:.2f}",
         )
         self._bind_slider_commit(self.overlay_alpha_slider, self._on_display_control_changed)
+
+        metric_row = QHBoxLayout()
+        metric_row.addWidget(QLabel("Similarity Metric"))
+        self.similarity_mode_combo = QComboBox()
+        self.similarity_mode_combo.addItem("Cosine", "cosine")
+        self.similarity_mode_combo.addItem("Dot Product", "dot")
+        self.similarity_mode_combo.currentIndexChanged.connect(lambda _idx: self._on_display_control_changed(0))
+        metric_row.addWidget(self.similarity_mode_combo)
+        controls_layout.addLayout(metric_row)
 
         self.start_search_button = QPushButton("Start Search")
         self.start_search_button.clicked.connect(lambda: self.startSearchRequested.emit())
@@ -205,6 +235,10 @@ class MainWindow(QMainWindow):
         self.pick_button = QPushButton("Pick Token")
         self.pick_button.clicked.connect(self._emit_token_pick)
         controls_layout.addWidget(self.pick_button)
+
+        self.reset_state_button = QPushButton("Reset UI State")
+        self.reset_state_button.clicked.connect(lambda: self.resetUiStateRequested.emit())
+        controls_layout.addWidget(self.reset_state_button)
 
         self.status_label = QLabel("Ready")
         controls_layout.addWidget(self.status_label)
@@ -261,6 +295,9 @@ class MainWindow(QMainWindow):
         self._vertical_exaggeration = exag
         self.slice_viewer.set_vertical_exaggeration(exag)
         self.status_label.setText(f"Vertical exaggeration: {exag:.1f}x")
+
+    def set_patch_shape(self, patch_size: int | tuple[int, int, int] | list[int]) -> None:
+        self.slice_viewer.set_patch_shape(patch_size)
 
     def get_vertical_exaggeration(self) -> float:
         return float(self._vertical_exaggeration)
@@ -356,7 +393,9 @@ class MainWindow(QMainWindow):
             "z_index": int(self.z_slider.value()),
             "input_clip": float(self.input_clip_slider.value()) / 100.0,
             "output_clip": float(self.output_clip_slider.value()) / 100.0,
+            "overlay_threshold": float(self.overlay_threshold_slider.value()) / 100.0,
             "overlay_alpha": float(self.overlay_alpha_slider.value()) / 100.0,
+            "similarity_mode": str(self.similarity_mode_combo.currentData() or "cosine"),
         }
 
     def set_output_volume(self, volume: np.ndarray) -> None:
@@ -372,9 +411,19 @@ class MainWindow(QMainWindow):
                 z_index=int(snapshot.get("z_index", 0)),
                 input_clip=float(snapshot.get("input_clip", 0.5)),
                 output_clip=float(snapshot.get("output_clip", 0.5)),
+                overlay_threshold=float(snapshot.get("overlay_threshold", 0.5)),
                 overlay_alpha=float(snapshot.get("overlay_alpha", 0.6)),
             )
         )
+
+        mode = str(snapshot.get("similarity_mode", "cosine"))
+        idx = self.similarity_mode_combo.findData(mode)
+        if idx >= 0 and idx != self.similarity_mode_combo.currentIndex():
+            self.similarity_mode_combo.setCurrentIndex(idx)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.windowClosing.emit()
+        super().closeEvent(event)
 
     def set_job_progress_visible(self, visible: bool) -> None:
         self.job_progress_label.setVisible(visible)

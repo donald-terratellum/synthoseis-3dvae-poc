@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 
@@ -9,7 +9,7 @@ from .preprocess import preprocess_for_token
 def build_preprocessed_token_cube(
     volume: np.ndarray,
     center_xyz: Tuple[int, int, int],
-    patch_size: int = 32,
+    patch_size: int | Sequence[int] = 32,
 ) -> np.ndarray:
     x, y, z = center_xyz
     cube = extract_centered_cube(volume, x=x, y=y, z=z, patch_size=patch_size)
