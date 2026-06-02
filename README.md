@@ -19,6 +19,7 @@ uv sync
 ## Repository Map
 
 - [docs/training/README.md](docs/training/README.md): Training component overview, quickstart, and key files.
+- [docs/training/latent_alignment_experiments.md](docs/training/latent_alignment_experiments.md): Latent alignment theory, usage, and ablation guide for detail-focused VAE training.
 - [docs/seismic_tokenizer/README.md](docs/seismic_tokenizer/README.md): Application component overview and entrypoints.
 - [docs/seismic_tokenizer/user_guide.md](docs/seismic_tokenizer/user_guide.md): End-user commands, UI workflow, troubleshooting, and test commands.
 - [docs/seismic_tokenizer/code_description.md](docs/seismic_tokenizer/code_description.md): Architecture and module responsibilities.

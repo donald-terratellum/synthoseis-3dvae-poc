@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 import zarr
@@ -206,6 +207,21 @@ def compute_vae_losses(recon, targets, mu, logvar, kl_weight):
     return loss, rec_loss, kld
 
 
+def compute_latent_alignment_losses(model, input_mu, recon, targets, detach_targets=True):
+    pred_mu, _ = model.encoder(recon)
+    target_mu, _ = model.encoder(targets)
+
+    reference_input_mu = input_mu
+    reference_target_mu = target_mu
+    if detach_targets:
+        reference_input_mu = reference_input_mu.detach()
+        reference_target_mu = reference_target_mu.detach()
+
+    pred_target_loss = F.mse_loss(pred_mu, reference_target_mu)
+    pred_input_loss = F.mse_loss(pred_mu, reference_input_mu)
+    return pred_target_loss, pred_input_loss
+
+
 def compute_discriminator_gan_loss(discriminator, real_cubes, fake_cubes_detached):
     real_logits = discriminator(real_cubes)
     fake_logits = discriminator(fake_cubes_detached)
@@ -258,8 +274,43 @@ def get_kl_weight(epoch_idx, args):
     return float(args.kl_start + progress * (args.kl_end - args.kl_start))
 
 
+def get_named_group_lr(optimizer, group_name, fallback=float('nan')):
+    for param_group in optimizer.param_groups:
+        if param_group.get('name') == group_name:
+            return float(param_group['lr'])
+    return float(fallback)
+
+
 def build_optimizer(model, args):
-    return torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if args.encoder_lr_mult <= 0.0:
+        raise ValueError('--encoder_lr_mult must be positive.')
+    if args.decoder_lr_mult <= 0.0:
+        raise ValueError('--decoder_lr_mult must be positive.')
+
+    base_lr = float(args.learning_rate)
+    if args.encoder_lr_mult == 1.0 and args.decoder_lr_mult == 1.0:
+        return torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
+
+    encoder_params = list(model.encoder.parameters())
+    decoder_params = list(model.decoder.parameters())
+    tracked_ids = {id(p) for p in encoder_params + decoder_params}
+    other_params = [p for p in model.parameters() if id(p) not in tracked_ids]
+
+    param_groups = [
+        {
+            'params': encoder_params,
+            'lr': base_lr * float(args.encoder_lr_mult),
+            'name': 'encoder',
+        },
+        {
+            'params': decoder_params,
+            'lr': base_lr * float(args.decoder_lr_mult),
+            'name': 'decoder',
+        },
+    ]
+    if other_params:
+        param_groups.append({'params': other_params, 'lr': base_lr, 'name': 'other'})
+    return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=args.weight_decay)
 
 
 def build_discriminator(args):
@@ -594,6 +645,9 @@ def train_one_epoch(
     grad_clip,
     kl_weight,
     gan_weight,
+    latent_pred_target_weight,
+    latent_pred_input_weight,
+    latent_alignment_detach_targets,
 ):
     model.train()
     if discriminator is not None:
@@ -602,6 +656,8 @@ def train_one_epoch(
     total_g_gan_loss = 0.0
     total_d_gan_loss = 0.0
     total_d_gan_acc = 0.0
+    total_latent_pred_target_loss = 0.0
+    total_latent_pred_input_loss = 0.0
     batch_iter = iter(dataloader) if steps_per_epoch is None else itertools.cycle(dataloader)
 
     last_snapshot = None
@@ -626,13 +682,30 @@ def train_one_epoch(
         # Generator (VAE) step.
         recon, mu, logvar = model(inputs)
         vae_loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
+        latent_pred_target_loss_value = 0.0
+        latent_pred_input_loss_value = 0.0
+        latent_loss = 0.0
+        if latent_pred_target_weight > 0.0 or latent_pred_input_weight > 0.0:
+            latent_pred_target_loss, latent_pred_input_loss = compute_latent_alignment_losses(
+                model,
+                mu,
+                recon,
+                targets,
+                detach_targets=latent_alignment_detach_targets,
+            )
+            latent_pred_target_loss_value = float(latent_pred_target_loss.item())
+            latent_pred_input_loss_value = float(latent_pred_input_loss.item())
+            latent_loss = (
+                latent_pred_target_weight * latent_pred_target_loss
+                + latent_pred_input_weight * latent_pred_input_loss
+            )
+
         g_gan_loss_value = 0.0
+        total_g_loss = vae_loss + latent_loss
         if discriminator is not None:
             g_gan_loss = compute_generator_gan_loss(discriminator, recon)
             g_gan_loss_value = float(g_gan_loss.item())
-            total_g_loss = vae_loss + gan_weight * g_gan_loss
-        else:
-            total_g_loss = vae_loss
+            total_g_loss = total_g_loss + gan_weight * g_gan_loss
 
         optimizer.zero_grad()
         total_g_loss.backward()
@@ -642,6 +715,8 @@ def train_one_epoch(
         total_g_gan_loss += g_gan_loss_value
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
+        total_latent_pred_target_loss += latent_pred_target_loss_value
+        total_latent_pred_input_loss += latent_pred_input_loss_value
         per_example_mse = compute_per_example_mse(recon.detach(), targets.detach()).detach().cpu()
         last_snapshot = BatchSnapshot(
             inputs=inputs.detach().cpu().clone(),
@@ -655,6 +730,8 @@ def train_one_epoch(
         total_g_gan_loss / steps_per_epoch,
         total_d_gan_loss / steps_per_epoch,
         total_d_gan_acc / steps_per_epoch,
+        total_latent_pred_target_loss / steps_per_epoch,
+        total_latent_pred_input_loss / steps_per_epoch,
         last_snapshot,
     )
 
@@ -726,6 +803,19 @@ def validate(model, args, device, train_steps_per_epoch):
             targets = targets.to(device)
             recon, mu, logvar = model(inputs)
             loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight)
+            if args.latent_pred_target_weight > 0.0 or args.latent_pred_input_weight > 0.0:
+                latent_pred_target_loss, latent_pred_input_loss = compute_latent_alignment_losses(
+                    model,
+                    mu,
+                    recon,
+                    targets,
+                    detach_targets=args.latent_alignment_detach_targets,
+                )
+                loss = (
+                    loss
+                    + args.latent_pred_target_weight * latent_pred_target_loss
+                    + args.latent_pred_input_weight * latent_pred_input_loss
+                )
             total_loss += float(loss.item())
             per_example_mse = compute_per_example_mse(recon, targets).detach().cpu()
             last_snapshot = BatchSnapshot(
@@ -816,6 +906,17 @@ def train(args):
     print(f"Checkpoint schema keys={checkpoint_keys}")
     print("base_ch = base channel count for the VAE's convolution layers")
     print(
+        'Latent alignment:',
+        f"pred_target_weight={args.latent_pred_target_weight}",
+        f"pred_input_weight={args.latent_pred_input_weight}",
+        f"detach_targets={args.latent_alignment_detach_targets}",
+    )
+    print(
+        'Optimizer LR multipliers:',
+        f"encoder_lr_mult={args.encoder_lr_mult}",
+        f"decoder_lr_mult={args.decoder_lr_mult}",
+    )
+    print(
         "Checkpoint metadata:",
         f"patch_shape={list(model.patch_shape)}",
         f"latent_dim={model.latent_dim}",
@@ -851,6 +952,10 @@ def train(args):
         raise ValueError('--early_stopping_patience must be positive.')
     if args.gan_weight < 0:
         raise ValueError('--gan_weight must be non-negative.')
+    if args.latent_pred_target_weight < 0.0:
+        raise ValueError('--latent_pred_target_weight must be non-negative.')
+    if args.latent_pred_input_weight < 0.0:
+        raise ValueError('--latent_pred_input_weight must be non-negative.')
     if not 0.0 < args.gan_balance_target_low < 1.0:
         raise ValueError('--gan_balance_target_low must be in (0, 1).')
     if not 0.0 < args.gan_balance_target_high < 1.0:
@@ -953,7 +1058,15 @@ def train(args):
             args.current_kl_weight = kl_weight
             gan_weight_for_epoch = current_gan_weight
 
-            train_loss, g_gan_loss_epoch, d_gan_loss_epoch, d_gan_acc_epoch, train_last_snapshot = train_one_epoch(
+            (
+                train_loss,
+                g_gan_loss_epoch,
+                d_gan_loss_epoch,
+                d_gan_acc_epoch,
+                latent_pred_target_loss_epoch,
+                latent_pred_input_loss_epoch,
+                train_last_snapshot,
+            ) = train_one_epoch(
                 model,
                 discriminator,
                 dl,
@@ -964,6 +1077,9 @@ def train(args):
                 args.grad_clip,
                 kl_weight,
                 gan_weight_for_epoch,
+                args.latent_pred_target_weight,
+                args.latent_pred_input_weight,
+                args.latent_alignment_detach_targets,
             )
             val_loss, val_last_snapshot = validate(model, args, device, steps_per_epoch)
             examples_this_epoch = samples_per_epoch
@@ -1001,6 +1117,10 @@ def train(args):
             writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
             writer.add_scalar('train/d_gan_accuracy', float(d_gan_acc_epoch), epoch_number)
             writer.add_scalar('train/d_gan_lr', float(current_disc_lr), epoch_number)
+            writer.add_scalar('train/latent_pred_target_loss', float(latent_pred_target_loss_epoch), epoch_number)
+            writer.add_scalar('train/latent_pred_input_loss', float(latent_pred_input_loss_epoch), epoch_number)
+            writer.add_scalar('train/encoder_lr', float(get_named_group_lr(opt, 'encoder', current_lr)), epoch_number)
+            writer.add_scalar('train/decoder_lr', float(get_named_group_lr(opt, 'decoder', current_lr)), epoch_number)
 
             if epoch_number == args.representative_selection_epoch:
                 representative_examples['training'] = _build_representative_examples(
@@ -1107,6 +1227,8 @@ if __name__ == '__main__':
     p.add_argument('--number_batches', type=int, default=None, help='Number of batches per epoch. If omitted, uses full dataloader length.')
     p.add_argument('--learning_rate', '--lr', dest='learning_rate', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--encoder_lr_mult', type=float, default=1.0, help='Multiplier applied to encoder LR relative to --learning_rate.')
+    p.add_argument('--decoder_lr_mult', type=float, default=1.0, help='Multiplier applied to decoder LR relative to --learning_rate.')
     p.add_argument('--grad_clip', type=float, default=2.0)
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--device', type=str, default='auto')
@@ -1131,6 +1253,11 @@ if __name__ == '__main__':
     p.add_argument('--kl_end', type=float, default=1e-3)
     p.add_argument('--kl_warmup_epochs', type=int, default=15)
     p.add_argument('--kl_fixed', type=float, default=1e-3)
+    p.add_argument('--latent_pred_target_weight', type=float, default=0.0, help='Weight for latent consistency MSE between encoder(prediction) and encoder(label).')
+    p.add_argument('--latent_pred_input_weight', type=float, default=0.0, help='Weight for latent consistency MSE between encoder(prediction) and encoder(input).')
+    p.add_argument('--latent_alignment_detach_targets', dest='latent_alignment_detach_targets', action='store_true', help='Detach encoder(input/label) branches in latent consistency losses (default).')
+    p.add_argument('--no_latent_alignment_detach_targets', dest='latent_alignment_detach_targets', action='store_false', help='Allow gradients through all latent branches in latent consistency losses.')
+    p.set_defaults(latent_alignment_detach_targets=True)
     p.add_argument('--lr_scheduler', type=str, default='plateau', choices=['none', 'plateau'])
     p.add_argument('--lr_scheduler_patience', type=int, default=3)
     p.add_argument('--lr_scheduler_factor', type=float, default=0.5)

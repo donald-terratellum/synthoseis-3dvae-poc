@@ -80,3 +80,8 @@ Use `--patch_size X Y Z` for anisotropic examples. If you provide a single value
 
 - Patch size can be specified as one value (broadcast to all three axes) or three values (X Y Z).
 - Checkpoints are written under configured output directories (for example checkpoints/).
+
+## Advanced experiment guides
+
+- Latent alignment and encoder/decoder balancing guide (Markdown): [latent_alignment_experiments.md](latent_alignment_experiments.md)
+- Latent alignment and encoder/decoder balancing guide (HTML): [latent_alignment_experiments.html](latent_alignment_experiments.html)
