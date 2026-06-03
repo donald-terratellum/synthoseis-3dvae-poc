@@ -46,7 +46,11 @@ Validation run in this close-out:
   - Donald (requester/operator)
   - GitHub Copilot (GPT-5.3-Codex) (implementation updates, review, testing, and session close-out)
 
-## Basic Info (Relevant Commits, Files Involved)
+## Basic Info
+Repository and branch context:
+- Repository: `synthoseis-3dvae-poc`
+- Branch: `feat/vae-deep-supervision`
+
 Relevant prior commits in this branch context:
 - `366118f` - sparse augmentation updates and prior session summary
 - `7bdfe91` - checkpoint metadata enhancements
@@ -73,7 +77,7 @@ Copilot session info recovered (as available):
 - Environment snapshot in log: Copilot `0.50.1`, VS Code `1.122.1`
 - Additional turn/tool telemetry was not present in the local debug file for this session.
 
-## Next And/Or Future Follow-Up Work Suggestions
+## Next Or Future Follow-Up Suggestions
 - Run short comparative training experiments (`deep_supervision` on/off) and compare validation loss trajectories and representative reconstructions.
 - Add a training metric breakdown for per-scale reconstruction losses to make deep-supervision behavior easier to diagnose.
 - Evaluate latent clustering quality across sample patch classes to confirm tokenizer descriptor improvements.
