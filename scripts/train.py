@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 import sys
-from typing import Any, cast
+from typing import Any, cast, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -25,6 +25,8 @@ import zarr
 import numpy as np
 from src.augmentations import apply_input_trace_dropout
 from src.augmentations import apply_input_extrema_mixup
+from src.augmentations import apply_input_decimate_trilinear
+from src.augmentations import apply_input_random_sparse_keep
 from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
@@ -72,7 +74,13 @@ class ZarrPatchDataset(Dataset):
         vertical_warp_prob=0.5,
         zero_cluster_min=8,
         zero_cluster_max=12,
-        extrema_only=False,
+        extrema_only: Optional[bool] = None,
+        input_extrema_prob=1.0,
+        input_sparse_keep_prob=0.0,
+        input_decimate_trilinear_prob=0.0,
+        sparse_keep_fraction_min=0.10,
+        sparse_keep_fraction_max=0.30,
+        sparse_poisson_radius_scale=0.85,
         mixup_augment_prob=0.10,
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
@@ -91,7 +99,13 @@ class ZarrPatchDataset(Dataset):
         self.vertical_warp_prob = float(vertical_warp_prob)
         self.zero_cluster_min = int(zero_cluster_min)
         self.zero_cluster_max = int(zero_cluster_max)
-        self.extrema_only = bool(extrema_only)
+        self.extrema_only = None if extrema_only is None else bool(extrema_only)
+        self.input_extrema_prob = float(input_extrema_prob)
+        self.input_sparse_keep_prob = float(input_sparse_keep_prob)
+        self.input_decimate_trilinear_prob = float(input_decimate_trilinear_prob)
+        self.sparse_keep_fraction_min = float(sparse_keep_fraction_min)
+        self.sparse_keep_fraction_max = float(sparse_keep_fraction_max)
+        self.sparse_poisson_radius_scale = float(sparse_poisson_radius_scale)
         self.mixup_augment_prob = float(mixup_augment_prob)
 
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
@@ -104,8 +118,64 @@ class ZarrPatchDataset(Dataset):
             raise ValueError('--zero_cluster_min must be <= --zero_cluster_max.')
         if not 0.0 <= self.vertical_warp_prob <= 1.0:
             raise ValueError('--vertical_warp_prob must be in [0, 1].')
+        if self.sparse_keep_fraction_min < 0.01 or self.sparse_keep_fraction_max > 1.0:
+            raise ValueError('--sparse_keep_fraction_min/max must be in [0.01, 1.0].')
+        if self.sparse_keep_fraction_min > self.sparse_keep_fraction_max:
+            raise ValueError('--sparse_keep_fraction_min must be <= --sparse_keep_fraction_max.')
+        if self.sparse_poisson_radius_scale < 0.1 or self.sparse_poisson_radius_scale > 2.0:
+            raise ValueError('--sparse_poisson_radius_scale must be in [0.1, 2.0].')
+        if not 0.0 <= self.input_extrema_prob <= 1.0:
+            raise ValueError('--input_extrema_prob must be in [0, 1].')
+        if not 0.0 <= self.input_sparse_keep_prob <= 1.0:
+            raise ValueError('--input_sparse_keep_prob must be in [0, 1].')
+        if not 0.0 <= self.input_decimate_trilinear_prob <= 1.0:
+            raise ValueError('--input_decimate_trilinear_prob must be in [0, 1].')
+        if self.extrema_only is None:
+            prob_sum = self.input_extrema_prob + self.input_sparse_keep_prob + self.input_decimate_trilinear_prob
+            if prob_sum <= 0.0:
+                raise ValueError('At least one input transform probability must be > 0.')
+        else:
+            default_prob_tuple = (1.0, 0.0, 0.0)
+            actual_prob_tuple = (
+                self.input_extrema_prob,
+                self.input_sparse_keep_prob,
+                self.input_decimate_trilinear_prob,
+            )
+            if self.extrema_only and actual_prob_tuple != default_prob_tuple:
+                raise ValueError(
+                    'extrema_only=True cannot be combined with non-default input transform probabilities. '
+                    'Use probability controls only: --input_extrema_prob, --input_sparse_keep_prob, '
+                    '--input_decimate_trilinear_prob.'
+                )
         if not 0.0 <= self.mixup_augment_prob <= 1.0:
             raise ValueError('--mixup_augment_prob must be in [0, 1].')
+
+    def _apply_one_of_three_input_transform(self, x):
+        probs = np.array(
+            [
+                self.input_extrema_prob,
+                self.input_sparse_keep_prob,
+                self.input_decimate_trilinear_prob,
+            ],
+            dtype=np.float64,
+        )
+        positive_mask = probs > 0.0
+        transform_choices = np.where(positive_mask)[0]
+        choice_weights = probs[positive_mask]
+        choice_weights = choice_weights / float(choice_weights.sum())
+        selected_idx = int(np.random.choice(transform_choices, p=choice_weights))
+
+        if selected_idx == 0:
+            return keep_trace_extrema_only(x)
+        if selected_idx == 1:
+            return apply_input_random_sparse_keep(
+                x,
+                fraction_min=self.sparse_keep_fraction_min,
+                fraction_max=self.sparse_keep_fraction_max,
+                method='random',
+                poisson_radius_scale=self.sparse_poisson_radius_scale,
+            )
+        return apply_input_decimate_trilinear(x)
 
     def _apply_scaling(self, arr):
         if self.scaling == 'divide_by_std':
@@ -138,7 +208,9 @@ class ZarrPatchDataset(Dataset):
                 self.vertical_warp_prob,
             )
             x = apply_input_trace_dropout(x, self.zero_cluster_min, self.zero_cluster_max)
-        if self.extrema_only:
+        if self.extrema_only is None:
+            x = self._apply_one_of_three_input_transform(x)
+        elif self.extrema_only:
             x = keep_trace_extrema_only(x)
 
         if self.augment and np.random.random() < self.mixup_augment_prob:
@@ -765,12 +837,19 @@ def build_dataset(args, data_path, augment=False):
         vertical_warp_prob=args.vertical_warp_prob,
         zero_cluster_min=args.zero_cluster_min,
         zero_cluster_max=args.zero_cluster_max,
-        extrema_only=True,
+        extrema_only=None,
+        input_extrema_prob=args.input_extrema_prob,
+        input_sparse_keep_prob=args.input_sparse_keep_prob,
+        input_decimate_trilinear_prob=args.input_decimate_trilinear_prob,
+        sparse_keep_fraction_min=args.sparse_keep_fraction_min,
+        sparse_keep_fraction_max=args.sparse_keep_fraction_max,
+        sparse_poisson_radius_scale=args.sparse_poisson_radius_scale,
         mixup_augment_prob=args.mixup_augment_prob,
     )
 
 
 def validate(model, args, device, train_steps_per_epoch):
+    validation_extrema_mode = None if args.validation_extrema_only else False
     validation_ds = ZarrPatchDataset(
         args.validation_data,
         scaling=args.input_scaling,
@@ -783,7 +862,13 @@ def validate(model, args, device, train_steps_per_epoch):
         vertical_warp_prob=0.0,
         zero_cluster_min=0,
         zero_cluster_max=0,
-        extrema_only=args.validation_extrema_only,
+        extrema_only=validation_extrema_mode,
+        input_extrema_prob=args.input_extrema_prob,
+        input_sparse_keep_prob=args.input_sparse_keep_prob,
+        input_decimate_trilinear_prob=args.input_decimate_trilinear_prob,
+        sparse_keep_fraction_min=args.sparse_keep_fraction_min,
+        sparse_keep_fraction_max=args.sparse_keep_fraction_max,
+        sparse_poisson_radius_scale=args.sparse_poisson_radius_scale,
         mixup_augment_prob=0.0,
     )
     validation_dl = DataLoader(validation_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
@@ -907,9 +992,17 @@ def train(args):
         f"vertical_warp_prob={args.vertical_warp_prob}",
         f"mixup_augment_prob={args.mixup_augment_prob}",
         f"zero_cluster_range=[{args.zero_cluster_min},{args.zero_cluster_max}]",
+        f"input_extrema_prob={args.input_extrema_prob}",
+        f"input_sparse_keep_prob={args.input_sparse_keep_prob}",
+        f"input_decimate_trilinear_prob={args.input_decimate_trilinear_prob}",
+        f"sparse_keep_fraction_range=[{args.sparse_keep_fraction_min},{args.sparse_keep_fraction_max}]",
+        f"sparse_poisson_radius_scale={args.sparse_poisson_radius_scale}",
     )
-    print("Train extrema-only input=True")
-    print(f"Validation extrema-only input={args.validation_extrema_only}")
+    print("Train input transform mode=one-of-three (extrema/sparse/decimate) with normalized positive weights")
+    if args.validation_extrema_only:
+        print("Validation input transform mode=shared train weights (extrema/sparse/decimate)")
+    else:
+        print("Validation input transform mode=disabled")
     print(f"Discriminator enabled={args.use_discriminator}")
     checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']
     print(f"Checkpoint schema keys={checkpoint_keys}")
@@ -957,6 +1050,20 @@ def train(args):
         raise ValueError('--vertical_warp_prob must be in [0, 1].')
     if not 0.0 <= args.mixup_augment_prob <= 1.0:
         raise ValueError('--mixup_augment_prob must be in [0, 1].')
+    if not 0.0 <= args.input_extrema_prob <= 1.0:
+        raise ValueError('--input_extrema_prob must be in [0, 1].')
+    if not 0.0 <= args.input_sparse_keep_prob <= 1.0:
+        raise ValueError('--input_sparse_keep_prob must be in [0, 1].')
+    if not 0.0 <= args.input_decimate_trilinear_prob <= 1.0:
+        raise ValueError('--input_decimate_trilinear_prob must be in [0, 1].')
+    if (args.input_extrema_prob + args.input_sparse_keep_prob + args.input_decimate_trilinear_prob) <= 0.0:
+        raise ValueError('At least one of input transform probabilities must be > 0.')
+    if args.sparse_keep_fraction_min < 0.01 or args.sparse_keep_fraction_max > 1.0:
+        raise ValueError('--sparse_keep_fraction_min/max must be in [0.01, 1.0].')
+    if args.sparse_keep_fraction_min > args.sparse_keep_fraction_max:
+        raise ValueError('--sparse_keep_fraction_min must be <= --sparse_keep_fraction_max.')
+    if args.sparse_poisson_radius_scale < 0.1 or args.sparse_poisson_radius_scale > 2.0:
+        raise ValueError('--sparse_poisson_radius_scale must be in [0.1, 2.0].')
     if args.early_stopping_patience <= 0:
         raise ValueError('--early_stopping_patience must be positive.')
     if args.gan_weight < 0:
@@ -1250,12 +1357,18 @@ if __name__ == '__main__':
     p.add_argument('--flip_y_prob', type=float, default=0.5)
     p.add_argument('--vertical_warp_prob', type=float, default=0.5, help='Probability of applying non-linear depth stretch/squeeze to label and paired input.')
     p.add_argument('--mixup_augment_prob', type=float, default=0.10, help='Probability of adding extrema-only signal from a random second zarr example into the input volume.')
+    p.add_argument('--input_extrema_prob', type=float, default=1.0, help='Weight for selecting extrema-only input transform in one-of-three input transform mode.')
+    p.add_argument('--input_sparse_keep_prob', type=float, default=0.0, help='Weight for selecting sparse-keep input transform in one-of-three input transform mode.')
+    p.add_argument('--input_decimate_trilinear_prob', type=float, default=0.0, help='Weight for selecting parity decimate+trilinear input transform in one-of-three input transform mode.')
+    p.add_argument('--sparse_keep_fraction_min', type=float, default=0.10, help='Minimum per-sample kept-voxel fraction for sparse-keep transform.')
+    p.add_argument('--sparse_keep_fraction_max', type=float, default=0.30, help='Maximum per-sample kept-voxel fraction for sparse-keep transform.')
+    p.add_argument('--sparse_poisson_radius_scale', type=float, default=0.85, help='Radius scale for Poisson-like branch of sparse selector; the other branch uses uniform thresholding.')
     p.add_argument('--zero_cluster_min', type=int, default=8)
     p.add_argument('--zero_cluster_max', type=int, default=12)
     p.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint to resume training from.')
     p.add_argument('--validation_data', type=str, default='data/validation.zarr', help='Path to validation zarr patches.')
-    p.add_argument('--validation_extrema_only', dest='validation_extrema_only', action='store_true', help='Use extrema-only input transform for validation data (default).')
-    p.add_argument('--no_validation_extrema_only', dest='validation_extrema_only', action='store_false', help='Disable extrema-only input transform for validation data.')
+    p.add_argument('--validation_extrema_only', dest='validation_extrema_only', action='store_true', help='Use the same input transform family and probabilities as training for validation data (default).')
+    p.add_argument('--no_validation_extrema_only', dest='validation_extrema_only', action='store_false', help='Disable input transforms for validation data.')
     p.set_defaults(validation_extrema_only=True)
     p.add_argument('--kl_schedule', type=str, default='warmup', choices=['warmup', 'fixed'])
     p.add_argument('--kl_start', type=float, default=0.0)
