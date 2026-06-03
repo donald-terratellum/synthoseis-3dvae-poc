@@ -230,9 +230,7 @@ class InputAugmentationTests(unittest.TestCase):
             sparse_keep_fraction_max=0.30,
             sparse_poisson_radius_scale=0.85,
             current_kl_weight=0.0,
-            latent_pred_target_weight=0.0,
-            latent_pred_input_weight=0.0,
-            latent_alignment_detach_targets=True,
+            deep_supervision=False,
             patch_size_xyz=(32, 32, 32),
         )
 

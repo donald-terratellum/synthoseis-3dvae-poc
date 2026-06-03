@@ -12,3 +12,7 @@ __pycache__/
 
 # macOS filesystem metadata
 .DS_Store
+
+# unused files
+scripts/generate_reconstructions.py
+docs/plans/*.png

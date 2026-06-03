@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Summary - VAE Deep Supervision (MONAI-Style) With Tokenizer Compatibility (2026-06-03)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; line-height: 1.5; max-width: 980px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
+    h1, h2 { color: #111827; }
+    code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    ul { margin-top: 0.3rem; }
+  </style>
+</head>
+<body>
+  <h1>Session Summary: VAE Deep Supervision (MONAI-Style) With Tokenizer Compatibility (2026-06-03)</h1>
+
+  <h2>Context And Goals</h2>
+  <p>This session closed out the deep-supervision implementation plan captured in <code>docs/plans/deep_supervision_feature_ala_monai.md</code>.</p>
+  <p>Primary goals were to improve decoder supervision for coarse/fine structure, keep latent outputs stable for tokenizer workflows, keep changes optional/backward-compatible, and validate behavior with focused tests.</p>
+
+  <h2>What Was Done</h2>
+  <ul>
+    <li>Added optional deep-supervision support to the VAE decoder in <code>src/model.py</code>.</li>
+    <li>Added auxiliary 1x1x1 decoder prediction heads at coarse and mid stages.</li>
+    <li>Upsampled auxiliary predictions to full output resolution and exposed them only through an explicit deep-supervision return path.</li>
+    <li>Added <code>DeepSupervisionLoss</code> in <code>src/deep_supervision.py</code> with weighted multi-scale aggregation.</li>
+    <li>Integrated deep-supervision training/validation handling in <code>scripts/train.py</code>.</li>
+    <li>Added CLI options <code>--deep_supervision</code> and <code>--deep_supervision_weights</code>.</li>
+    <li>Removed latent alignment loss wiring from this training flow and replaced it with deep-supervision reconstruction handling.</li>
+    <li>Updated checkpoint metadata and load compatibility logic for optional auxiliary heads.</li>
+    <li>Updated tokenizer adapter loading compatibility in <code>src/tokenizer/core/model_adapter.py</code>.</li>
+    <li>Updated test arg fixtures in <code>tests/test_input_augmentations.py</code>.</li>
+    <li>Added <code>tests/test_deep_supervision.py</code> for shape checks, weighted loss validation, inference contract, and gradient-flow checks.</li>
+  </ul>
+
+  <h2>How Was It Done</h2>
+  <ul>
+    <li>Refactored decoder internals from a single sequential block into explicit staged modules to tap intermediate features cleanly.</li>
+    <li>Added optional auxiliary heads and scale-up logic with trilinear interpolation.</li>
+    <li>Created a reusable weighted deep-supervision loss wrapper around <code>nn.MSELoss</code>.</li>
+    <li>Added conditional train/validation branches to request and consume deep-supervision outputs.</li>
+    <li>Used strict-but-compatible checkpoint loading (<code>strict=False</code> + allowlists) to protect backward compatibility.</li>
+  </ul>
+  <p>Validation run in this close-out:</p>
+  <ul>
+    <li><code>/Users/donaldpg/synthoseis-3dvae-poc/.venv/bin/python -m unittest tests/test_deep_supervision.py tests/test_input_augmentations.py</code></li>
+    <li>Result: <code>Ran 11 tests ... OK</code></li>
+  </ul>
+
+  <h2>When Was It Done And By Whom</h2>
+  <ul>
+    <li>Date: 2026-06-03</li>
+    <li>By: Donald (requester/operator) and GitHub Copilot (GPT-5.3-Codex)</li>
+  </ul>
+
+  <h2>Basic Info (Relevant Commits, Files Involved)</h2>
+  <p>Relevant prior commits in this branch context:</p>
+  <ul>
+    <li><code>366118f</code> - sparse augmentation updates and prior session summary</li>
+    <li><code>7bdfe91</code> - checkpoint metadata enhancements</li>
+    <li><code>8c7d155</code> - latent alignment controls/documentation baseline</li>
+  </ul>
+  <p>Files involved in this deep-supervision session:</p>
+  <ul>
+    <li><code>.gitignore</code></li>
+    <li><code>scripts/train.py</code></li>
+    <li><code>src/model.py</code></li>
+    <li><code>src/deep_supervision.py</code></li>
+    <li><code>src/tokenizer/core/model_adapter.py</code></li>
+    <li><code>tests/test_deep_supervision.py</code></li>
+    <li><code>tests/test_input_augmentations.py</code></li>
+    <li><code>.github/session-summary-and-commit.prompt.md</code></li>
+    <li><code>docs/plans/deep_supervision_feature_ala_monai.md</code></li>
+    <li><code>docs/sessions/vae-deep-supervision-monai-tokenizer-compatibility-2026-06-03.md</code></li>
+    <li><code>docs/sessions/vae-deep-supervision-monai-tokenizer-compatibility-2026-06-03.html</code></li>
+  </ul>
+  <p>Copilot session info recovered (as available):</p>
+  <ul>
+    <li>Session ID: <code>78b94ef4-4d7f-4bec-95c6-05717b38ebff</code></li>
+    <li>Debug log file: <code>.vscode-server/data/User/workspaceStorage/abb74fdfd5b6049b99cff19af8986642/GitHub.copilot-chat/debug-logs/78b94ef4-4d7f-4bec-95c6-05717b38ebff/main.jsonl</code></li>
+    <li>Recorded event found: <code>session_start</code></li>
+    <li>Timestamp in log: <code>1780524610386</code> (~2026-06-03 17:10:10 CDT)</li>
+    <li>Environment snapshot: Copilot <code>0.50.1</code>, VS Code <code>1.122.1</code></li>
+    <li>Additional turn/tool telemetry was not present in the local debug file for this session.</li>
+  </ul>
+
+  <h2>Next And/Or Future Follow-Up Work Suggestions</h2>
+  <ul>
+    <li>Run short comparative training experiments with deep supervision on/off and compare validation/reconstruction outcomes.</li>
+    <li>Add per-scale reconstruction metrics to TensorBoard for easier diagnosis.</li>
+    <li>Evaluate latent clustering quality for representative patch classes to confirm tokenizer descriptor improvements.</li>
+    <li>Add/update README notes describing mixed old/new checkpoint compatibility behavior.</li>
+  </ul>
+</body>
+</html>

@@ -67,7 +67,20 @@ class VaeLatentAdapter:
             patch_shape=self.patch_shape,
         )
         state_dict = checkpoint["model_state_dict"]
-        self.model.load_state_dict(state_dict)
+        load_result = self.model.load_state_dict(state_dict, strict=False)
+        invalid_missing = [
+            k for k in load_result.missing_keys
+            if not k.startswith("decoder.aux_head_")
+        ]
+        invalid_unexpected = [
+            k for k in load_result.unexpected_keys
+            if not k.startswith("decoder.aux_head_")
+        ]
+        if invalid_missing or invalid_unexpected:
+            raise ValueError(
+                "Checkpoint state_dict is incompatible with tokenizer adapter model. "
+                f"invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}"
+            )
         self.model.to(self.device)
         self.model.eval()
 

@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 import zarr
@@ -30,6 +29,7 @@ from src.augmentations import apply_input_random_sparse_keep
 from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
+from src.deep_supervision import DeepSupervisionLoss
 from src.model import VAE3D
 
 
@@ -272,26 +272,17 @@ def resolve_device(requested_device: str) -> torch.device:
     raise ValueError("Unsupported device. Use one of: 'auto', 'cuda', 'mps', 'cpu'.")
 
 
-def compute_vae_losses(recon, targets, mu, logvar, kl_weight):
-    rec_loss = torch.nn.functional.mse_loss(recon, targets)
+def compute_vae_losses(recon, targets, mu, logvar, kl_weight, deep_supervision_loss=None):
+    if deep_supervision_loss is not None:
+        rec_loss = deep_supervision_loss(recon, targets)
+    else:
+        if isinstance(recon, (list, tuple)):
+            rec_loss = torch.nn.functional.mse_loss(recon[0], targets)
+        else:
+            rec_loss = torch.nn.functional.mse_loss(recon, targets)
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / targets.numel()
     loss = rec_loss + kl_weight * kld
     return loss, rec_loss, kld
-
-
-def compute_latent_alignment_losses(model, input_mu, recon, targets, detach_targets=True):
-    pred_mu, _ = model.encoder(recon)
-    target_mu, _ = model.encoder(targets)
-
-    reference_input_mu = input_mu
-    reference_target_mu = target_mu
-    if detach_targets:
-        reference_input_mu = reference_input_mu.detach()
-        reference_target_mu = reference_target_mu.detach()
-
-    pred_target_loss = F.mse_loss(pred_mu, reference_target_mu)
-    pred_input_loss = F.mse_loss(pred_mu, reference_input_mu)
-    return pred_target_loss, pred_input_loss
 
 
 def compute_discriminator_gan_loss(discriminator, real_cubes, fake_cubes_detached):
@@ -321,7 +312,7 @@ def compute_generator_gan_loss(discriminator, fake_cubes):
     return g_gan_loss
 
 
-def compute_average_loss(model, dataloader, device, steps, kl_weight):
+def compute_average_loss(model, dataloader, device, steps, kl_weight, deep_supervision=False, deep_supervision_loss=None):
     model.eval()
     total_loss = 0.0
     batch_iter = iter(dataloader) if steps is None else itertools.cycle(dataloader)
@@ -330,8 +321,12 @@ def compute_average_loss(model, dataloader, device, steps, kl_weight):
             inputs, targets = next(batch_iter)
             inputs = inputs.to(device)
             targets = targets.to(device)
-            recon, mu, logvar = model(inputs)
-            loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
+            if deep_supervision:
+                recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
+                loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss)
+            else:
+                recon, mu, logvar = model(inputs)
+                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
             total_loss += loss.item()
     return total_loss / steps
 
@@ -432,6 +427,7 @@ def build_checkpoint_payload(model):
         'patch_shape': [int(v) for v in model.patch_shape],
         'latent_dim': int(model.latent_dim),
         'base_ch': int(model.base_ch),
+        'deep_supervision': bool(getattr(model, 'deep_supervision', False)),
     }
 
 
@@ -717,9 +713,8 @@ def train_one_epoch(
     grad_clip,
     kl_weight,
     gan_weight,
-    latent_pred_target_weight,
-    latent_pred_input_weight,
-    latent_alignment_detach_targets,
+    deep_supervision=False,
+    deep_supervision_loss=None,
 ):
     model.train()
     if discriminator is not None:
@@ -728,8 +723,6 @@ def train_one_epoch(
     total_g_gan_loss = 0.0
     total_d_gan_loss = 0.0
     total_d_gan_acc = 0.0
-    total_latent_pred_target_loss = 0.0
-    total_latent_pred_input_loss = 0.0
     batch_iter = iter(dataloader) if steps_per_epoch is None else itertools.cycle(dataloader)
 
     last_snapshot = None
@@ -743,7 +736,10 @@ def train_one_epoch(
         if discriminator is not None:
             # Discriminator step.
             with torch.no_grad():
-                recon_for_d, _, _ = model(inputs)
+                if deep_supervision:
+                    recon_for_d, _, _, _ = model(inputs, return_deep_supervision=True)
+                else:
+                    recon_for_d, _, _ = model(inputs)
             disc_optimizer.zero_grad()
             d_gan_loss, d_gan_accuracy = compute_discriminator_gan_loss(discriminator, targets, recon_for_d.detach())
             d_gan_loss.backward()
@@ -752,28 +748,15 @@ def train_one_epoch(
             d_gan_acc_value = float(d_gan_accuracy.item())
 
         # Generator (VAE) step.
-        recon, mu, logvar = model(inputs)
-        vae_loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
-        latent_pred_target_loss_value = 0.0
-        latent_pred_input_loss_value = 0.0
-        latent_loss = 0.0
-        if latent_pred_target_weight > 0.0 or latent_pred_input_weight > 0.0:
-            latent_pred_target_loss, latent_pred_input_loss = compute_latent_alignment_losses(
-                model,
-                mu,
-                recon,
-                targets,
-                detach_targets=latent_alignment_detach_targets,
-            )
-            latent_pred_target_loss_value = float(latent_pred_target_loss.item())
-            latent_pred_input_loss_value = float(latent_pred_input_loss.item())
-            latent_loss = (
-                latent_pred_target_weight * latent_pred_target_loss
-                + latent_pred_input_weight * latent_pred_input_loss
-            )
+        if deep_supervision:
+            recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
+            vae_loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss)
+        else:
+            recon, mu, logvar = model(inputs)
+            vae_loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
 
         g_gan_loss_value = 0.0
-        total_g_loss = vae_loss + latent_loss
+        total_g_loss = vae_loss
         if discriminator is not None:
             g_gan_loss = compute_generator_gan_loss(discriminator, recon)
             g_gan_loss_value = float(g_gan_loss.item())
@@ -787,8 +770,6 @@ def train_one_epoch(
         total_g_gan_loss += g_gan_loss_value
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
-        total_latent_pred_target_loss += latent_pred_target_loss_value
-        total_latent_pred_input_loss += latent_pred_input_loss_value
         per_example_mse = compute_per_example_mse(recon.detach(), targets.detach()).detach().cpu()
         last_snapshot = BatchSnapshot(
             inputs=inputs.detach().cpu().clone(),
@@ -802,8 +783,6 @@ def train_one_epoch(
         total_g_gan_loss / steps_per_epoch,
         total_d_gan_loss / steps_per_epoch,
         total_d_gan_acc / steps_per_epoch,
-        total_latent_pred_target_loss / steps_per_epoch,
-        total_latent_pred_input_loss / steps_per_epoch,
         last_snapshot,
     )
 
@@ -848,7 +827,7 @@ def build_dataset(args, data_path, augment=False):
     )
 
 
-def validate(model, args, device, train_steps_per_epoch):
+def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=None):
     validation_extrema_mode = None if args.validation_extrema_only else False
     validation_ds = ZarrPatchDataset(
         args.validation_data,
@@ -886,21 +865,19 @@ def validate(model, args, device, train_steps_per_epoch):
             inputs, targets = next(batch_iter)
             inputs = inputs.to(device)
             targets = targets.to(device)
-            recon, mu, logvar = model(inputs)
-            loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight)
-            if args.latent_pred_target_weight > 0.0 or args.latent_pred_input_weight > 0.0:
-                latent_pred_target_loss, latent_pred_input_loss = compute_latent_alignment_losses(
-                    model,
-                    mu,
-                    recon,
+            if args.deep_supervision:
+                recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
+                loss, _, _ = compute_vae_losses(
+                    ds_outputs,
                     targets,
-                    detach_targets=args.latent_alignment_detach_targets,
+                    mu,
+                    logvar,
+                    args.current_kl_weight,
+                    deep_supervision_loss,
                 )
-                loss = (
-                    loss
-                    + args.latent_pred_target_weight * latent_pred_target_loss
-                    + args.latent_pred_input_weight * latent_pred_input_loss
-                )
+            else:
+                recon, mu, logvar = model(inputs)
+                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight)
             total_loss += float(loss.item())
             per_example_mse = compute_per_example_mse(recon, targets).detach().cpu()
             last_snapshot = BatchSnapshot(
@@ -922,7 +899,14 @@ def train(args):
     steps_per_epoch = args.number_batches if args.number_batches is not None else len(dl)
     samples_per_epoch = steps_per_epoch * args.batch_size
 
-    model = VAE3D(in_ch=1, out_ch=1, base_ch=16, latent_dim=128, patch_shape=args.patch_size_xyz)
+    model = VAE3D(
+        in_ch=1,
+        out_ch=1,
+        base_ch=16,
+        latent_dim=128,
+        patch_shape=args.patch_size_xyz,
+        deep_supervision=args.deep_supervision,
+    )
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
 
@@ -978,7 +962,23 @@ def train(args):
             )
 
         state_dict = checkpoint['model_state_dict']
-        model.load_state_dict(state_dict)
+        load_result = model.load_state_dict(state_dict, strict=False)
+        missing_keys = list(load_result.missing_keys)
+        unexpected_keys = list(load_result.unexpected_keys)
+        allowed_ds_missing = {
+            'decoder.aux_head_coarse.weight',
+            'decoder.aux_head_coarse.bias',
+            'decoder.aux_head_mid.weight',
+            'decoder.aux_head_mid.bias',
+        }
+        allowed_ds_unexpected = allowed_ds_missing
+        invalid_missing = [k for k in missing_keys if k not in allowed_ds_missing]
+        invalid_unexpected = [k for k in unexpected_keys if k not in allowed_ds_unexpected]
+        if invalid_missing or invalid_unexpected:
+            raise ValueError(
+                'Resume checkpoint model_state_dict is incompatible with current architecture. '
+                f'invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}'
+            )
         print(f"Resumed model weights from {ckpt_path}")
 
     print(f"Using device: {device}")
@@ -1004,15 +1004,14 @@ def train(args):
     else:
         print("Validation input transform mode=disabled")
     print(f"Discriminator enabled={args.use_discriminator}")
-    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch']
+    print(
+        'Deep supervision:',
+        f"enabled={args.deep_supervision}",
+        f"weights={args.deep_supervision_weights}",
+    )
+    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch', 'deep_supervision']
     print(f"Checkpoint schema keys={checkpoint_keys}")
     print("base_ch = base channel count for the VAE's convolution layers")
-    print(
-        'Latent alignment:',
-        f"pred_target_weight={args.latent_pred_target_weight}",
-        f"pred_input_weight={args.latent_pred_input_weight}",
-        f"detach_targets={args.latent_alignment_detach_targets}",
-    )
     print(
         'Optimizer LR multipliers:',
         f"encoder_lr_mult={args.encoder_lr_mult}",
@@ -1068,10 +1067,12 @@ def train(args):
         raise ValueError('--early_stopping_patience must be positive.')
     if args.gan_weight < 0:
         raise ValueError('--gan_weight must be non-negative.')
-    if args.latent_pred_target_weight < 0.0:
-        raise ValueError('--latent_pred_target_weight must be non-negative.')
-    if args.latent_pred_input_weight < 0.0:
-        raise ValueError('--latent_pred_input_weight must be non-negative.')
+    if len(args.deep_supervision_weights) != 3:
+        raise ValueError('--deep_supervision_weights must contain exactly 3 values.')
+    if any(weight < 0.0 for weight in args.deep_supervision_weights):
+        raise ValueError('--deep_supervision_weights must be non-negative.')
+    if args.deep_supervision and sum(args.deep_supervision_weights) <= 0.0:
+        raise ValueError('--deep_supervision_weights sum must be > 0 when --deep_supervision is enabled.')
     if not 0.0 < args.gan_balance_target_low < 1.0:
         raise ValueError('--gan_balance_target_low must be in (0, 1).')
     if not 0.0 < args.gan_balance_target_high < 1.0:
@@ -1100,6 +1101,12 @@ def train(args):
     opt = build_optimizer(model, args)
     disc_opt = build_discriminator_optimizer(discriminator, args)
     scheduler = build_scheduler(opt, args)
+    deep_supervision_loss = None
+    if args.deep_supervision:
+        deep_supervision_loss = DeepSupervisionLoss(
+            base_loss=nn.MSELoss(),
+            weights=tuple(float(v) for v in args.deep_supervision_weights),
+        )
 
     current_gan_weight = float(args.gan_weight)
     disc_lr_min = None
@@ -1179,8 +1186,6 @@ def train(args):
                 g_gan_loss_epoch,
                 d_gan_loss_epoch,
                 d_gan_acc_epoch,
-                latent_pred_target_loss_epoch,
-                latent_pred_input_loss_epoch,
                 train_last_snapshot,
             ) = train_one_epoch(
                 model,
@@ -1193,11 +1198,16 @@ def train(args):
                 args.grad_clip,
                 kl_weight,
                 gan_weight_for_epoch,
-                args.latent_pred_target_weight,
-                args.latent_pred_input_weight,
-                args.latent_alignment_detach_targets,
+                deep_supervision=args.deep_supervision,
+                deep_supervision_loss=deep_supervision_loss,
             )
-            val_loss, val_last_snapshot = validate(model, args, device, steps_per_epoch)
+            val_loss, val_last_snapshot = validate(
+                model,
+                args,
+                device,
+                steps_per_epoch,
+                deep_supervision_loss=deep_supervision_loss,
+            )
             examples_this_epoch = samples_per_epoch
             cumulative_examples = (epoch + 1) * samples_per_epoch
 
@@ -1233,8 +1243,6 @@ def train(args):
             writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
             writer.add_scalar('train/d_gan_accuracy', float(d_gan_acc_epoch), epoch_number)
             writer.add_scalar('train/d_gan_lr', float(current_disc_lr), epoch_number)
-            writer.add_scalar('train/latent_pred_target_loss', float(latent_pred_target_loss_epoch), epoch_number)
-            writer.add_scalar('train/latent_pred_input_loss', float(latent_pred_input_loss_epoch), epoch_number)
             writer.add_scalar('train/encoder_lr', float(get_named_group_lr(opt, 'encoder', current_lr)), epoch_number)
             writer.add_scalar('train/decoder_lr', float(get_named_group_lr(opt, 'decoder', current_lr)), epoch_number)
 
@@ -1375,11 +1383,8 @@ if __name__ == '__main__':
     p.add_argument('--kl_end', type=float, default=1e-3)
     p.add_argument('--kl_warmup_epochs', type=int, default=15)
     p.add_argument('--kl_fixed', type=float, default=1e-3)
-    p.add_argument('--latent_pred_target_weight', type=float, default=0.0, help='Weight for latent consistency MSE between encoder(prediction) and encoder(label).')
-    p.add_argument('--latent_pred_input_weight', type=float, default=0.0, help='Weight for latent consistency MSE between encoder(prediction) and encoder(input).')
-    p.add_argument('--latent_alignment_detach_targets', dest='latent_alignment_detach_targets', action='store_true', help='Detach encoder(input/label) branches in latent consistency losses (default).')
-    p.add_argument('--no_latent_alignment_detach_targets', dest='latent_alignment_detach_targets', action='store_false', help='Allow gradients through all latent branches in latent consistency losses.')
-    p.set_defaults(latent_alignment_detach_targets=True)
+    p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
+    p.add_argument('--deep_supervision_weights', type=float, nargs=3, default=[1.0, 0.5, 0.25], help='Three deep supervision reconstruction loss weights (fine, mid, coarse).')
     p.add_argument('--lr_scheduler', type=str, default='plateau', choices=['none', 'plateau'])
     p.add_argument('--lr_scheduler_patience', type=int, default=3)
     p.add_argument('--lr_scheduler_factor', type=float, default=0.5)
