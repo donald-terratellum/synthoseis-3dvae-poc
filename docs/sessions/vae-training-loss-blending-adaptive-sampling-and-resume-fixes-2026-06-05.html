@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VAE Training Loss Blending, Adaptive Sampling, and Resume Fixes (2026-06-05)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem auto; max-width: 960px; line-height: 1.5; color: #1b1f24; }
+    h1, h2 { line-height: 1.25; }
+    code { background: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    ul { margin-top: 0.4rem; }
+  </style>
+</head>
+<body>
+  <h1>VAE Training Loss Blending, Adaptive Sampling, and Resume Fixes (2026-06-05)</h1>
+
+  <h2>Context and goals</h2>
+  <ul>
+    <li>Align training reconstruction behavior with user intent by combining MSE and PMSE under a CLI-controlled weight.</li>
+    <li>Ensure representative TensorBoard sampling and adaptive sampling behavior are consistent with the active reconstruction objective.</li>
+    <li>Improve resumed training continuity for epoch numbering and representative image logging.</li>
+    <li>Improve GAN balance behavior stability with trend look-ahead and predictive deadband.</li>
+  </ul>
+
+  <h2>What was done</h2>
+  <ul>
+    <li>Updated representative percentile set to include 5, 10, 20, ..., 90, 95.</li>
+    <li>Added adaptive sampling infrastructure driven by periodic per-example snapshot scoring, persisted to checkpoint artifacts.</li>
+    <li>Added resume-aware epoch continuation so resumed runs continue epoch numbering, checkpoint naming, CSV epochs, and TensorBoard steps.</li>
+    <li>Added optional GAN balance look-ahead control using linear trend fit over recent discriminator accuracy.</li>
+    <li>Added predictive-only deadband control in look-ahead mode to reduce oscillation near target boundaries.</li>
+    <li>Added PMSE metric display in representative plot titles and PMSE scalar logging to TensorBoard.</li>
+    <li>Added blended reconstruction loss support via CLI-configurable MSE weight (<code>loss_mse_weight</code>) and PMSE complement.</li>
+    <li>Threaded blended reconstruction loss through training and validation reconstruction objectives, including deep supervision.</li>
+    <li>Switched adaptive sampling snapshots from raw MSE to blended reconstruction-loss scoring.</li>
+    <li>Fixed adaptive snapshot serialization key mismatch (<code>mse</code> vs <code>recon_loss</code>) to prevent runtime KeyError.</li>
+    <li>Switched representative snapshot ranking/selection source from raw MSE to blended reconstruction-loss score and updated title label from <code>epoch4_mse</code> to <code>epoch4_recon</code>.</li>
+    <li>Added resume-time representative metadata loading/fallback so representative figures continue after resumed runs.</li>
+  </ul>
+
+  <h2>How was it done</h2>
+  <ul>
+    <li>Refactored reconstruction loss handling in <code>scripts/train.py</code> with a reusable <code>CombinedReconLoss</code> module.</li>
+    <li>Updated call sites in train, validation, deep-supervision path, representative snapshot path, and adaptive sampling snapshot path to consistently use blended reconstruction scoring where required.</li>
+    <li>Added CLI arguments, range validation, startup configuration prints, and TensorBoard scalar additions.</li>
+    <li>Added backward-compatible serialization behavior for adaptive sampling snapshots by accepting both legacy and new key layouts.</li>
+    <li>Performed iterative validation after each change batch using static diagnostics and targeted runtime smoke checks.</li>
+  </ul>
+
+  <h2>When was it done and by whom</h2>
+  <ul>
+    <li>Date: 2026-06-05</li>
+    <li>By: Donald G. P. (requester) with GitHub Copilot (GPT-5.3-Codex) implementing and validating code changes.</li>
+  </ul>
+
+  <h2>Basic info (relevant commits, files involved)</h2>
+  <ul>
+    <li>Branch: <code>feat/vae-deep-supervision</code></li>
+    <li>Relevant commit(s): Session implementation commit created after this summary step.</li>
+    <li>Primary file modified: <code>scripts/train.py</code></li>
+    <li>Session summary artifacts:
+      <ul>
+        <li><code>docs/sessions/vae-training-loss-blending-adaptive-sampling-and-resume-fixes-2026-06-05.md</code></li>
+        <li><code>docs/sessions/vae-training-loss-blending-adaptive-sampling-and-resume-fixes-2026-06-05.html</code></li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2>Next and/or future follow-up work suggestions</h2>
+  <ul>
+    <li>Add explicit console/table columns for reconstruction-only loss, KL term, and GAN term to separate objective components clearly.</li>
+    <li>Add a small unit/integration test for adaptive snapshot serialization compatibility and resume continuation.</li>
+    <li>Consider optional representative selection based on separate rank channels (<code>mse</code>, <code>pmse</code>, <code>combined</code>) controlled by a CLI switch.</li>
+    <li>Consider adding TensorBoard histograms for adaptive sampling probabilities and reconstruction snapshot distributions.</li>
+  </ul>
+</body>
+</html>

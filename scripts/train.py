@@ -14,11 +14,13 @@ import itertools
 import math
 import csv
 import time
+import re
+from collections import deque
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 import zarr
 import numpy as np
@@ -272,14 +274,39 @@ def resolve_device(requested_device: str) -> torch.device:
     raise ValueError("Unsupported device. Use one of: 'auto', 'cuda', 'mps', 'cpu'.")
 
 
-def compute_vae_losses(recon, targets, mu, logvar, kl_weight, deep_supervision_loss=None):
+class CombinedReconLoss(nn.Module):
+    """Weighted combination of MSE and percent-MSE reconstruction losses.
+
+    combined = mse_weight * MSE + (1 - mse_weight) * PMSE
+    where PMSE = mean((pred-label)^2) / mean(label^2).
+    """
+
+    def __init__(self, mse_weight: float = 0.6, eps: float = 1e-8):
+        super().__init__()
+        if not 0.0 <= mse_weight <= 1.0:
+            raise ValueError('mse_weight must be in [0, 1].')
+        self.mse_weight = float(mse_weight)
+        self.pmse_weight = 1.0 - self.mse_weight
+        self.eps = float(eps)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        mse = torch.nn.functional.mse_loss(pred, target)
+        if self.pmse_weight == 0.0:
+            return mse
+        label_energy = (target ** 2).mean()
+        pmse = mse / torch.clamp(label_energy, min=self.eps)
+        return self.mse_weight * mse + self.pmse_weight * pmse
+
+
+def compute_vae_losses(recon, targets, mu, logvar, kl_weight, deep_supervision_loss=None, rec_loss_fn=None):
     if deep_supervision_loss is not None:
         rec_loss = deep_supervision_loss(recon, targets)
     else:
+        _rec_fn = rec_loss_fn if rec_loss_fn is not None else torch.nn.functional.mse_loss
         if isinstance(recon, (list, tuple)):
-            rec_loss = torch.nn.functional.mse_loss(recon[0], targets)
+            rec_loss = _rec_fn(recon[0], targets)
         else:
-            rec_loss = torch.nn.functional.mse_loss(recon, targets)
+            rec_loss = _rec_fn(recon, targets)
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / targets.numel()
     loss = rec_loss + kl_weight * kld
     return loss, rec_loss, kld
@@ -312,7 +339,7 @@ def compute_generator_gan_loss(discriminator, fake_cubes):
     return g_gan_loss
 
 
-def compute_average_loss(model, dataloader, device, steps, kl_weight, deep_supervision=False, deep_supervision_loss=None):
+def compute_average_loss(model, dataloader, device, steps, kl_weight, deep_supervision=False, deep_supervision_loss=None, rec_loss_fn=None):
     model.eval()
     total_loss = 0.0
     batch_iter = iter(dataloader) if steps is None else itertools.cycle(dataloader)
@@ -323,10 +350,10 @@ def compute_average_loss(model, dataloader, device, steps, kl_weight, deep_super
             targets = targets.to(device)
             if deep_supervision:
                 recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-                loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss)
+                loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss, rec_loss_fn=rec_loss_fn)
             else:
                 recon, mu, logvar = model(inputs)
-                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
+                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight, rec_loss_fn=rec_loss_fn)
             total_loss += loss.item()
     return total_loss / steps
 
@@ -421,14 +448,17 @@ def clamp_float(value, lower, upper):
     return max(lower, min(upper, value))
 
 
-def build_checkpoint_payload(model):
-    return {
+def build_checkpoint_payload(model, epoch=None):
+    payload = {
         'model_state_dict': model.state_dict(),
         'patch_shape': [int(v) for v in model.patch_shape],
         'latent_dim': int(model.latent_dim),
         'base_ch': int(model.base_ch),
         'deep_supervision': bool(getattr(model, 'deep_supervision', False)),
     }
+    if epoch is not None:
+        payload['epoch'] = int(epoch)
+    return payload
 
 
 @dataclass
@@ -452,6 +482,41 @@ class RepresentativeExample:
 
 def compute_per_example_mse(recon, targets):
     return ((recon - targets) ** 2).mean(dim=(1, 2, 3, 4))
+
+
+def compute_per_example_pmse(recon, targets, eps=1e-8):
+    mse_num = ((recon - targets) ** 2).mean(dim=(1, 2, 3, 4))
+    mse_den = (targets ** 2).mean(dim=(1, 2, 3, 4))
+    return mse_num / torch.clamp(mse_den, min=eps)
+
+
+def compute_per_example_combined_recon_loss(recon, targets, mse_weight, eps=1e-8):
+    mse_values = compute_per_example_mse(recon, targets)
+    pmse_values = compute_per_example_pmse(recon, targets, eps=eps)
+    return float(mse_weight) * mse_values + (1.0 - float(mse_weight)) * pmse_values
+
+
+def compute_per_example_deep_supervision_combined_recon_loss(outputs, target, weights, mse_weight, eps=1e-8):
+    if isinstance(outputs, torch.Tensor):
+        return compute_per_example_combined_recon_loss(outputs, target, mse_weight, eps=eps)
+    if outputs is None:
+        raise ValueError('outputs must not be None')
+
+    predictions = list(outputs)
+    if len(predictions) == 0:
+        raise ValueError('outputs must contain at least one tensor')
+    if len(predictions) != len(weights):
+        raise ValueError(
+            f'outputs length ({len(predictions)}) must match weights length ({len(weights)})'
+        )
+
+    total = torch.zeros((target.shape[0],), dtype=target.dtype, device=target.device)
+    for weight, pred in zip(weights, predictions):
+        target_for_scale = target
+        if pred.shape[2:] != target.shape[2:]:
+            target_for_scale = torch.nn.functional.interpolate(target, size=pred.shape[2:], mode='trilinear', align_corners=False)
+        total = total + (float(weight) * compute_per_example_combined_recon_loss(pred, target_for_scale, mse_weight, eps=eps))
+    return total
 
 
 def _build_representative_examples(snapshot, split, epoch_number, percentiles):
@@ -528,6 +593,7 @@ def _plot_representative_example(model, device, example, epoch_number, vmin=-3.1
         y = example.target_cube.to(device)
         recon, _, _ = model(x)
         mse_value = float(compute_per_example_mse(recon, y)[0].item())
+        pmse_value = float(compute_per_example_pmse(recon, y)[0].item())
         latent_input_mu, _ = model.encoder(x)
         latent_pred_mu, _ = model.encoder(recon)
         latent_label_mu, _ = model.encoder(y)
@@ -602,12 +668,12 @@ def _plot_representative_example(model, device, example, epoch_number, vmin=-3.1
     fig.suptitle(
         (
             f"{example.split} representative | epoch={epoch_number} | "
-            f"percentile(epoch4)={example.percentile}% | mse={mse_value:.6f} | "
-            f"epoch4_mse={example.selection_mse:.6f} | batch_idx={example.batch_index}"
+            f"percentile(epoch4)={example.percentile}% | mse={mse_value:.6f} | pmse={pmse_value:.6f} | "
+            f"epoch4_recon={example.selection_mse:.6f} | batch_idx={example.batch_index}"
         ),
         fontsize=10,
     )
-    return fig, mse_value
+    return fig, mse_value, pmse_value
 
 
 def _log_representative_examples(writer, model, device, examples, epoch_number, output_dir):
@@ -617,7 +683,7 @@ def _log_representative_examples(writer, model, device, examples, epoch_number, 
     plot_root.mkdir(parents=True, exist_ok=True)
 
     for example in examples:
-        fig, mse_value = _plot_representative_example(model, device, example, epoch_number)
+        fig, mse_value, pmse_value = _plot_representative_example(model, device, example, epoch_number)
         filename = f"{example.split.lower()}_p{example.percentile:02d}.png"
         fig.savefig(plot_root / filename, dpi=140)
         writer.add_figure(
@@ -628,6 +694,11 @@ def _log_representative_examples(writer, model, device, examples, epoch_number, 
         writer.add_scalar(
             f"representative/{example.split.lower()}/p{example.percentile:02d}_mse",
             mse_value,
+            epoch_number,
+        )
+        writer.add_scalar(
+            f"representative/{example.split.lower()}/p{example.percentile:02d}_pmse",
+            pmse_value,
             epoch_number,
         )
         import matplotlib.pyplot as plt
@@ -653,23 +724,65 @@ def _save_representative_example_metadata(examples_by_split, output_path):
     torch.save(serializable, output_path)
 
 
+def _load_representative_example_metadata(input_path):
+    payload = torch.load(input_path, map_location='cpu')
+    if not isinstance(payload, dict):
+        raise ValueError('Representative metadata payload must be a dict.')
+
+    loaded = {'training': [], 'validation': []}
+    for split_name in ('training', 'validation'):
+        split_items = payload.get(split_name, [])
+        if not isinstance(split_items, list):
+            continue
+        for item in split_items:
+            loaded[split_name].append(
+                RepresentativeExample(
+                    split=str(item['split']),
+                    percentile=int(item['percentile']),
+                    source_epoch=int(item['source_epoch']),
+                    batch_index=int(item['batch_index']),
+                    selection_mse=float(item['selection_mse']),
+                    input_cube=item['input_cube'].detach().cpu().clone(),
+                    target_cube=item['target_cube'].detach().cpu().clone(),
+                )
+            )
+    return loaded
+
+
 def update_gan_balance_controller(
     args,
     d_gan_acc_epoch,
+    d_gan_acc_history,
     current_gan_weight,
     disc_optimizer,
     disc_lr_min,
     disc_lr_max,
 ):
     if not args.gan_balance_controller or disc_optimizer is None:
-        return current_gan_weight, None, 'off'
+        return current_gan_weight, None, 'off', float(d_gan_acc_epoch)
 
     current_disc_lr = float(disc_optimizer.param_groups[0]['lr'])
     next_gan_weight = current_gan_weight
     next_disc_lr = current_disc_lr
     status = 'hold'
+    control_acc = float(d_gan_acc_epoch)
+    used_prediction = False
+    target_low = float(args.gan_balance_target_low)
+    target_high = float(args.gan_balance_target_high)
 
-    if d_gan_acc_epoch > args.gan_balance_target_high:
+    if args.gan_balance_lookahead and len(d_gan_acc_history) >= args.gan_balance_lookahead_window:
+        y = np.asarray(list(d_gan_acc_history)[-args.gan_balance_lookahead_window:], dtype=np.float64)
+        x = np.arange(y.shape[0], dtype=np.float64)
+        slope, intercept = np.polyfit(x, y, deg=1)
+        lookahead_x = float(y.shape[0] - 1 + args.gan_balance_lookahead_horizon)
+        predicted_acc = float(intercept + slope * lookahead_x)
+        control_acc = clamp_float(predicted_acc, 0.0, 1.0)
+        used_prediction = True
+        deadband = max(0.0, float(args.gan_balance_lookahead_deadband))
+        target_low = min(target_high, target_low + deadband)
+        target_high = max(target_low, target_high - deadband)
+
+    if control_acc > target_high:
         # D is too strong: increase G adversarial pressure and slow D slightly.
         next_gan_weight = clamp_float(
             current_gan_weight * args.gan_balance_gan_weight_up_mult,
@@ -681,8 +794,8 @@ def update_gan_balance_controller(
             disc_lr_min,
             disc_lr_max,
         )
-        status = 'd_strong'
-    elif d_gan_acc_epoch < args.gan_balance_target_low:
+        status = 'd_strong_pred' if used_prediction else 'd_strong'
+    elif control_acc < target_low:
         # D is too weak: reduce G adversarial pressure and speed D slightly.
         next_gan_weight = clamp_float(
             current_gan_weight * args.gan_balance_gan_weight_down_mult,
@@ -694,12 +807,12 @@ def update_gan_balance_controller(
             disc_lr_min,
             disc_lr_max,
         )
-        status = 'd_weak'
+        status = 'd_weak_pred' if used_prediction else 'd_weak'
 
     for param_group in disc_optimizer.param_groups:
         param_group['lr'] = next_disc_lr
 
-    return next_gan_weight, next_disc_lr, status
+    return next_gan_weight, next_disc_lr, status, control_acc
 
 
 def train_one_epoch(
@@ -715,6 +828,9 @@ def train_one_epoch(
     gan_weight,
     deep_supervision=False,
     deep_supervision_loss=None,
+    rec_loss_fn=None,
+    mse_weight=0.6,
+    deep_supervision_weights=None,
 ):
     model.train()
     if discriminator is not None:
@@ -730,6 +846,7 @@ def train_one_epoch(
         inputs, targets = next(batch_iter)
         inputs = inputs.to(device)
         targets = targets.to(device)
+        ds_outputs = None
 
         d_gan_loss_value = 0.0
         d_gan_acc_value = 0.0
@@ -750,10 +867,10 @@ def train_one_epoch(
         # Generator (VAE) step.
         if deep_supervision:
             recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-            vae_loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss)
+            vae_loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss, rec_loss_fn=rec_loss_fn)
         else:
             recon, mu, logvar = model(inputs)
-            vae_loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight)
+            vae_loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight, rec_loss_fn=rec_loss_fn)
 
         g_gan_loss_value = 0.0
         total_g_loss = vae_loss
@@ -770,7 +887,24 @@ def train_one_epoch(
         total_g_gan_loss += g_gan_loss_value
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
-        per_example_mse = compute_per_example_mse(recon.detach(), targets.detach()).detach().cpu()
+        if deep_supervision:
+            if deep_supervision_weights is None:
+                raise ValueError('deep_supervision_weights must be provided when deep supervision is enabled.')
+            if ds_outputs is None:
+                raise ValueError('deep supervision outputs are required when deep supervision is enabled.')
+            ds_outputs_detached = tuple(out.detach() for out in ds_outputs)
+            per_example_mse = compute_per_example_deep_supervision_combined_recon_loss(
+                ds_outputs_detached,
+                targets.detach(),
+                weights=tuple(float(v) for v in deep_supervision_weights),
+                mse_weight=mse_weight,
+            ).detach().cpu()
+        else:
+            per_example_mse = compute_per_example_combined_recon_loss(
+                recon.detach(),
+                targets.detach(),
+                mse_weight,
+            ).detach().cpu()
         last_snapshot = BatchSnapshot(
             inputs=inputs.detach().cpu().clone(),
             targets=targets.detach().cpu().clone(),
@@ -827,7 +961,142 @@ def build_dataset(args, data_path, augment=False):
     )
 
 
-def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=None):
+def build_train_dataloader(dataset, args, sample_weights=None):
+    if sample_weights is None:
+        return DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+
+    weights = np.asarray(sample_weights, dtype=np.float64)
+    if weights.ndim != 1 or int(weights.shape[0]) != len(dataset):
+        raise ValueError('sample_weights must be a 1D array with length equal to training dataset size.')
+    if np.any(weights < 0.0):
+        raise ValueError('sample_weights must be non-negative.')
+    if not np.isfinite(weights).all():
+        raise ValueError('sample_weights must be finite.')
+
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0.0:
+        weights = np.ones_like(weights, dtype=np.float64)
+        weight_sum = float(weights.sum())
+    normalized = weights / weight_sum
+
+    sampler = WeightedRandomSampler(
+        weights=normalized.tolist(),
+        num_samples=len(dataset),
+        replacement=True,
+    )
+    return DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False, num_workers=2)
+
+
+def build_sampling_eval_dataset(args):
+    return ZarrPatchDataset(
+        args.data,
+        scaling=args.input_scaling,
+        scaling_mean=args.input_mean,
+        scaling_std=args.input_std,
+        augment=False,
+        swap_xy_prob=0.0,
+        flip_x_prob=0.0,
+        flip_y_prob=0.0,
+        vertical_warp_prob=0.0,
+        zero_cluster_min=0,
+        zero_cluster_max=0,
+        extrema_only=False,
+        input_extrema_prob=args.input_extrema_prob,
+        input_sparse_keep_prob=args.input_sparse_keep_prob,
+        input_decimate_trilinear_prob=args.input_decimate_trilinear_prob,
+        sparse_keep_fraction_min=args.sparse_keep_fraction_min,
+        sparse_keep_fraction_max=args.sparse_keep_fraction_max,
+        sparse_poisson_radius_scale=args.sparse_poisson_radius_scale,
+        mixup_augment_prob=0.0,
+    )
+
+
+def compute_full_dataset_recon_snapshot(model, dataset, batch_size, device, mse_weight, deep_supervision=False, deep_supervision_weights=None):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    recon_snapshot = np.zeros((len(dataset),), dtype=np.float32)
+
+    model.eval()
+    write_offset = 0
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            if deep_supervision:
+                if deep_supervision_weights is None:
+                    raise ValueError('deep_supervision_weights must be provided when deep_supervision is enabled.')
+                recon, _, _, ds_outputs = model(inputs, return_deep_supervision=True)
+                batch_recon = compute_per_example_deep_supervision_combined_recon_loss(
+                    ds_outputs,
+                    targets,
+                    weights=tuple(float(v) for v in deep_supervision_weights),
+                    mse_weight=mse_weight,
+                )
+            else:
+                recon, _, _ = model(inputs)
+
+                batch_recon = compute_per_example_combined_recon_loss(recon, targets, mse_weight)
+
+            batch_recon_np = batch_recon.detach().cpu().numpy().astype(np.float32)
+            batch_count = int(batch_recon_np.shape[0])
+            recon_snapshot[write_offset:write_offset + batch_count] = batch_recon_np
+            write_offset += batch_count
+
+    return recon_snapshot
+
+
+def compute_adaptive_sampling_scores(recon_history, improvement_weight=1.0):
+    if not recon_history:
+        raise ValueError('recon_history must contain at least one snapshot.')
+
+    current_recon = np.asarray(recon_history[-1], dtype=np.float32)
+    if len(recon_history) < 2:
+        average_improvement = np.zeros_like(current_recon, dtype=np.float32)
+    else:
+        improvements = []
+        for previous_snapshot, next_snapshot in zip(recon_history[:-1], recon_history[1:]):
+            prev_arr = np.asarray(previous_snapshot, dtype=np.float32)
+            next_arr = np.asarray(next_snapshot, dtype=np.float32)
+            improvements.append(prev_arr - next_arr)
+        average_improvement = np.mean(np.stack(improvements, axis=0), axis=0).astype(np.float32)
+
+    score = current_recon + float(improvement_weight) * average_improvement
+    score = np.where(np.isfinite(score), score, 0.0).astype(np.float32)
+    score = np.clip(score, a_min=0.0, a_max=None)
+
+    if float(score.sum()) <= 0.0:
+        score = np.where(np.isfinite(current_recon), current_recon, 0.0).astype(np.float32)
+        score = np.clip(score, a_min=0.0, a_max=None)
+    if float(score.sum()) <= 0.0:
+        score = np.ones_like(current_recon, dtype=np.float32)
+
+    probabilities = score / float(score.sum())
+    return probabilities.astype(np.float64), average_improvement, score
+
+
+def save_adaptive_sampling_snapshots(output_path, snapshot_records):
+    serializable = {
+        'snapshots': [
+            {
+                'epoch': int(record['epoch']),
+                'recon_loss': np.asarray(record.get('recon_loss', record.get('mse')), dtype=np.float32),
+                'average_improvement': np.asarray(record['average_improvement'], dtype=np.float32),
+                'score': np.asarray(record['score'], dtype=np.float32),
+                'probability': np.asarray(record['probability'], dtype=np.float32),
+            }
+            for record in snapshot_records
+        ]
+    }
+    torch.save(serializable, output_path)
+
+
+def infer_completed_epochs_from_resume_path(path):
+    match = re.search(r'vae_epoch(\d+)$', path.stem)
+    if match is None:
+        return 0
+    return int(match.group(1))
+
+
+def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=None, rec_loss_fn=None):
     validation_extrema_mode = None if args.validation_extrema_only else False
     validation_ds = ZarrPatchDataset(
         args.validation_data,
@@ -865,6 +1134,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
             inputs, targets = next(batch_iter)
             inputs = inputs.to(device)
             targets = targets.to(device)
+            ds_outputs = None
             if args.deep_supervision:
                 recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
                 loss, _, _ = compute_vae_losses(
@@ -874,12 +1144,27 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     logvar,
                     args.current_kl_weight,
                     deep_supervision_loss,
+                    rec_loss_fn=rec_loss_fn,
                 )
             else:
                 recon, mu, logvar = model(inputs)
-                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight)
+                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight, rec_loss_fn=rec_loss_fn)
             total_loss += float(loss.item())
-            per_example_mse = compute_per_example_mse(recon, targets).detach().cpu()
+            if args.deep_supervision:
+                if ds_outputs is None:
+                    raise ValueError('deep supervision outputs are required when deep supervision is enabled.')
+                per_example_mse = compute_per_example_deep_supervision_combined_recon_loss(
+                    ds_outputs,
+                    targets,
+                    weights=tuple(float(v) for v in args.deep_supervision_weights),
+                    mse_weight=float(args.loss_mse_weight),
+                ).detach().cpu()
+            else:
+                per_example_mse = compute_per_example_combined_recon_loss(
+                    recon,
+                    targets,
+                    mse_weight=float(args.loss_mse_weight),
+                ).detach().cpu()
             last_snapshot = BatchSnapshot(
                 inputs=inputs.detach().cpu().clone(),
                 targets=targets.detach().cpu().clone(),
@@ -892,7 +1177,33 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
 def train(args):
     ds = build_dataset(args, args.data, augment=args.augment)
     args.patch_size_xyz = resolve_patch_size_xyz(args.patch_size, ds.patch_shape)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    if args.adaptive_sampling_by_mse and args.sampling_snapshot_interval <= 0:
+        raise ValueError('--sampling_snapshot_interval must be a positive integer when adaptive sampling is enabled.')
+    if args.sampling_improvement_window < 2:
+        raise ValueError('--sampling_improvement_window must be at least 2.')
+
+    adaptive_sample_weights = None
+    adaptive_recon_history = deque(maxlen=int(args.sampling_improvement_window))
+    adaptive_snapshot_records = []
+    adaptive_eval_ds = None
+    adaptive_snapshot_path = Path(args.out_dir) / args.sampling_snapshot_filename
+    if args.adaptive_sampling_by_mse:
+        adaptive_eval_ds = build_sampling_eval_dataset(args)
+        if adaptive_eval_ds.patch_shape != args.patch_size_xyz:
+            raise ValueError(
+                f"adaptive eval patch shape {adaptive_eval_ds.patch_shape} does not match --patch_size {args.patch_size_xyz}"
+            )
+        adaptive_sample_weights = np.ones((len(ds),), dtype=np.float64) / float(max(1, len(ds)))
+        print(
+            'Adaptive sampling:',
+            f"enabled={args.adaptive_sampling_by_mse}",
+            f"snapshot_interval={args.sampling_snapshot_interval}",
+            f"improvement_window={args.sampling_improvement_window}",
+            f"improvement_weight={args.sampling_improvement_weight}",
+            f"snapshot_file={adaptive_snapshot_path}",
+        )
+
+    dl = build_train_dataloader(ds, args, sample_weights=adaptive_sample_weights)
 
     if args.number_batches is not None and args.number_batches <= 0:
         raise ValueError('--number_batches must be a positive integer when provided.')
@@ -909,6 +1220,7 @@ def train(args):
     )
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
+    resume_completed_epochs = 0
 
     if args.resume is not None:
         ckpt_path = Path(args.resume)
@@ -979,7 +1291,13 @@ def train(args):
                 'Resume checkpoint model_state_dict is incompatible with current architecture. '
                 f'invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}'
             )
+        checkpoint_epoch = checkpoint.get('epoch', None)
+        if checkpoint_epoch is not None:
+            resume_completed_epochs = max(0, int(checkpoint_epoch))
+        else:
+            resume_completed_epochs = infer_completed_epochs_from_resume_path(ckpt_path)
         print(f"Resumed model weights from {ckpt_path}")
+        print(f"Resuming epoch numbering from {resume_completed_epochs + 1}")
 
     print(f"Using device: {device}")
     print(f"Batch size (B): {args.batch_size}, batches/epoch: {steps_per_epoch}, examples/epoch: {samples_per_epoch}")
@@ -1023,7 +1341,14 @@ def train(args):
         f"latent_dim={model.latent_dim}",
         f"base_ch={model.base_ch}",
     )
-    representative_percentiles = (10, 25, 50, 75, 90)
+    print(
+        'Reconstruction loss:',
+        f"mse_weight={args.loss_mse_weight:.4f}",
+        f"pmse_weight={1.0 - args.loss_mse_weight:.4f}",
+    )
+    representative_percentiles = (
+        5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95
+    )
     if args.representative_selection_epoch <= 0:
         raise ValueError('--representative_selection_epoch must be a positive integer.')
     if args.representative_plot_interval <= 0:
@@ -1033,7 +1358,7 @@ def train(args):
         f"selection_epoch={args.representative_selection_epoch}",
         f"plot_every={args.representative_plot_interval}",
         f"percentiles={list(representative_percentiles)}",
-        "source=last_batch_mse_distribution",
+        "source=last_batch_reconstruction_distribution",
     )
     model.to(device)
     if discriminator is not None:
@@ -1065,6 +1390,8 @@ def train(args):
         raise ValueError('--sparse_poisson_radius_scale must be in [0.1, 2.0].')
     if args.early_stopping_patience <= 0:
         raise ValueError('--early_stopping_patience must be positive.')
+    if not 0.0 <= args.loss_mse_weight <= 1.0:
+        raise ValueError('--loss_mse_weight must be in [0, 1].')
     if args.gan_weight < 0:
         raise ValueError('--gan_weight must be non-negative.')
     if len(args.deep_supervision_weights) != 3:
@@ -1079,6 +1406,14 @@ def train(args):
         raise ValueError('--gan_balance_target_high must be in (0, 1).')
     if args.gan_balance_target_low >= args.gan_balance_target_high:
         raise ValueError('--gan_balance_target_low must be less than --gan_balance_target_high.')
+    if args.gan_balance_lookahead_window < 2:
+        raise ValueError('--gan_balance_lookahead_window must be >= 2.')
+    if args.gan_balance_lookahead_horizon < 1:
+        raise ValueError('--gan_balance_lookahead_horizon must be >= 1.')
+    if args.gan_balance_lookahead_deadband < 0.0:
+        raise ValueError('--gan_balance_lookahead_deadband must be non-negative.')
+    if args.gan_balance_lookahead_deadband >= 0.5 * (args.gan_balance_target_high - args.gan_balance_target_low):
+        raise ValueError('--gan_balance_lookahead_deadband is too large for the target band width.')
     if args.gan_balance_gan_weight_min < 0.0:
         raise ValueError('--gan_balance_gan_weight_min must be non-negative.')
     if args.gan_balance_gan_weight_min > args.gan_balance_gan_weight_max:
@@ -1101,10 +1436,11 @@ def train(args):
     opt = build_optimizer(model, args)
     disc_opt = build_discriminator_optimizer(discriminator, args)
     scheduler = build_scheduler(opt, args)
+    rec_loss_fn = CombinedReconLoss(mse_weight=float(args.loss_mse_weight))
     deep_supervision_loss = None
     if args.deep_supervision:
         deep_supervision_loss = DeepSupervisionLoss(
-            base_loss=nn.MSELoss(),
+            base_loss=rec_loss_fn,
             weights=tuple(float(v) for v in args.deep_supervision_weights),
         )
 
@@ -1130,7 +1466,13 @@ def train(args):
             f"target_acc_range=[{100.0*args.gan_balance_target_low:.1f}%,{100.0*args.gan_balance_target_high:.1f}%]",
             f"gan_weight_bounds=[{args.gan_balance_gan_weight_min:.6f},{args.gan_balance_gan_weight_max:.6f}]",
             f"disc_lr_bounds=[{disc_lr_min:.2e},{disc_lr_max:.2e}]",
+            f"lookahead={args.gan_balance_lookahead}",
+            f"lookahead_window={args.gan_balance_lookahead_window}",
+            f"lookahead_horizon={args.gan_balance_lookahead_horizon}",
+            f"lookahead_deadband={args.gan_balance_lookahead_deadband}",
         )
+
+    d_gan_acc_history = deque(maxlen=max(2, int(args.gan_balance_lookahead_window)))
 
     early_stopping = EarlyStoppingState(best_val_loss=float('inf'), epochs_without_improvement=0)
     best_ckpt_path = Path(args.out_dir) / args.best_checkpoint_name
@@ -1142,6 +1484,15 @@ def train(args):
     print(f"TensorBoard log dir: {tensorboard_dir}")
     print(f"Run TensorBoard: uv run tensorboard --logdir {tensorboard_dir}")
     representative_examples = {'training': [], 'validation': []}
+    representative_examples_ready = False
+    if args.resume is not None and representative_metadata_path.exists():
+        try:
+            representative_examples = _load_representative_example_metadata(representative_metadata_path)
+            representative_examples_ready = bool(representative_examples['training']) and bool(representative_examples['validation'])
+            if representative_examples_ready:
+                print(f"Loaded representative metadata from {representative_metadata_path}")
+        except Exception as exc:
+            print(f"Warning: failed to load representative metadata from {representative_metadata_path}: {exc}")
     csv_exists = metrics_csv_path.exists()
     training_start_time = time.time()
     with metrics_csv_path.open('a', newline='') as csv_file:
@@ -1172,12 +1523,17 @@ def train(args):
 
         print_epoch_header()
 
-        for epoch in range(args.epochs):
-            if epoch > 0 and epoch % 25 == 0:
+        total_display_epochs = resume_completed_epochs + args.epochs
+
+        for epoch_offset in range(args.epochs):
+            if epoch_offset > 0 and epoch_offset % 25 == 0:
                 print()
                 print_epoch_header()
 
-            kl_weight = get_kl_weight(epoch, args)
+            epoch_idx = resume_completed_epochs + epoch_offset
+            epoch_number = epoch_idx + 1
+
+            kl_weight = get_kl_weight(epoch_idx, args)
             args.current_kl_weight = kl_weight
             gan_weight_for_epoch = current_gan_weight
 
@@ -1200,6 +1556,9 @@ def train(args):
                 gan_weight_for_epoch,
                 deep_supervision=args.deep_supervision,
                 deep_supervision_loss=deep_supervision_loss,
+                rec_loss_fn=rec_loss_fn,
+                mse_weight=float(args.loss_mse_weight),
+                deep_supervision_weights=args.deep_supervision_weights,
             )
             val_loss, val_last_snapshot = validate(
                 model,
@@ -1207,15 +1566,19 @@ def train(args):
                 device,
                 steps_per_epoch,
                 deep_supervision_loss=deep_supervision_loss,
+                rec_loss_fn=rec_loss_fn,
             )
             examples_this_epoch = samples_per_epoch
-            cumulative_examples = (epoch + 1) * samples_per_epoch
+            cumulative_examples = epoch_number * samples_per_epoch
 
             next_disc_lr = float(disc_opt.param_groups[0]['lr']) if disc_opt is not None else None
             controller_status = 'off'
-            current_gan_weight, next_disc_lr, controller_status = update_gan_balance_controller(
+            controller_acc = float(d_gan_acc_epoch)
+            d_gan_acc_history.append(float(d_gan_acc_epoch))
+            current_gan_weight, next_disc_lr, controller_status, controller_acc = update_gan_balance_controller(
                 args,
                 d_gan_acc_epoch,
+                d_gan_acc_history,
                 current_gan_weight,
                 disc_opt,
                 disc_lr_min,
@@ -1227,14 +1590,13 @@ def train(args):
 
             improved = update_early_stopping(early_stopping, val_loss, args.early_stopping_min_delta)
             if improved:
-                torch.save(build_checkpoint_payload(model), best_ckpt_path)
+                torch.save(build_checkpoint_payload(model, epoch=epoch_number), best_ckpt_path)
 
             if args.save_epoch_checkpoints:
-                torch.save(build_checkpoint_payload(model), Path(args.out_dir)/f"vae_epoch{epoch+1}.pt")
+                torch.save(build_checkpoint_payload(model, epoch=epoch_number), Path(args.out_dir)/f"vae_epoch{epoch_number}.pt")
 
             current_lr = opt.param_groups[0]['lr']
             current_disc_lr = disc_opt.param_groups[0]['lr'] if disc_opt is not None else float('nan')
-            epoch_number = epoch + 1
 
             writer.add_scalar('train/loss', float(train_loss), epoch_number)
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
@@ -1242,11 +1604,54 @@ def train(args):
             writer.add_scalar('train/gan_weight', float(gan_weight_for_epoch), epoch_number)
             writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
             writer.add_scalar('train/d_gan_accuracy', float(d_gan_acc_epoch), epoch_number)
+            writer.add_scalar('train/d_gan_controller_accuracy', float(controller_acc), epoch_number)
             writer.add_scalar('train/d_gan_lr', float(current_disc_lr), epoch_number)
             writer.add_scalar('train/encoder_lr', float(get_named_group_lr(opt, 'encoder', current_lr)), epoch_number)
             writer.add_scalar('train/decoder_lr', float(get_named_group_lr(opt, 'decoder', current_lr)), epoch_number)
 
-            if epoch_number == args.representative_selection_epoch:
+            if args.adaptive_sampling_by_mse and epoch_number % args.sampling_snapshot_interval == 0:
+                snapshot_recon = compute_full_dataset_recon_snapshot(
+                    model,
+                    adaptive_eval_ds,
+                    args.batch_size,
+                    device,
+                    mse_weight=args.loss_mse_weight,
+                    deep_supervision=args.deep_supervision,
+                    deep_supervision_weights=args.deep_supervision_weights,
+                )
+                adaptive_recon_history.append(snapshot_recon)
+                adaptive_sample_weights, avg_improvement, score = compute_adaptive_sampling_scores(
+                    list(adaptive_recon_history),
+                    improvement_weight=args.sampling_improvement_weight,
+                )
+
+                adaptive_snapshot_records.append(
+                    {
+                        'epoch': epoch_number,
+                        'recon_loss': snapshot_recon,
+                        'average_improvement': avg_improvement,
+                        'score': score,
+                        'probability': adaptive_sample_weights,
+                    }
+                )
+                save_adaptive_sampling_snapshots(adaptive_snapshot_path, adaptive_snapshot_records)
+                dl = build_train_dataloader(ds, args, sample_weights=adaptive_sample_weights)
+
+                writer.add_scalar('adaptive_sampling/recon_mean', float(np.mean(snapshot_recon)), epoch_number)
+                writer.add_scalar('adaptive_sampling/improvement_mean', float(np.mean(avg_improvement)), epoch_number)
+                writer.add_scalar('adaptive_sampling/score_mean', float(np.mean(score)), epoch_number)
+                writer.add_scalar('adaptive_sampling/probability_max', float(np.max(adaptive_sample_weights)), epoch_number)
+                writer.add_scalar('adaptive_sampling/probability_min', float(np.min(adaptive_sample_weights)), epoch_number)
+                writer.add_scalar('adaptive_sampling/probability_entropy', float(-np.sum(adaptive_sample_weights * np.log(np.clip(adaptive_sample_weights, 1e-12, 1.0)))), epoch_number)
+
+                print(
+                    f"Adaptive sampling snapshot @ epoch {epoch_number}: "
+                    f"recon_mean={float(np.mean(snapshot_recon)):.6f}, "
+                    f"improvement_mean={float(np.mean(avg_improvement)):.6f}, "
+                    f"score_mean={float(np.mean(score)):.6f}"
+                )
+
+            if (not representative_examples_ready) and epoch_number >= args.representative_selection_epoch:
                 representative_examples['training'] = _build_representative_examples(
                     train_last_snapshot,
                     split='training',
@@ -1259,11 +1664,13 @@ def train(args):
                     epoch_number=epoch_number,
                     percentiles=representative_percentiles,
                 )
-                _save_representative_example_metadata(representative_examples, representative_metadata_path)
-                print(
-                    f"Saved representative metadata from epoch {args.representative_selection_epoch} "
-                    f"to {representative_metadata_path}"
-                )
+                representative_examples_ready = bool(representative_examples['training']) and bool(representative_examples['validation'])
+                if representative_examples_ready:
+                    _save_representative_example_metadata(representative_examples, representative_metadata_path)
+                    print(
+                        f"Saved representative metadata from epoch {epoch_number} "
+                        f"to {representative_metadata_path}"
+                    )
 
             if (
                 epoch_number % args.representative_plot_interval == 0
@@ -1298,10 +1705,10 @@ def train(args):
             writer.flush()
 
             elapsed_summary = ''
-            if (epoch + 1) % 5 == 0:
+            if (epoch_offset + 1) % 5 == 0:
                 elapsed_seconds = time.time() - training_start_time
-                average_epoch_seconds = elapsed_seconds / float(epoch + 1)
-                remaining_epochs = max(0, args.epochs - (epoch + 1))
+                average_epoch_seconds = elapsed_seconds / float(epoch_offset + 1)
+                remaining_epochs = max(0, args.epochs - (epoch_offset + 1))
                 remaining_seconds = average_epoch_seconds * float(remaining_epochs)
                 estimated_finish = datetime.now() + timedelta(seconds=remaining_seconds)
                 elapsed_summary = (
@@ -1316,7 +1723,7 @@ def train(args):
             d_gan_lr_display = f"{current_disc_lr:9.2e}" if disc_opt is not None else f"{'n/a':>9}"
 
             print(
-                f"{(f'{epoch+1:>{len(str(args.epochs))}d}/{args.epochs}'):>9} "
+                f"{(f'{epoch_number:>{len(str(total_display_epochs))}d}/{total_display_epochs}'):>9} "
                 f"{train_loss:9.6f} "
                 f"{val_loss:10.6f} "
                 f"{kl_weight:11.6f} "
@@ -1333,7 +1740,7 @@ def train(args):
 
             if early_stopping.epochs_without_improvement >= args.early_stopping_patience:
                 print(
-                    f"Early stopping triggered after epoch {epoch+1} "
+                    f"Early stopping triggered after epoch {epoch_number} "
                     f"(no val improvement for {early_stopping.epochs_without_improvement} epochs)."
                 )
                 break
@@ -1385,6 +1792,7 @@ if __name__ == '__main__':
     p.add_argument('--kl_fixed', type=float, default=1e-3)
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
     p.add_argument('--deep_supervision_weights', type=float, nargs=3, default=[1.0, 0.5, 0.25], help='Three deep supervision reconstruction loss weights (fine, mid, coarse).')
+    p.add_argument('--loss_mse_weight', type=float, default=0.6, help='Weight for MSE component of reconstruction loss in [0, 1]; PMSE weight = 1 - this value.')
     p.add_argument('--lr_scheduler', type=str, default='plateau', choices=['none', 'plateau'])
     p.add_argument('--lr_scheduler_patience', type=int, default=3)
     p.add_argument('--lr_scheduler_factor', type=float, default=0.5)
@@ -1407,12 +1815,21 @@ if __name__ == '__main__':
     p.add_argument('--gan_balance_disc_lr_max', type=float, default=None)
     p.add_argument('--gan_balance_disc_lr_down_mult', type=float, default=0.98)
     p.add_argument('--gan_balance_disc_lr_up_mult', type=float, default=1.02)
+    p.add_argument('--gan_balance_lookahead', action='store_true', help='Use trend look-ahead for GAN balance controller decisions based on recent discriminator accuracy.')
+    p.add_argument('--gan_balance_lookahead_window', type=int, default=5, help='Number of recent epochs used for linear fit of d_gan_acc when look-ahead is enabled.')
+    p.add_argument('--gan_balance_lookahead_horizon', type=int, default=1, help='Prediction horizon in epochs for d_gan_acc look-ahead control.')
+    p.add_argument('--gan_balance_lookahead_deadband', type=float, default=0.01, help='Predictive-mode-only deadband (fraction) applied inward from target edges to reduce control oscillation.')
     p.add_argument('--best_checkpoint_name', type=str, default='vae_best.pt')
     p.add_argument('--save_epoch_checkpoints', dest='save_epoch_checkpoints', action='store_true', help='Save per-epoch checkpoints in addition to best checkpoint.')
     p.add_argument('--no_save_epoch_checkpoints', dest='save_epoch_checkpoints', action='store_false', help='Disable per-epoch checkpoint saving and keep only best checkpoint.')
     p.set_defaults(save_epoch_checkpoints=True)
     p.add_argument('--representative_selection_epoch', type=int, default=4, help='Epoch number used to select representative examples from last-batch MSE percentiles.')
     p.add_argument('--representative_plot_interval', type=int, default=5, help='Generate representative plots every N epochs, reusing the selected examples.')
+    p.add_argument('--adaptive_sampling_by_mse', action='store_true', help='Enable adaptive training sampling probabilities from full-dataset blended reconstruction-loss snapshots.')
+    p.add_argument('--sampling_snapshot_interval', type=int, default=5, help='Recompute full-dataset blended reconstruction loss every N epochs when adaptive sampling is enabled.')
+    p.add_argument('--sampling_improvement_window', type=int, default=3, help='Number of recent reconstruction-loss snapshots kept to compute average improvement (>=2).')
+    p.add_argument('--sampling_improvement_weight', type=float, default=1.0, help='Weight on average improvement term in score: score = current_recon + weight * avg_improvement.')
+    p.add_argument('--sampling_snapshot_filename', type=str, default='adaptive_sampling_snapshots.pt', help='Output filename under --out_dir for stored per-example adaptive sampling snapshots.')
     p.add_argument('--out_dir', type=str, default='checkpoints')
     args = p.parse_args()
     args.patch_size_xyz = normalize_patch_size(args.patch_size) if args.patch_size is not None else None
