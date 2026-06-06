@@ -13,6 +13,9 @@ Requires-Dist: tqdm
 Requires-Dist: tensorboard
 Requires-Dist: omegaconf
 Requires-Dist: pytorch-lightning
+Requires-Dist: PySide6
+Requires-Dist: pyvista
+Requires-Dist: pyvistaqt
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: flake8; extra == "dev"

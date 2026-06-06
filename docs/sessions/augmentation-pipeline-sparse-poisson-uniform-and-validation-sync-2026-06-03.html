@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Summary - Augmentation Pipeline Updates (2026-06-03)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; line-height: 1.5; max-width: 980px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
+    h1, h2 { color: #111827; }
+    code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    ul { margin-top: 0.3rem; }
+  </style>
+</head>
+<body>
+  <h1>Session Summary: Augmentation Pipeline Updates (2026-06-03)</h1>
+
+  <h2>Context And Goals</h2>
+  <p>The session focused on extending and stabilizing the training input augmentation pipeline for 3D VAE training.</p>
+  <p>Primary goals were to add sparse-input augmentation options, enforce transform exclusivity, replace the slow Mitchell-like sparse selector, align training and validation controls, diagnose representative-plot artifacts, and update defaults/tests.</p>
+  <p>Command context included runs with <code>--input_extrema_prob 0.0 --input_sparse_keep_prob 1.0 --input_decimate_trilinear_prob 0.0</code> targeting <code>checkpoints_poisson_disc</code>.</p>
+
+  <h2>What Was Done</h2>
+  <ul>
+    <li>Added one-of-three input transform selection (extrema / sparse / decimate) using weighted probabilities.</li>
+    <li>Implemented sparse methods: Poisson-like and uniform-threshold with random 50/50 selection.</li>
+    <li>Removed Mitchell-like sparse method from active pipeline and CLI.</li>
+    <li>Added decimate+trilinear input augmentation.</li>
+    <li>Synced validation input transform behavior with training transform family/weights when enabled.</li>
+    <li>Diagnosed all-zero representative training input artifacts and fixed sparse assignment for non-contiguous arrays.</li>
+    <li>Updated sparse default keep range from <code>[0.10, 0.20]</code> to <code>[0.10, 0.30]</code>.</li>
+    <li>Updated vertical warp defaults to <code>min_step=0.5</code> and <code>max_step=2.0</code>.</li>
+    <li>Added/updated benchmark and unit tests; generated benchmark PNG artifacts.</li>
+  </ul>
+
+  <h2>How It Was Done</h2>
+  <ul>
+    <li>Modified augmentation and training data pipeline code in <code>src/augmentations.py</code> and <code>scripts/train.py</code>.</li>
+    <li>Added/updated tests in <code>tests/test_input_augmentations.py</code>, <code>tests/test_sparse_keep_vs_uniform_benchmark.py</code>, and <code>tests/test_vertical_warp.py</code>.</li>
+    <li>Inspected representative metadata and plots from <code>checkpoints_poisson_disc</code> to reproduce and diagnose behavior.</li>
+    <li>Validated changes with targeted unittest runs and CLI smoke checks.</li>
+  </ul>
+
+  <h2>When Was It Done And By Whom</h2>
+  <ul>
+    <li>Date: 2026-06-03</li>
+    <li>By: Donald (requester/operator) and GitHub Copilot (GPT-5.3-Codex)</li>
+  </ul>
+
+  <h2>Basic Info (Commits, Files Involved)</h2>
+  <p>Relevant files changed in this session:</p>
+  <ul>
+    <li><code>scripts/train.py</code></li>
+    <li><code>src/augmentations.py</code></li>
+    <li><code>tests/test_vertical_warp.py</code></li>
+    <li><code>tests/test_input_augmentations.py</code></li>
+    <li><code>tests/test_sparse_keep_vs_uniform_benchmark.py</code></li>
+    <li><code>docs/plans/input-augmentations-sparse-keep-and-decimate-trilinear-2026-06-02.md</code></li>
+    <li><code>docs/sessions/augmentation-pipeline-sparse-poisson-uniform-and-validation-sync-2026-06-03.md</code></li>
+    <li><code>docs/sessions/augmentation-pipeline-sparse-poisson-uniform-and-validation-sync-2026-06-03.html</code></li>
+  </ul>
+  <p>Generated benchmark artifacts (intentionally excluded from commit):</p>
+  <ul>
+    <li><code>docs/plans/sparse_keep_vs_uniform_cross_sections_32x32x64.png</code></li>
+    <li><code>docs/plans/sparse_keep_vs_uniform_cross_sections_32x32x64_15pct.png</code></li>
+    <li><code>docs/plans/sparse_keep_vs_uniform_cross_sections_32x32x64_30pct.png</code></li>
+  </ul>
+  <p>Validation commands executed during the session included:</p>
+  <ul>
+    <li><code>python -m unittest tests/test_input_augmentations.py</code></li>
+    <li><code>python -m unittest tests/test_vertical_warp.py</code></li>
+    <li><code>python -m unittest tests/test_sparse_keep_vs_uniform_benchmark.py</code></li>
+    <li><code>python scripts/train.py --help</code> and targeted argument checks</li>
+  </ul>
+
+  <h2>Next / Future Follow-Up Suggestions</h2>
+  <ul>
+    <li>Run a short training smoke run and regenerate representative plots to confirm no all-zero sparse-input artifacts remain.</li>
+    <li>Add an explicit regression test for sparse keep on non-contiguous input views (swap/flip).</li>
+    <li>Optionally log effective nonzero ratio of augmented input <code>x</code> during training.</li>
+    <li>Tune <code>sparse_poisson_radius_scale</code> after observing quality with the updated <code>[0.10, 0.30]</code> range.</li>
+  </ul>
+</body>
+</html>

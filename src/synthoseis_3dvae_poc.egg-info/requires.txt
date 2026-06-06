@@ -6,6 +6,9 @@ tqdm
 tensorboard
 omegaconf
 pytorch-lightning
+PySide6
+pyvista
+pyvistaqt
 
 [dev]
 pytest

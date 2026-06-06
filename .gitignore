@@ -1,6 +1,6 @@
 # Generated training data and outputs
 data/
-checkpoints/
+checkpoints*/
 checkpoints_retrain/
 checkpoints_smoke/
 purgatory/
@@ -12,3 +12,7 @@ __pycache__/
 
 # macOS filesystem metadata
 .DS_Store
+
+# unused files
+scripts/generate_reconstructions.py
+docs/plans/*.png

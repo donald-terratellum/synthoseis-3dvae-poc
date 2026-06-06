@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Latent Alignment Training Guide</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --card: #ffffff;
+      --ink: #1f2937;
+      --muted: #4b5563;
+      --line: #d1d5db;
+      --accent: #0f766e;
+      --accent-soft: #dff5f2;
+      --code: #111827;
+      --code-bg: #f3f4f6;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #eef2f7 0%, var(--bg) 100%);
+      line-height: 1.55;
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 24px auto;
+      padding: 0 16px 40px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.05);
+    }
+
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin-top: 0;
+    }
+
+    h1 {
+      font-size: 1.9rem;
+      margin-bottom: 0.3rem;
+    }
+
+    h2 {
+      margin-top: 1.8rem;
+      font-size: 1.35rem;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 0.35rem;
+    }
+
+    h3 {
+      margin-top: 1.2rem;
+      font-size: 1.05rem;
+      color: var(--muted);
+    }
+
+    p, li {
+      color: var(--ink);
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 0.9rem;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      margin-right: 0.35rem;
+      margin-bottom: 0.35rem;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.85rem;
+      border: 1px solid #b9ece6;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+      color: var(--code);
+      background: var(--code-bg);
+      border: 1px solid #e5e7eb;
+      border-radius: 4px;
+      padding: 0.08rem 0.3rem;
+    }
+
+    pre {
+      margin: 0.6rem 0 1.2rem;
+      padding: 0.9rem;
+      overflow-x: auto;
+      border-radius: 8px;
+      background: #0b1220;
+      color: #e5e7eb;
+      border: 1px solid #25334d;
+    }
+
+    pre code {
+      background: transparent;
+      border: 0;
+      color: inherit;
+      padding: 0;
+      font-size: 0.9rem;
+    }
+
+    .eq {
+      margin: 0.8rem 0;
+      padding: 0.8rem;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      background: #fafafa;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      white-space: nowrap;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0.8rem 0 1.2rem;
+      font-size: 0.95rem;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 0.5rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f9fafb;
+    }
+
+    a {
+      color: #0a5f93;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f0fdfa;
+      padding: 0.75rem 0.9rem;
+      margin: 0.75rem 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <article class="card">
+      <h1>Latent Alignment Training Guide</h1>
+      <p class="subtitle">Goals, ownership, implementation, theory, references, and ablation workflow for improving reconstruction detail.</p>
+      <div>
+        <span class="pill">training</span>
+        <span class="pill">VAE</span>
+        <span class="pill">latent losses</span>
+        <span class="pill">ablation</span>
+      </div>
+
+      <h2>Goals</h2>
+      <ul>
+        <li>Improve reconstruction detail in predictions, especially fault-like discontinuities and localized vertical offsets.</li>
+        <li>Reduce latent mismatch between input, prediction, and label in representative plots.</li>
+        <li>Bias optimization toward stronger encoder learning and relatively weaker decoder dynamics.</li>
+      </ul>
+
+      <h2>Who</h2>
+      <ul>
+        <li>Primary audience: researchers and engineers training the 3D VAE in this repository.</li>
+        <li>Secondary audience: reviewers evaluating reproducibility and methodology.</li>
+      </ul>
+
+      <h2>What</h2>
+      <p>This guide documents two optional training modifications:</p>
+      <ol>
+        <li>Latent consistency losses:
+          <ul>
+            <li>prediction vs label latent alignment</li>
+            <li>prediction vs input latent alignment</li>
+          </ul>
+        </li>
+        <li>Encoder/decoder learning-rate multipliers:
+          <ul>
+            <li>increase encoder LR relative to base LR</li>
+            <li>decrease decoder LR relative to base LR</li>
+          </ul>
+        </li>
+      </ol>
+
+      <h2>When</h2>
+      <ul>
+        <li>Use when reconstructions appear over-smoothed and miss structure visible in labels.</li>
+        <li>Use when representative latent plots show large separation between prediction and label.</li>
+        <li>Do not treat this as a replacement for data quality and augmentation review.</li>
+      </ul>
+
+      <h2>How</h2>
+      <h3>New flags</h3>
+      <ul>
+        <li><code>--latent_pred_target_weight</code></li>
+        <li><code>--latent_pred_input_weight</code></li>
+        <li><code>--latent_alignment_detach_targets</code> / <code>--no_latent_alignment_detach_targets</code></li>
+        <li><code>--encoder_lr_mult</code></li>
+        <li><code>--decoder_lr_mult</code></li>
+      </ul>
+
+      <h3>Meaning</h3>
+      <ul>
+        <li><code>--latent_pred_target_weight</code>: aligns <code>encoder(prediction)</code> to <code>encoder(label)</code>.</li>
+        <li><code>--latent_pred_input_weight</code>: aligns <code>encoder(prediction)</code> to <code>encoder(input)</code>.</li>
+        <li><code>--latent_alignment_detach_targets</code> (default): detaches target branches for stability.</li>
+        <li><code>--encoder_lr_mult &gt; 1.0</code>: stronger encoder optimization pressure.</li>
+        <li><code>--decoder_lr_mult &lt; 1.0</code>: relatively weaker decoder optimization dynamics.</li>
+      </ul>
+
+      <h3>Objective</h3>
+      <div class="eq">L = L_recon + beta * L_KL + lambda_pt * ||E(y_hat)-E(y)||^2 + lambda_pi * ||E(y_hat)-E(x)||^2 + lambda_gan * L_gan</div>
+      <p>Where <code>x</code> is input, <code>y_hat</code> is prediction, <code>y</code> is label, and <code>E</code> is encoder mean branch.</p>
+
+      <h2>Usage</h2>
+      <h3>Baseline</h3>
+      <pre><code>uv run python scripts/train.py \
+  --data data/train_32-32-64.zarr \
+  --validation_data data/val_32-32-64.zarr \
+  --batch_size 50 \
+  --number_batches 100 \
+  --epochs 150 \
+  --augment \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-4 \
+  --out_dir checkpoints_baseline</code></pre>
+
+      <h3>Latent alignment only</h3>
+      <pre><code>uv run python scripts/train.py \
+  --data data/train_32-32-64.zarr \
+  --validation_data data/val_32-32-64.zarr \
+  --batch_size 50 \
+  --number_batches 100 \
+  --epochs 150 \
+  --augment \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-4 \
+  --latent_pred_target_weight 0.05 \
+  --latent_pred_input_weight 0.00 \
+  --out_dir checkpoints_latent_pt005</code></pre>
+
+      <h3>Encoder-favored optimization only</h3>
+      <pre><code>uv run python scripts/train.py \
+  --data data/train_32-32-64.zarr \
+  --validation_data data/val_32-32-64.zarr \
+  --batch_size 50 \
+  --number_batches 100 \
+  --epochs 150 \
+  --augment \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-4 \
+  --encoder_lr_mult 1.5 \
+  --decoder_lr_mult 0.75 \
+  --out_dir checkpoints_lr_skew_e15_d075</code></pre>
+
+      <h3>Combined</h3>
+      <pre><code>uv run python scripts/train.py \
+  --data data/train_32-32-64.zarr \
+  --validation_data data/val_32-32-64.zarr \
+  --batch_size 50 \
+  --number_batches 100 \
+  --epochs 150 \
+  --augment \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-4 \
+  --latent_pred_target_weight 0.05 \
+  --latent_pred_input_weight 0.00 \
+  --encoder_lr_mult 1.5 \
+  --decoder_lr_mult 0.75 \
+  --out_dir checkpoints_latent_plus_lr_skew</code></pre>
+
+      <h2>Experimentation And Ablation Guide</h2>
+      <h3>Recommended matrix</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>latent_pred_target_weight</th>
+            <th>latent_pred_input_weight</th>
+            <th>encoder_lr_mult</th>
+            <th>decoder_lr_mult</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>A0 Baseline</td><td>0.00</td><td>0.00</td><td>1.0</td><td>1.0</td></tr>
+          <tr><td>A1 Latent target alignment</td><td>0.05</td><td>0.00</td><td>1.0</td><td>1.0</td></tr>
+          <tr><td>A2 LR asymmetry</td><td>0.00</td><td>0.00</td><td>1.5</td><td>0.75</td></tr>
+          <tr><td>A3 Combined</td><td>0.05</td><td>0.00</td><td>1.5</td><td>0.75</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Optional sensitivity checks</h3>
+      <ul>
+        <li>A4 Higher latent pressure: <code>latent_pred_target_weight=0.10</code></li>
+        <li>A5 Add input alignment: <code>latent_pred_input_weight=0.02</code></li>
+      </ul>
+
+      <h3>Readouts</h3>
+      <ul>
+        <li>Validation loss trajectory.</li>
+        <li>Representative plots at fixed examples over epochs.</li>
+        <li>Visual preservation of fault discontinuities.</li>
+        <li>TensorBoard: <code>train/latent_pred_target_loss</code>, <code>train/latent_pred_input_loss</code>, <code>train/encoder_lr</code>, <code>train/decoder_lr</code>.</li>
+      </ul>
+
+      <h3>Decision criteria</h3>
+      <ul>
+        <li>Promote if fault detail consistently improves and training remains stable.</li>
+        <li>Reject or down-weight if instability increases or validation trends regress materially.</li>
+      </ul>
+
+      <h2>Theory And Rationale</h2>
+      <ul>
+        <li>Pointwise losses can produce over-smoothed reconstructions under uncertainty.</li>
+        <li>Feature-space or latent-space matching can improve structure preservation.</li>
+        <li>Denoising formulations align with corrupted-input to clean-target training.</li>
+      </ul>
+
+      <div class="note">
+        This approach is an empirical training strategy and should be validated with controlled ablations before broad adoption.
+      </div>
+
+      <h2>References</h2>
+      <ol>
+        <li>Larsen et al., Autoencoding beyond pixels using a learned similarity metric, arXiv:1512.09300<br><a href="https://arxiv.org/abs/1512.09300">https://arxiv.org/abs/1512.09300</a></li>
+        <li>Dosovitskiy and Brox, Generating Images with Perceptual Similarity Metrics based on Deep Networks, arXiv:1602.02644<br><a href="https://arxiv.org/abs/1602.02644">https://arxiv.org/abs/1602.02644</a></li>
+        <li>Johnson et al., Perceptual Losses for Real-Time Style Transfer and Super-Resolution, arXiv:1603.08155<br><a href="https://arxiv.org/abs/1603.08155">https://arxiv.org/abs/1603.08155</a></li>
+        <li>Vincent et al., Extracting and Composing Robust Features with Denoising Autoencoders, ICML 2008<br><a href="https://www.cs.toronto.edu/~larocheh/publications/icml-2008-denoising-autoencoders.pdf">https://www.cs.toronto.edu/~larocheh/publications/icml-2008-denoising-autoencoders.pdf</a></li>
+      </ol>
+
+      <h2>Repository Mapping</h2>
+      <ul>
+        <li><code>scripts/train.py</code></li>
+        <li><code>src/model.py</code></li>
+      </ul>
+    </article>
+  </div>
+</body>
+</html>

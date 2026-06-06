@@ -15,8 +15,8 @@ class VerticalWarpTests(unittest.TestCase):
             self.assertTrue(np.isclose(float(target[0]), 0.0, atol=1e-6))
             self.assertTrue(np.isclose(float(target[-1]), float(nz - 1), atol=1e-6))
             self.assertTrue(np.all(increments > 0.0))
-            self.assertGreaterEqual(float(increments.min()), 0.8 - 1e-6)
-            self.assertLessEqual(float(increments.max()), 1.25 + 1e-6)
+            self.assertGreaterEqual(float(increments.min()), 0.5 - 1e-6)
+            self.assertLessEqual(float(increments.max()), 2.0 + 1e-6)
             self.assertTrue(np.isclose(float(increments.mean()), 1.0, atol=1e-6))
 
     def test_apply_vertical_warp_to_cube_preserves_shape_and_endpoints(self):

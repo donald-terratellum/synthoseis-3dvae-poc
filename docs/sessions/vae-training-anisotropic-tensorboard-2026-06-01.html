@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Coding Session Summary</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f6f2;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #5b6472;
+      --accent: #0f766e;
+      --border: #dbe4ea;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--text);
+      background: linear-gradient(180deg, #f7f6f2 0%, #eef4f7 100%);
+      line-height: 1.55;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+    .hero {
+      background: linear-gradient(135deg, rgba(15, 118, 110, 0.08), rgba(17, 24, 39, 0.05));
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 28px;
+      margin-bottom: 22px;
+      box-shadow: 0 12px 28px rgba(31, 41, 55, 0.06);
+    }
+    .chips {
+      margin-bottom: 10px;
+    }
+    .chip {
+      display: inline-block;
+      margin-right: 8px;
+      margin-bottom: 8px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.1);
+      color: var(--accent);
+      font-weight: 600;
+      font-size: 0.92rem;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2rem;
+    }
+    p.meta {
+      margin: 0;
+      color: var(--muted);
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 22px 24px;
+      margin: 18px 0;
+      box-shadow: 0 8px 20px rgba(31, 41, 55, 0.04);
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 1.15rem;
+    }
+    ul {
+      margin: 0;
+      padding-left: 22px;
+    }
+    li + li {
+      margin-top: 8px;
+    }
+    code {
+      background: #eef4f8;
+      border: 1px solid #d9e5ee;
+      border-radius: 6px;
+      padding: 0 6px;
+      font-size: 0.95em;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="hero">
+      <div class="chips">
+        <span class="chip">2026-06-01</span>
+        <span class="chip">GitHub Copilot / GPT-5.4</span>
+        <span class="chip">Training + TensorBoard</span>
+      </div>
+      <h1>Agentic Coding Session Summary</h1>
+      <p class="meta">Anisotropic patch-size support, checkpoint metadata, training-side TensorBoard logging, representative-example plots, and iterative latent-plot layout fixes.</p>
+    </div>
+
+    <section>
+      <h2>Context and Goals</h2>
+      <ul>
+        <li>Finish the move to <code>scripts/train.py</code> in the active training docs and references.</li>
+        <li>Support anisotropic training and patch sampling with patch sizes supplied as one value or three values.</li>
+        <li>Write checkpoint metadata required for robust downstream inference.</li>
+        <li>Add TensorBoard tracking and representative-example figures directly from training.</li>
+        <li>Iterate on plot layout until the inline, crossline, and latent panels matched the requested presentation.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Was Done</h2>
+      <ul>
+        <li>Generalized <code>scripts/sample_patches.py</code> and <code>scripts/train.py</code> to accept anisotropic patch sizes.</li>
+        <li>Updated <code>src/model.py</code> so <code>VAE3D</code> stores <code>patch_shape</code>, <code>latent_dim</code>, and <code>base_ch</code>.</li>
+        <li>Changed checkpoint saves to use metadata-rich dict payloads and validated that resume reads them back consistently.</li>
+        <li>Added startup logging for checkpoint schema details and the full <code>uv run tensorboard</code> command.</li>
+        <li>Added TensorBoard scalar logging and representative example selection, persistence, and plotting.</li>
+        <li>Adjusted representative plot axes, depth orientation, latent spacing, shading, fixed x-ranges, and latent line/fill registration.</li>
+        <li>Added anisotropic patch-size tests and updated training documentation to reflect the current script paths and commands.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How It Was Done</h2>
+      <ul>
+        <li>Worked from the local training surfaces first: <code>scripts/train.py</code>, <code>scripts/sample_patches.py</code>, and <code>src/model.py</code>.</li>
+        <li>Used focused helper functions for patch-size normalization, checkpoint payload creation, representative selection, and plotting.</li>
+        <li>Validated after each major edit with CLI checks, unit tests, smoke runs, checkpoint inspection, and plot artifact checks.</li>
+        <li>Resolved latent-panel registration issues by switching fill and outline to the same <code>stairs</code>-based half-sample edge definition.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>When It Was Done and By Whom</h2>
+      <div class="grid">
+        <div><strong>Date</strong><br />2026-06-01</div>
+        <div><strong>Authoring agent</strong><br />GitHub Copilot (GPT-5.4)</div>
+        <div><strong>Collaborator</strong><br />Donald P. Griffith</div>
+        <div><strong>Environment</strong><br />VS Code workspace on macOS</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Basic Info</h2>
+      <ul>
+        <li>Relevant commit before this session: <code>1a7e46e</code>.</li>
+        <li>Files involved: <code>.gitignore</code>, <code>README.md</code>, <code>docs/plans/seismic_tokenizer_app.md</code>, <code>docs/training/README.md</code>, <code>scripts/sample_patches.py</code>, <code>scripts/train.py</code>, <code>src/model.py</code>, <code>src/synthoseis_3dvae_poc.egg-info/SOURCES.txt</code>, and <code>tests/test_patch_size_shape_generalization.py</code>.</li>
+        <li>Validation included CLI help checks, anisotropic unit tests, smoke training, checkpoint inspection, resume verification, and representative plot generation.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Next and Future Follow-Up Work</h2>
+      <ul>
+        <li>Teach the tokenizer-side model adapter to consume checkpoint metadata automatically for anisotropic inference.</li>
+        <li>Consider timestamped TensorBoard run directories to avoid historical image mixing.</li>
+        <li>Decide whether representative latent-stat logging should remain disabled or be exposed through a dedicated debug flag.</li>
+        <li>Consider extracting representative plotting into a separate reporting module if training-side reporting grows further.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

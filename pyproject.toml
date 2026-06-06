@@ -18,7 +18,10 @@ dependencies = [
   "tqdm",
   "tensorboard",
   "omegaconf",
-  "pytorch-lightning"
+  "pytorch-lightning",
+  "PySide6",
+  "pyvista",
+  "pyvistaqt"
 ]
 
 [project.optional-dependencies]
