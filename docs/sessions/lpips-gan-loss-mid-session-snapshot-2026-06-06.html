@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LPIPS + GAN Loss Mid-Session Snapshot (2026-06-06)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 2rem auto; max-width: 960px; line-height: 1.55; color: #111; }
+    h1, h2 { line-height: 1.2; }
+    code { background: #f5f5f5; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    ul, ol { margin-top: 0.4rem; }
+  </style>
+</head>
+<body>
+  <h1>LPIPS + GAN Loss Mid-Session Snapshot (2026-06-06)</h1>
+
+  <h2>Context and goals</h2>
+  <ul>
+    <li>Branch: <code>feat/pixelwise_LPIPS_GAN_loss</code>.</li>
+    <li>Training was already in progress while loss-integration work was being implemented.</li>
+    <li>Primary goal for this snapshot was to preserve the current code state before additional edits.</li>
+    <li>Observed status during this checkpoint:
+      <ul>
+        <li>Training quality is better than previous attempts at the same stage.</li>
+        <li>Current run is at approximately epoch 40 of 200.</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2>What was done</h2>
+  <ul>
+    <li>Added LPIPS dependency declarations to project metadata and requirements.</li>
+    <li>Integrated optional slice-wise LPIPS loss into the VAE objective path.</li>
+    <li>Preserved baseline behavior when LPIPS weight is zero.</li>
+    <li>Added LPIPS-related metrics to training and validation logging outputs.</li>
+    <li>Added CSV schema migration handling for new metrics columns.</li>
+    <li>Added explicit resume epoch override support.</li>
+    <li>Added focused LPIPS regression tests.</li>
+    <li>Updated representative TensorBoard plot/title reporting to include LPIPS and combined reconstruction loss display.</li>
+    <li>Reduced LPIPS initialization warning noise by handling known torchvision deprecation warnings during LPIPS construction.</li>
+  </ul>
+
+  <h2>How was it done</h2>
+  <ul>
+    <li>Implemented LPIPS loss as a dedicated module in the training script with:
+      <ul>
+        <li>Mid-slice extraction (inline and crossline).</li>
+        <li>Normalization and optional minimum-size upsampling before LPIPS evaluation.</li>
+        <li>FP32 execution block and frozen LPIPS network parameters.</li>
+      </ul>
+    </li>
+    <li>Routed LPIPS contribution into shared loss computation used by both training and validation.</li>
+    <li>Kept GAN loss in the generator objective optional and separate from discriminator optimization.</li>
+    <li>Extended metrics outputs in TensorBoard and CSV while maintaining resume compatibility through header migration/backfill logic.</li>
+    <li>Added unittest coverage for LPIPS no-op behavior, GAN-path invariance, LPIPS preprocessing/gradient behavior, and CSV migration.</li>
+  </ul>
+
+  <h2>When it was done and by whom</h2>
+  <ul>
+    <li>Date: 2026-06-06.</li>
+    <li>Session type: mid-session checkpoint during active model-training work.</li>
+    <li>Contributors:
+      <ul>
+        <li>Donald P. Griffith (user, direction and training observations).</li>
+        <li>GitHub Copilot coding agent (implementation and verification).</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2>Basic info</h2>
+  <ul>
+    <li>Relevant commit(s): to be filled by the commit generated immediately after this summary.</li>
+    <li>Branch: <code>feat/pixelwise_LPIPS_GAN_loss</code>.</li>
+    <li>Files involved in this snapshot commit:
+      <ul>
+        <li><code>pyproject.toml</code></li>
+        <li><code>requirements.txt</code></li>
+        <li><code>scripts/train.py</code></li>
+        <li><code>tests/test_train_lpips.py</code></li>
+        <li><code>docs/sessions/lpips-gan-loss-mid-session-snapshot-2026-06-06.md</code></li>
+        <li><code>docs/sessions/lpips-gan-loss-mid-session-snapshot-2026-06-06.html</code></li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2>Next and future follow-up suggestions</h2>
+  <ol>
+    <li>Let the current training run continue to gather stronger evidence over more epochs before additional objective changes.</li>
+    <li>Compare current checkpoint metrics/qualitative samples against prior best runs at matched epochs.</li>
+    <li>If stability remains good, run controlled LPIPS weight sweeps while keeping GAN settings fixed.</li>
+    <li>Add an explicit checkpoint filename collision guard for resumed runs if multiple overlapping resumes are expected.</li>
+    <li>After this snapshot, continue planned integration phases only after preserving reproducible run metadata for this checkpoint.</li>
+  </ol>
+</body>
+</html>

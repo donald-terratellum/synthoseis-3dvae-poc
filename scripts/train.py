@@ -1,7 +1,9 @@
 import argparse
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 from typing import Any, cast, Optional
+import warnings
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -11,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import itertools
+import importlib
 import math
 import csv
 import time
@@ -20,6 +23,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 import zarr
@@ -33,6 +37,11 @@ from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
 from src.deep_supervision import DeepSupervisionLoss
 from src.model import VAE3D
+
+try:
+    lpips_lib = importlib.import_module('lpips')
+except ImportError:
+    lpips_lib = None
 
 
 def normalize_patch_size(values):
@@ -298,7 +307,106 @@ class CombinedReconLoss(nn.Module):
         return self.mse_weight * mse + self.pmse_weight * pmse
 
 
-def compute_vae_losses(recon, targets, mu, logvar, kl_weight, deep_supervision_loss=None, rec_loss_fn=None):
+def _get_primary_prediction(recon):
+    if isinstance(recon, (list, tuple)):
+        return recon[0]
+    return recon
+
+
+def _get_autocast_disabled_context(device_type: str):
+    if device_type in {'cpu', 'cuda'}:
+        return torch.autocast(device_type=device_type, enabled=False)
+    return nullcontext()
+
+
+class SliceLPIPSLoss(nn.Module):
+    def __init__(self, net: str = 'alex', min_spatial_size: int = 64, eps: float = 1e-6):
+        super().__init__()
+        if lpips_lib is None:
+            raise RuntimeError(
+                'lpips is required when --lpips_weight > 0. Install dependencies from requirements.txt or pyproject.toml.'
+            )
+        if min_spatial_size <= 0:
+            raise ValueError('min_spatial_size must be positive.')
+        self.min_spatial_size = int(min_spatial_size)
+        self.eps = float(eps)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message=r".*The parameter 'pretrained' is deprecated since 0\.13.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                'ignore',
+                message=r".*Arguments other than a weight enum or `None` for 'weights' are deprecated since 0\.13.*",
+                category=UserWarning,
+            )
+            try:
+                self.network = lpips_lib.LPIPS(net=net, verbose=False)
+            except TypeError:
+                self.network = lpips_lib.LPIPS(net=net)
+        self.network.eval()
+        for param in self.network.parameters():
+            param.requires_grad_(False)
+
+    def _extract_mid_slices(self, volume: torch.Tensor):
+        mid_x = int(volume.shape[2] // 2)
+        mid_y = int(volume.shape[3] // 2)
+        inline = volume[:, :, :, mid_y, :]
+        crossline = volume[:, :, mid_x, :, :]
+        return inline, crossline
+
+    def _resize_if_needed(self, image: torch.Tensor) -> torch.Tensor:
+        height, width = int(image.shape[-2]), int(image.shape[-1])
+        target_h = max(height, self.min_spatial_size)
+        target_w = max(width, self.min_spatial_size)
+        if target_h == height and target_w == width:
+            return image
+        return F.interpolate(image, size=(target_h, target_w), mode='bilinear', align_corners=False)
+
+    def _normalize_pair(self, pred: torch.Tensor, target: torch.Tensor):
+        scale = torch.maximum(
+            pred.detach().abs().amax(dim=(-2, -1), keepdim=True),
+            target.detach().abs().amax(dim=(-2, -1), keepdim=True),
+        )
+        scale = torch.clamp(scale, min=self.eps)
+        pred_norm = torch.clamp(pred / scale, min=-1.0, max=1.0)
+        target_norm = torch.clamp(target / scale, min=-1.0, max=1.0)
+        return pred_norm, target_norm.detach()
+
+    def _prepare_slices(self, pred: torch.Tensor, target: torch.Tensor):
+        pred_norm, target_norm = self._normalize_pair(pred.float(), target.float())
+        pred_rgb = self._resize_if_needed(pred_norm.repeat(1, 3, 1, 1))
+        target_rgb = self._resize_if_needed(target_norm.repeat(1, 3, 1, 1))
+        return pred_rgb, target_rgb
+
+    def forward(self, recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = _get_primary_prediction(recon)
+        inline_pred, crossline_pred = self._extract_mid_slices(pred)
+        inline_target, crossline_target = self._extract_mid_slices(target)
+
+        losses = []
+        with _get_autocast_disabled_context(pred.device.type):
+            for pred_slice, target_slice in (
+                (inline_pred, inline_target),
+                (crossline_pred, crossline_target),
+            ):
+                pred_rgb, target_rgb = self._prepare_slices(pred_slice, target_slice)
+                losses.append(self.network(pred_rgb, target_rgb).mean())
+        return torch.stack(losses).mean()
+
+
+def compute_vae_losses(
+    recon,
+    targets,
+    mu,
+    logvar,
+    kl_weight,
+    deep_supervision_loss=None,
+    rec_loss_fn=None,
+    lpips_loss_fn=None,
+    lpips_weight=0.0,
+):
     if deep_supervision_loss is not None:
         rec_loss = deep_supervision_loss(recon, targets)
     else:
@@ -307,9 +415,12 @@ def compute_vae_losses(recon, targets, mu, logvar, kl_weight, deep_supervision_l
             rec_loss = _rec_fn(recon[0], targets)
         else:
             rec_loss = _rec_fn(recon, targets)
+    lpips_loss = rec_loss.new_zeros(())
+    if lpips_loss_fn is not None and float(lpips_weight) > 0.0:
+        lpips_loss = lpips_loss_fn(_get_primary_prediction(recon), targets)
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / targets.numel()
-    loss = rec_loss + kl_weight * kld
-    return loss, rec_loss, kld
+    loss = rec_loss + (float(lpips_weight) * lpips_loss) + kl_weight * kld
+    return loss, rec_loss, kld, lpips_loss
 
 
 def compute_discriminator_gan_loss(discriminator, real_cubes, fake_cubes_detached):
@@ -339,7 +450,18 @@ def compute_generator_gan_loss(discriminator, fake_cubes):
     return g_gan_loss
 
 
-def compute_average_loss(model, dataloader, device, steps, kl_weight, deep_supervision=False, deep_supervision_loss=None, rec_loss_fn=None):
+def compute_average_loss(
+    model,
+    dataloader,
+    device,
+    steps,
+    kl_weight,
+    deep_supervision=False,
+    deep_supervision_loss=None,
+    rec_loss_fn=None,
+    lpips_loss_fn=None,
+    lpips_weight=0.0,
+):
     model.eval()
     total_loss = 0.0
     batch_iter = iter(dataloader) if steps is None else itertools.cycle(dataloader)
@@ -350,10 +472,29 @@ def compute_average_loss(model, dataloader, device, steps, kl_weight, deep_super
             targets = targets.to(device)
             if deep_supervision:
                 recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-                loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss, rec_loss_fn=rec_loss_fn)
+                loss, _, _, _ = compute_vae_losses(
+                    ds_outputs,
+                    targets,
+                    mu,
+                    logvar,
+                    kl_weight,
+                    deep_supervision_loss,
+                    rec_loss_fn=rec_loss_fn,
+                    lpips_loss_fn=lpips_loss_fn,
+                    lpips_weight=lpips_weight,
+                )
             else:
                 recon, mu, logvar = model(inputs)
-                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight, rec_loss_fn=rec_loss_fn)
+                loss, _, _, _ = compute_vae_losses(
+                    recon,
+                    targets,
+                    mu,
+                    logvar,
+                    kl_weight,
+                    rec_loss_fn=rec_loss_fn,
+                    lpips_loss_fn=lpips_loss_fn,
+                    lpips_weight=lpips_weight,
+                )
             total_loss += loss.item()
     return total_loss / steps
 
@@ -442,6 +583,52 @@ def format_elapsed_time(seconds):
     hours, rem = divmod(total_seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+METRICS_CSV_COLUMNS = [
+    'epoch',
+    'examples_this_epoch',
+    'cumulative_examples',
+    'train_loss',
+    'train_lpips_loss',
+    'val_loss',
+    'val_lpips_loss',
+    'kl_weight',
+    'learning_rate',
+    'discriminator_learning_rate',
+    'gan_weight',
+    'g_gan_loss',
+    'd_gan_loss',
+    'd_gan_acc_pct',
+    'best_model',
+]
+
+
+def migrate_metrics_csv_if_needed(csv_path: Path, expected_header):
+    if not csv_path.exists():
+        return False
+
+    with csv_path.open('r', newline='') as csv_file:
+        rows = list(csv.reader(csv_file))
+
+    if not rows:
+        return False
+
+    current_header = rows[0]
+    if current_header == list(expected_header):
+        return False
+
+    migrated_rows = [list(expected_header)]
+    for row in rows[1:]:
+        row_map = {
+            column_name: row[idx] if idx < len(row) else ''
+            for idx, column_name in enumerate(current_header)
+        }
+        migrated_rows.append([row_map.get(column_name, '') for column_name in expected_header])
+
+    with csv_path.open('w', newline='') as csv_file:
+        csv.writer(csv_file).writerows(migrated_rows)
+    return True
 
 
 def clamp_float(value, lower, upper):
@@ -581,7 +768,17 @@ def _format_latent_percentiles(name, latent_values):
     return f"{name:>10}[" + ", ".join(stats) + "]"
 
 
-def _plot_representative_example(model, device, example, epoch_number, vmin=-3.1, vmax=3.1):
+def _plot_representative_example(
+    model,
+    device,
+    example,
+    epoch_number,
+    rec_loss_fn,
+    lpips_loss_fn=None,
+    lpips_weight=0.0,
+    vmin=-3.1,
+    vmax=3.1,
+):
     import matplotlib
 
     matplotlib.use('Agg')
@@ -594,6 +791,11 @@ def _plot_representative_example(model, device, example, epoch_number, vmin=-3.1
         recon, _, _ = model(x)
         mse_value = float(compute_per_example_mse(recon, y)[0].item())
         pmse_value = float(compute_per_example_pmse(recon, y)[0].item())
+        rec_loss_value = float(rec_loss_fn(recon, y).item())
+        lpips_value = 0.0
+        if lpips_loss_fn is not None and float(lpips_weight) > 0.0:
+            lpips_value = float(lpips_loss_fn(recon, y).item())
+        combined_loss_value = rec_loss_value + (float(lpips_weight) * lpips_value)
         latent_input_mu, _ = model.encoder(x)
         latent_pred_mu, _ = model.encoder(recon)
         latent_label_mu, _ = model.encoder(y)
@@ -669,21 +871,40 @@ def _plot_representative_example(model, device, example, epoch_number, vmin=-3.1
         (
             f"{example.split} representative | epoch={epoch_number} | "
             f"percentile(epoch4)={example.percentile}% | mse={mse_value:.6f} | pmse={pmse_value:.6f} | "
+            f"lpips={lpips_value:.6f} | loss={combined_loss_value:.6f} | "
             f"epoch4_recon={example.selection_mse:.6f} | batch_idx={example.batch_index}"
         ),
         fontsize=10,
     )
-    return fig, mse_value, pmse_value
+    return fig, mse_value, pmse_value, lpips_value, combined_loss_value
 
 
-def _log_representative_examples(writer, model, device, examples, epoch_number, output_dir):
+def _log_representative_examples(
+    writer,
+    model,
+    device,
+    examples,
+    epoch_number,
+    output_dir,
+    rec_loss_fn,
+    lpips_loss_fn=None,
+    lpips_weight=0.0,
+):
     if not examples:
         return
     plot_root = Path(output_dir) / 'representative_plots' / f'epoch_{epoch_number:04d}'
     plot_root.mkdir(parents=True, exist_ok=True)
 
     for example in examples:
-        fig, mse_value, pmse_value = _plot_representative_example(model, device, example, epoch_number)
+        fig, mse_value, pmse_value, lpips_value, combined_loss_value = _plot_representative_example(
+            model,
+            device,
+            example,
+            epoch_number,
+            rec_loss_fn=rec_loss_fn,
+            lpips_loss_fn=lpips_loss_fn,
+            lpips_weight=lpips_weight,
+        )
         filename = f"{example.split.lower()}_p{example.percentile:02d}.png"
         fig.savefig(plot_root / filename, dpi=140)
         writer.add_figure(
@@ -699,6 +920,16 @@ def _log_representative_examples(writer, model, device, examples, epoch_number, 
         writer.add_scalar(
             f"representative/{example.split.lower()}/p{example.percentile:02d}_pmse",
             pmse_value,
+            epoch_number,
+        )
+        writer.add_scalar(
+            f"representative/{example.split.lower()}/p{example.percentile:02d}_lpips",
+            lpips_value,
+            epoch_number,
+        )
+        writer.add_scalar(
+            f"representative/{example.split.lower()}/p{example.percentile:02d}_loss",
+            combined_loss_value,
             epoch_number,
         )
         import matplotlib.pyplot as plt
@@ -829,6 +1060,8 @@ def train_one_epoch(
     deep_supervision=False,
     deep_supervision_loss=None,
     rec_loss_fn=None,
+    lpips_loss_fn=None,
+    lpips_weight=0.0,
     mse_weight=0.6,
     deep_supervision_weights=None,
 ):
@@ -836,6 +1069,7 @@ def train_one_epoch(
     if discriminator is not None:
         discriminator.train()
     total_loss = 0.0
+    total_lpips_loss = 0.0
     total_g_gan_loss = 0.0
     total_d_gan_loss = 0.0
     total_d_gan_acc = 0.0
@@ -867,10 +1101,29 @@ def train_one_epoch(
         # Generator (VAE) step.
         if deep_supervision:
             recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-            vae_loss, _, _ = compute_vae_losses(ds_outputs, targets, mu, logvar, kl_weight, deep_supervision_loss, rec_loss_fn=rec_loss_fn)
+            vae_loss, _, _, lpips_loss = compute_vae_losses(
+                ds_outputs,
+                targets,
+                mu,
+                logvar,
+                kl_weight,
+                deep_supervision_loss,
+                rec_loss_fn=rec_loss_fn,
+                lpips_loss_fn=lpips_loss_fn,
+                lpips_weight=lpips_weight,
+            )
         else:
             recon, mu, logvar = model(inputs)
-            vae_loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, kl_weight, rec_loss_fn=rec_loss_fn)
+            vae_loss, _, _, lpips_loss = compute_vae_losses(
+                recon,
+                targets,
+                mu,
+                logvar,
+                kl_weight,
+                rec_loss_fn=rec_loss_fn,
+                lpips_loss_fn=lpips_loss_fn,
+                lpips_weight=lpips_weight,
+            )
 
         g_gan_loss_value = 0.0
         total_g_loss = vae_loss
@@ -884,6 +1137,7 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         total_loss += total_g_loss.item()
+        total_lpips_loss += float(lpips_loss.item())
         total_g_gan_loss += g_gan_loss_value
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
@@ -914,6 +1168,7 @@ def train_one_epoch(
 
     return (
         total_loss / steps_per_epoch,
+        total_lpips_loss / steps_per_epoch,
         total_g_gan_loss / steps_per_epoch,
         total_d_gan_loss / steps_per_epoch,
         total_d_gan_acc / steps_per_epoch,
@@ -1096,7 +1351,7 @@ def infer_completed_epochs_from_resume_path(path):
     return int(match.group(1))
 
 
-def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=None, rec_loss_fn=None):
+def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=None, rec_loss_fn=None, lpips_loss_fn=None):
     validation_extrema_mode = None if args.validation_extrema_only else False
     validation_ds = ZarrPatchDataset(
         args.validation_data,
@@ -1127,6 +1382,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
     validation_steps = max(1, int(math.ceil(0.2 * train_steps_per_epoch)))
     model.eval()
     total_loss = 0.0
+    total_lpips_loss = 0.0
     batch_iter = itertools.cycle(validation_dl)
     last_snapshot = None
     with torch.no_grad():
@@ -1137,7 +1393,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
             ds_outputs = None
             if args.deep_supervision:
                 recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-                loss, _, _ = compute_vae_losses(
+                loss, _, _, lpips_loss = compute_vae_losses(
                     ds_outputs,
                     targets,
                     mu,
@@ -1145,11 +1401,23 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     args.current_kl_weight,
                     deep_supervision_loss,
                     rec_loss_fn=rec_loss_fn,
+                    lpips_loss_fn=lpips_loss_fn,
+                    lpips_weight=args.lpips_weight,
                 )
             else:
                 recon, mu, logvar = model(inputs)
-                loss, _, _ = compute_vae_losses(recon, targets, mu, logvar, args.current_kl_weight, rec_loss_fn=rec_loss_fn)
+                loss, _, _, lpips_loss = compute_vae_losses(
+                    recon,
+                    targets,
+                    mu,
+                    logvar,
+                    args.current_kl_weight,
+                    rec_loss_fn=rec_loss_fn,
+                    lpips_loss_fn=lpips_loss_fn,
+                    lpips_weight=args.lpips_weight,
+                )
             total_loss += float(loss.item())
+            total_lpips_loss += float(lpips_loss.item())
             if args.deep_supervision:
                 if ds_outputs is None:
                     raise ValueError('deep supervision outputs are required when deep supervision is enabled.')
@@ -1171,7 +1439,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                 recon=recon.detach().cpu().clone(),
                 per_example_mse=per_example_mse,
             )
-    return total_loss / validation_steps, last_snapshot
+    return total_loss / validation_steps, total_lpips_loss / validation_steps, last_snapshot
 
 
 def train(args):
@@ -1292,7 +1560,10 @@ def train(args):
                 f'invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}'
             )
         checkpoint_epoch = checkpoint.get('epoch', None)
-        if checkpoint_epoch is not None:
+        if args.resume_epoch is not None:
+            resume_completed_epochs = int(args.resume_epoch)
+            print(f"Overriding resume epoch numbering with --resume_epoch={resume_completed_epochs}")
+        elif checkpoint_epoch is not None:
             resume_completed_epochs = max(0, int(checkpoint_epoch))
         else:
             resume_completed_epochs = infer_completed_epochs_from_resume_path(ckpt_path)
@@ -1345,6 +1616,7 @@ def train(args):
         'Reconstruction loss:',
         f"mse_weight={args.loss_mse_weight:.4f}",
         f"pmse_weight={1.0 - args.loss_mse_weight:.4f}",
+        f"lpips_weight={args.lpips_weight:.4f}",
     )
     representative_percentiles = (
         5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95
@@ -1370,6 +1642,12 @@ def train(args):
         raise ValueError('--grad_clip must be positive.')
     if args.weight_decay < 0:
         raise ValueError('--weight_decay must be non-negative.')
+    if args.resume_epoch is not None and args.resume_epoch < 0:
+        raise ValueError('--resume_epoch must be non-negative when provided.')
+    if args.lpips_weight < 0.0:
+        raise ValueError('--lpips_weight must be non-negative.')
+    if args.lpips_min_size <= 0:
+        raise ValueError('--lpips_min_size must be positive.')
     if not 0.0 <= args.vertical_warp_prob <= 1.0:
         raise ValueError('--vertical_warp_prob must be in [0, 1].')
     if not 0.0 <= args.mixup_augment_prob <= 1.0:
@@ -1437,6 +1715,10 @@ def train(args):
     disc_opt = build_discriminator_optimizer(discriminator, args)
     scheduler = build_scheduler(opt, args)
     rec_loss_fn = CombinedReconLoss(mse_weight=float(args.loss_mse_weight))
+    lpips_loss_fn = None
+    if args.lpips_weight > 0.0:
+        lpips_loss_fn = SliceLPIPSLoss(min_spatial_size=int(args.lpips_min_size)).to(device)
+        lpips_loss_fn.eval()
     deep_supervision_loss = None
     if args.deep_supervision:
         deep_supervision_loss = DeepSupervisionLoss(
@@ -1493,30 +1775,18 @@ def train(args):
                 print(f"Loaded representative metadata from {representative_metadata_path}")
         except Exception as exc:
             print(f"Warning: failed to load representative metadata from {representative_metadata_path}: {exc}")
+    if migrate_metrics_csv_if_needed(metrics_csv_path, METRICS_CSV_COLUMNS):
+        print(f"Migrated metrics CSV schema at {metrics_csv_path}")
     csv_exists = metrics_csv_path.exists()
     training_start_time = time.time()
     with metrics_csv_path.open('a', newline='') as csv_file:
         csv_writer = csv.writer(csv_file)
         if not csv_exists:
-            csv_writer.writerow([
-                'epoch',
-                'examples_this_epoch',
-                'cumulative_examples',
-                'train_loss',
-                'val_loss',
-                'kl_weight',
-                'learning_rate',
-                'discriminator_learning_rate',
-                'gan_weight',
-                'g_gan_loss',
-                'd_gan_loss',
-                'd_gan_acc_pct',
-                'best_model',
-            ])
+            csv_writer.writerow(METRICS_CSV_COLUMNS)
 
         def print_epoch_header():
             print(
-                f"{'Epoch':>9} {'loss':>9} {'val_loss':>10} {'kl_weight':>11} {'lr':>9} "
+                f"{'Epoch':>9} {'loss':>9} {'lpips':>9} {'val_loss':>10} {'val_lpips':>11} {'kl_weight':>11} {'lr':>9} "
                 f"{'gan_weight':>11} {'d_gan_lr':>9} {'g_gan_loss':>11} {'d_gan_loss':>11} {'d_gan_acc':>10} "
                 f"{'best_val':>10} {'gan_status':>10} {'elapsed / eta / est finish':>33}"
             )
@@ -1539,6 +1809,7 @@ def train(args):
 
             (
                 train_loss,
+                train_lpips_loss,
                 g_gan_loss_epoch,
                 d_gan_loss_epoch,
                 d_gan_acc_epoch,
@@ -1557,16 +1828,19 @@ def train(args):
                 deep_supervision=args.deep_supervision,
                 deep_supervision_loss=deep_supervision_loss,
                 rec_loss_fn=rec_loss_fn,
+                lpips_loss_fn=lpips_loss_fn,
+                lpips_weight=float(args.lpips_weight),
                 mse_weight=float(args.loss_mse_weight),
                 deep_supervision_weights=args.deep_supervision_weights,
             )
-            val_loss, val_last_snapshot = validate(
+            val_loss, val_lpips_loss, val_last_snapshot = validate(
                 model,
                 args,
                 device,
                 steps_per_epoch,
                 deep_supervision_loss=deep_supervision_loss,
                 rec_loss_fn=rec_loss_fn,
+                lpips_loss_fn=lpips_loss_fn,
             )
             examples_this_epoch = samples_per_epoch
             cumulative_examples = epoch_number * samples_per_epoch
@@ -1599,7 +1873,9 @@ def train(args):
             current_disc_lr = disc_opt.param_groups[0]['lr'] if disc_opt is not None else float('nan')
 
             writer.add_scalar('train/loss', float(train_loss), epoch_number)
+            writer.add_scalar('train/lpips_loss', float(train_lpips_loss), epoch_number)
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
+            writer.add_scalar('validation/lpips_loss', float(val_lpips_loss), epoch_number)
             writer.add_scalar('train/lr', float(current_lr), epoch_number)
             writer.add_scalar('train/gan_weight', float(gan_weight_for_epoch), epoch_number)
             writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
@@ -1684,6 +1960,9 @@ def train(args):
                     representative_examples['training'] + representative_examples['validation'],
                     epoch_number,
                     args.out_dir,
+                    rec_loss_fn=rec_loss_fn,
+                    lpips_loss_fn=lpips_loss_fn,
+                    lpips_weight=float(args.lpips_weight),
                 )
 
             csv_writer.writerow([
@@ -1691,7 +1970,9 @@ def train(args):
                 examples_this_epoch,
                 cumulative_examples,
                 f"{train_loss:.6f}",
+                f"{train_lpips_loss:.6f}",
                 f"{val_loss:.6f}",
+                f"{val_lpips_loss:.6f}",
                 f"{kl_weight:.6f}",
                 f"{current_lr:.8f}",
                 f"{current_disc_lr:.8f}",
@@ -1725,7 +2006,9 @@ def train(args):
             print(
                 f"{(f'{epoch_number:>{len(str(total_display_epochs))}d}/{total_display_epochs}'):>9} "
                 f"{train_loss:9.6f} "
+                f"{train_lpips_loss:9.6f} "
                 f"{val_loss:10.6f} "
+                f"{val_lpips_loss:11.6f} "
                 f"{kl_weight:11.6f} "
                 f"{current_lr:9.2e} "
                 f"{gan_weight_for_epoch:11.6f} "
@@ -1781,6 +2064,7 @@ if __name__ == '__main__':
     p.add_argument('--zero_cluster_min', type=int, default=8)
     p.add_argument('--zero_cluster_max', type=int, default=12)
     p.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint to resume training from.')
+    p.add_argument('--resume_epoch', type=int, default=None, help='Override the completed epoch count used for resumed runs.')
     p.add_argument('--validation_data', type=str, default='data/validation.zarr', help='Path to validation zarr patches.')
     p.add_argument('--validation_extrema_only', dest='validation_extrema_only', action='store_true', help='Use the same input transform family and probabilities as training for validation data (default).')
     p.add_argument('--no_validation_extrema_only', dest='validation_extrema_only', action='store_false', help='Disable input transforms for validation data.')
@@ -1793,6 +2077,8 @@ if __name__ == '__main__':
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
     p.add_argument('--deep_supervision_weights', type=float, nargs=3, default=[1.0, 0.5, 0.25], help='Three deep supervision reconstruction loss weights (fine, mid, coarse).')
     p.add_argument('--loss_mse_weight', type=float, default=0.6, help='Weight for MSE component of reconstruction loss in [0, 1]; PMSE weight = 1 - this value.')
+    p.add_argument('--lpips_weight', type=float, default=0.0, help='Weight for optional slice-wise LPIPS perceptual loss. Default 0 keeps baseline behavior.')
+    p.add_argument('--lpips_min_size', type=int, default=64, help='Minimum LPIPS slice height/width. Smaller slices are bilinearly upsampled before LPIPS.')
     p.add_argument('--lr_scheduler', type=str, default='plateau', choices=['none', 'plateau'])
     p.add_argument('--lr_scheduler_patience', type=int, default=3)
     p.add_argument('--lr_scheduler_factor', type=float, default=0.5)

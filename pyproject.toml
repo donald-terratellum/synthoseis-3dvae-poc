@@ -12,13 +12,16 @@ authors = [
 # Runtime dependencies (kept in sync with requirements.txt)
 dependencies = [
   "torch",
+  "torchvision",
   "numpy",
+  "scipy",
   "zarr",
   "xarray",
   "tqdm",
   "tensorboard",
   "omegaconf",
   "pytorch-lightning",
+  "lpips",
   "PySide6",
   "pyvista",
   "pyvistaqt"

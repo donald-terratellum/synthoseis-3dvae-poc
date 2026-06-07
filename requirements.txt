@@ -1,11 +1,14 @@
 torch
+torchvision
 numpy
+scipy
 zarr
 xarray
 tqdm
 tensorboard
 omegaconf
 pytorch-lightning
+lpips
 PySide6
 pyvista
 pyvistaqt

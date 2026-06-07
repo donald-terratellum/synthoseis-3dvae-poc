@@ -65,6 +65,43 @@ uv run python scripts/train.py \
   --discriminator_learning_rate 2.5e-6 \
   --resume /Users/donaldpg/synthoseis-3dvae-poc/checkpoints_gan_vwarp/vae_best.pt
 
+# LPIPS + GAN run example (mid-session snapshot)
+uv run python scripts/train.py \
+  --data data/train_32-32-64.zarr \
+  --validation_data data/val_32-32-64.zarr \
+  --batch_size 50 \
+  --number_batches 100 \
+  --epochs 200 \
+  --augment \
+  --vertical_warp_prob 0.5 \
+  --mixup_augment_prob 0.5 \
+  --learning_rate 1e-4 \
+  --weight_decay 1e-4 \
+  --kl_schedule warmup \
+  --kl_start 0.0 \
+  --kl_end 1e-3 \
+  --kl_warmup_epochs 15 \
+  --lr_scheduler plateau \
+  --lr_scheduler_patience 3 \
+  --lr_scheduler_factor 0.5 \
+  --early_stopping_patience 8 \
+  --use_discriminator \
+  --gan_weight 0.1 \
+  --gan_balance_controller \
+  --gan_balance_lookahead \
+  --gan_balance_disc_lr_down_mult 0.5 \
+  --discriminator_learning_rate 2.5e-6 \
+  --best_checkpoint_name vae_best.pt \
+  --out_dir checkpoints/checkpoints_lpips \
+  --save_epoch_checkpoints \
+  --input_extrema_prob 0.5 \
+  --input_sparse_keep_prob 0.3 \
+  --input_decimate_trilinear_prob 0.2 \
+  --lpips_weight 1.0 \
+  --adaptive_sampling_by_mse \
+  --gan_balance_lookahead_deadband 0.02 \
+  --loss_mse_weight 0.30
+
 Use `--patch_size X Y Z` for anisotropic examples. If you provide a single value, it is applied to all three axes.
 
 ```
