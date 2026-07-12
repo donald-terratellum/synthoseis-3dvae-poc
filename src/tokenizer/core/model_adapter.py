@@ -103,3 +103,28 @@ class VaeLatentAdapter:
             )
         out = self.encode_batch(arr[None, ...])
         return np.ascontiguousarray(out[0], dtype=np.float32)
+
+    @torch.inference_mode()
+    def reconstruct_batch(self, cubes: np.ndarray) -> np.ndarray:
+        """Reconstruct a batch of preprocessed cubes using encoder(mu)+decoder."""
+        arr = np.asarray(cubes, dtype=np.float32)
+        if arr.ndim != 4 or arr.shape[1:] != self.patch_shape:
+            raise ValueError(
+                f"expected cubes shape (B,{self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}"
+            )
+
+        batch = torch.from_numpy(arr[:, None, :, :, :]).to(self.device)
+        mu, _ = self.model.encoder(batch)
+        recon, _ = self.model.decoder(mu)
+        out = recon[:, 0, :, :, :].detach().cpu().numpy().astype(np.float32, copy=False)
+        return out
+
+    @torch.inference_mode()
+    def reconstruct_cube(self, cube: np.ndarray) -> np.ndarray:
+        arr = np.asarray(cube, dtype=np.float32)
+        if arr.shape != self.patch_shape:
+            raise ValueError(
+                f"expected cube shape ({self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}"
+            )
+        out = self.reconstruct_batch(arr[None, ...])
+        return np.ascontiguousarray(out[0], dtype=np.float32)
