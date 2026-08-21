@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 import zarr
 
 from scripts import train as train_script
@@ -192,6 +193,64 @@ class InputAugmentationTests(unittest.TestCase):
                     input_decimate_trilinear_prob=0.0,
                     mixup_augment_prob=0.0,
                 )
+
+    def test_dataset_can_optional_return_patch_metadata_for_geology_labels(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zarr_path = Path(tmp_dir) / 'data.zarr'
+            root = zarr.open(str(zarr_path), mode='w')
+            data = np.arange(1, 1 + 2 * 4 * 4 * 4, dtype=np.float32).reshape(2, 4, 4, 4)
+            root.create_array('patches', data=data)
+            root.create_array('fault_summary', data=np.array([0.1, 0.9], dtype=np.float32))
+            root.create_array('geologic_score', data=np.array([0.2, 0.8], dtype=np.float32))
+
+            ds = ZarrPatchDataset(
+                zarr_path,
+                augment=False,
+                include_metadata=True,
+                geology_metadata_keys=('fault_summary', 'geologic_score'),
+                mixup_augment_prob=0.0,
+            )
+
+            x, y, meta = ds[0]
+            self.assertEqual(x.shape, (1, 4, 4, 4))
+            self.assertEqual(y.shape, (1, 4, 4, 4))
+            self.assertAlmostEqual(float(meta['fault_summary']), 0.1)
+            self.assertAlmostEqual(float(meta['geologic_score']), 0.2)
+
+    def test_geology_similarity_loss_matches_latent_and_metadata_geometry(self):
+        metadata_batch = [
+            {'fault_summary': 1.0, 'geologic_score': 0.0},
+            {'fault_summary': 0.0, 'geologic_score': 1.0},
+            {'fault_summary': 1.0, 'geologic_score': 1.0},
+        ]
+        latent = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+
+        aligned_loss = train_script.compute_geology_similarity_loss(
+            latent,
+            metadata_batch,
+            ('fault_summary', 'geologic_score'),
+        )
+        self.assertLess(aligned_loss.item(), 1e-6)
+
+    def test_vae_supports_residual_encoder_variant(self):
+        model = train_script.VAE3D(
+            patch_shape=(32, 32, 32),
+            latent_dim=16,
+            base_ch=8,
+            residual_encoder=True,
+        )
+        x = torch.randn(2, 1, 32, 32, 32)
+        recon, mu, logvar = model(x)
+        self.assertEqual(recon.shape, x.shape)
+        self.assertEqual(mu.shape, (2, 16))
+        self.assertEqual(logvar.shape, (2, 16))
 
     def test_validation_uses_same_input_transform_weights_as_training(self):
         captured = {}

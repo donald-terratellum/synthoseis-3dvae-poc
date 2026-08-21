@@ -93,6 +93,8 @@ class ZarrPatchDataset(Dataset):
         sparse_keep_fraction_max=0.30,
         sparse_poisson_radius_scale=0.85,
         mixup_augment_prob=0.10,
+        include_metadata: bool = False,
+        geology_metadata_keys: Optional[tuple[str, ...]] = None,
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
         self.data = cast(Any, z['patches'])
@@ -118,6 +120,15 @@ class ZarrPatchDataset(Dataset):
         self.sparse_keep_fraction_max = float(sparse_keep_fraction_max)
         self.sparse_poisson_radius_scale = float(sparse_poisson_radius_scale)
         self.mixup_augment_prob = float(mixup_augment_prob)
+        self.include_metadata = bool(include_metadata)
+        self.geology_metadata_keys = tuple(str(key) for key in (geology_metadata_keys or ()))
+        self._metadata_arrays = {}
+
+        if self.include_metadata:
+            for key in self.geology_metadata_keys:
+                if key not in z:
+                    raise KeyError(f"Required geology metadata key '{key}' was not found in the dataset.")
+                self._metadata_arrays[key] = z[key]
 
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
             raise ValueError("--input_scaling must be one of: none, divide_by_std, zscore")
@@ -203,6 +214,24 @@ class ZarrPatchDataset(Dataset):
     def __len__(self):
         return self.num_examples
 
+    def _read_metadata_for_index(self, idx):
+        if not self.include_metadata:
+            return {}
+
+        metadata = {}
+        for key in self.geology_metadata_keys:
+            arr = self._metadata_arrays[key]
+            value = np.asarray(arr)
+            if value.ndim == 0:
+                metadata[key] = float(value)
+            elif value.shape[0] == self.num_examples:
+                metadata[key] = value[int(idx)]
+            elif value.shape[0] == 1:
+                metadata[key] = value[0]
+            else:
+                metadata[key] = value
+        return metadata
+
     def __getitem__(self, idx):
         arr = self._load_scaled_example(int(idx))
 
@@ -233,7 +262,10 @@ class ZarrPatchDataset(Dataset):
 
         x = np.ascontiguousarray(x[np.newaxis, ...])
         y = np.ascontiguousarray(y[np.newaxis, ...])
-        return torch.from_numpy(x), torch.from_numpy(y)
+        sample = (torch.from_numpy(x), torch.from_numpy(y))
+        if self.include_metadata:
+            return sample[0], sample[1], self._read_metadata_for_index(int(idx))
+        return sample[0], sample[1]
 
 
 class CubeDiscriminator(nn.Module):
@@ -396,6 +428,46 @@ class SliceLPIPSLoss(nn.Module):
         return torch.stack(losses).mean()
 
 
+def _normalize_metadata_vector(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.size == 0:
+        return np.zeros(1, dtype=np.float64)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 0.0:
+        return np.zeros_like(arr, dtype=np.float64)
+    return arr / norm
+
+
+def compute_geology_similarity_loss(latent_vectors, metadata_batch, metadata_keys):
+    if latent_vectors.ndim != 2:
+        raise ValueError('latent_vectors must be a 2D tensor of shape [batch, latent_dim].')
+    if len(metadata_batch) != int(latent_vectors.shape[0]):
+        raise ValueError('metadata_batch length must match latent_vectors batch size.')
+    if not metadata_keys:
+        return latent_vectors.new_zeros(())
+
+    key_tuple = tuple(str(k) for k in metadata_keys)
+    target_vectors = []
+    for sample in metadata_batch:
+        if not isinstance(sample, dict):
+            raise ValueError('Each metadata item must be a dict keyed by geology metadata name.')
+        vals = []
+        for key in key_tuple:
+            if key not in sample:
+                raise KeyError(f"Missing geology metadata key '{key}' in batch metadata.")
+            vals.append(float(sample[key]))
+        target_vectors.append(_normalize_metadata_vector(np.asarray(vals, dtype=np.float64)))
+
+    target = torch.as_tensor(np.stack(target_vectors, axis=0), dtype=latent_vectors.dtype, device=latent_vectors.device)
+    normed = F.normalize(latent_vectors, dim=1)
+    target_norm = F.normalize(target, dim=1)
+    sim = (normed * target_norm).sum(dim=1)
+    return 1.0 - sim.mean()
+
+
 def compute_vae_losses(
     recon,
     targets,
@@ -406,6 +478,10 @@ def compute_vae_losses(
     rec_loss_fn=None,
     lpips_loss_fn=None,
     lpips_weight=0.0,
+    geology_metadata_batch=None,
+    geology_metadata_keys=None,
+    geology_loss_weight=0.0,
+    latent_vectors=None,
 ):
     if deep_supervision_loss is not None:
         rec_loss = deep_supervision_loss(recon, targets)
@@ -419,8 +495,11 @@ def compute_vae_losses(
     if lpips_loss_fn is not None and float(lpips_weight) > 0.0:
         lpips_loss = lpips_loss_fn(_get_primary_prediction(recon), targets)
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / targets.numel()
-    loss = rec_loss + (float(lpips_weight) * lpips_loss) + kl_weight * kld
-    return loss, rec_loss, kld, lpips_loss
+    geology_loss = rec_loss.new_zeros(())
+    if geology_loss_weight > 0.0 and geology_metadata_batch is not None and geology_metadata_keys and latent_vectors is not None:
+        geology_loss = compute_geology_similarity_loss(latent_vectors, geology_metadata_batch, geology_metadata_keys)
+    loss = rec_loss + (float(lpips_weight) * lpips_loss) + kl_weight * kld + float(geology_loss_weight) * geology_loss
+    return loss, rec_loss, kld, lpips_loss, geology_loss
 
 
 def compute_discriminator_gan_loss(discriminator, real_cubes, fake_cubes_detached):
@@ -462,9 +541,14 @@ def compute_average_loss(
     lpips_loss_fn=None,
     lpips_weight=0.0,
 ):
+    if steps is None:
+        raise ValueError('steps must be provided for compute_average_loss.')
+    steps = int(steps)
+    if steps <= 0:
+        raise ValueError('steps must be a positive integer.')
     model.eval()
     total_loss = 0.0
-    batch_iter = iter(dataloader) if steps is None else itertools.cycle(dataloader)
+    batch_iter = itertools.cycle(dataloader)
     with torch.no_grad():
         for _ in range(steps):
             inputs, targets = next(batch_iter)
@@ -472,7 +556,7 @@ def compute_average_loss(
             targets = targets.to(device)
             if deep_supervision:
                 recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-                loss, _, _, _ = compute_vae_losses(
+                loss, _, _, _, _ = compute_vae_losses(
                     ds_outputs,
                     targets,
                     mu,
@@ -485,7 +569,7 @@ def compute_average_loss(
                 )
             else:
                 recon, mu, logvar = model(inputs)
-                loss, _, _, _ = compute_vae_losses(
+                loss, _, _, _, _ = compute_vae_losses(
                     recon,
                     targets,
                     mu,
@@ -1065,6 +1149,11 @@ def train_one_epoch(
     mse_weight=0.6,
     deep_supervision_weights=None,
 ):
+    if steps_per_epoch is None:
+        raise ValueError('steps_per_epoch must be provided for train_one_epoch.')
+    steps_per_epoch = int(steps_per_epoch)
+    if steps_per_epoch <= 0:
+        raise ValueError('steps_per_epoch must be a positive integer.')
     model.train()
     if discriminator is not None:
         discriminator.train()
@@ -1073,7 +1162,7 @@ def train_one_epoch(
     total_g_gan_loss = 0.0
     total_d_gan_loss = 0.0
     total_d_gan_acc = 0.0
-    batch_iter = iter(dataloader) if steps_per_epoch is None else itertools.cycle(dataloader)
+    batch_iter = itertools.cycle(dataloader)
 
     last_snapshot = None
     for _ in range(steps_per_epoch):
@@ -1101,7 +1190,7 @@ def train_one_epoch(
         # Generator (VAE) step.
         if deep_supervision:
             recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-            vae_loss, _, _, lpips_loss = compute_vae_losses(
+            vae_loss, _, _, lpips_loss, _ = compute_vae_losses(
                 ds_outputs,
                 targets,
                 mu,
@@ -1114,7 +1203,7 @@ def train_one_epoch(
             )
         else:
             recon, mu, logvar = model(inputs)
-            vae_loss, _, _, lpips_loss = compute_vae_losses(
+            vae_loss, _, _, lpips_loss, _ = compute_vae_losses(
                 recon,
                 targets,
                 mu,
@@ -1393,7 +1482,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
             ds_outputs = None
             if args.deep_supervision:
                 recon, mu, logvar, ds_outputs = model(inputs, return_deep_supervision=True)
-                loss, _, _, lpips_loss = compute_vae_losses(
+                loss, _, _, lpips_loss, _ = compute_vae_losses(
                     ds_outputs,
                     targets,
                     mu,
@@ -1406,7 +1495,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                 )
             else:
                 recon, mu, logvar = model(inputs)
-                loss, _, _, lpips_loss = compute_vae_losses(
+                loss, _, _, lpips_loss, _ = compute_vae_losses(
                     recon,
                     targets,
                     mu,

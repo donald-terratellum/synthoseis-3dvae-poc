@@ -26,18 +26,41 @@ class Conv3dBlock(nn.Module):
         return self.act(self.bn(self.conv(x)))
 
 
+class ResidualConv3dBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=k, stride=s, padding=p)
+        self.bn1 = nn.BatchNorm3d(out_ch)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm3d(out_ch)
+        self.residual = nn.Identity()
+        if in_ch != out_ch or s != 1:
+            self.residual = nn.Sequential(
+                nn.Conv3d(in_ch, out_ch, kernel_size=1, stride=s, padding=0),
+                nn.BatchNorm3d(out_ch),
+            )
+
+    def forward(self, x):
+        residual = self.residual(x)
+        x = self.act(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return self.act(x + residual)
+
+
 class Encoder(nn.Module):
-    def __init__(self, in_ch=1, base_ch=16, latent_dim=128, patch_shape=(32, 32, 32)):
+    def __init__(self, in_ch=1, base_ch=16, latent_dim=128, patch_shape=(32, 32, 32), residual_encoder=False):
         super().__init__()
         px, py, pz = _normalize_patch_shape(patch_shape)
         self._encoded_shape = (base_ch * 4, px // 8, py // 8, pz // 8)
         flat_dim = int(self._encoded_shape[0] * self._encoded_shape[1] * self._encoded_shape[2] * self._encoded_shape[3])
+        block_cls = ResidualConv3dBlock if residual_encoder else Conv3dBlock
         self.enc = nn.Sequential(
-            Conv3dBlock(in_ch, base_ch),
-            Conv3dBlock(base_ch, base_ch*2, s=2),
-            Conv3dBlock(base_ch*2, base_ch*2),
-            Conv3dBlock(base_ch*2, base_ch*4, s=2),
-            Conv3dBlock(base_ch*4, base_ch*4, s=2),
+            block_cls(in_ch, base_ch),
+            block_cls(base_ch, base_ch*2, s=2),
+            block_cls(base_ch*2, base_ch*2),
+            block_cls(base_ch*2, base_ch*4, s=2),
+            block_cls(base_ch*4, base_ch*4, s=2),
         )
         self.fc_mu = nn.Linear(flat_dim, latent_dim)
         self.fc_logvar = nn.Linear(flat_dim, latent_dim)
@@ -102,13 +125,20 @@ class Decoder(nn.Module):
 
 
 class VAE3D(nn.Module):
-    def __init__(self, in_ch=1, out_ch=1, base_ch=16, latent_dim=128, patch_shape=(32, 32, 32), deep_supervision=False):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=16, latent_dim=128, patch_shape=(32, 32, 32), deep_supervision=False, residual_encoder=False):
         super().__init__()
         self.base_ch = int(base_ch)
         self.latent_dim = int(latent_dim)
         self.patch_shape = _normalize_patch_shape(patch_shape)
         self.deep_supervision = bool(deep_supervision)
-        self.encoder = Encoder(in_ch, self.base_ch, self.latent_dim, patch_shape=self.patch_shape)
+        self.residual_encoder = bool(residual_encoder)
+        self.encoder = Encoder(
+            in_ch,
+            self.base_ch,
+            self.latent_dim,
+            patch_shape=self.patch_shape,
+            residual_encoder=self.residual_encoder,
+        )
         self.decoder = Decoder(
             out_ch,
             self.base_ch,
