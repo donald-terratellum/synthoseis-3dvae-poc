@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-- Status: approved direction with confirmed similarity semantics and promotion gates; only experiment-budget and training-origin decisions remain open.
+- Status: implementation-ready; similarity semantics, promotion gates, compute constraints, and training-origin protocol are confirmed.
 - Repository: `synthoseis-3dvae-poc`.
 - Primary downstream workflow: compare pairs of seismic patches using cosine similarity between deterministic encoder `mu` vectors in the seismic tokenizer.
 - Primary objective: make tokenizer-near patches geologically similar and tokenizer-distant patches geologically dissimilar.
@@ -44,7 +44,7 @@ The epoch-657 checkpoint has a preliminary 128-patch tokenizer-aligned baseline:
 | Neighbor overlap at 5 | 0.064063 |
 | Random neighbor-overlap reference | 0.039370 |
 
-These values indicate weak, slightly above-random geological organization. They are provisional because the final baseline must use the frozen validation set, 512 samples, multiple seeds where sampling is involved, and the exact metrics defined below.
+These values indicate weak, slightly above-random geological organization. They are provisional because the final baseline must use the frozen validation set, 512 samples, repeated short-run seeds where sampling is involved, and the exact metrics defined below.
 
 ## Desired outcome
 
@@ -281,7 +281,7 @@ Before changing training behavior:
 1. freeze train and validation Zarr identities, sampling seeds, patch origins, metadata schema, and calibration artifact;
 2. save baseline checkpoint identity and command;
 3. evaluate the same validation examples in the same order with tokenizer preprocessing;
-4. evaluate at least three training seeds for final candidate comparisons;
+4. use repeated short seeded screens for candidate comparisons, then run the selected final configuration once from the confirmed clean/staged origin;
 5. prohibit validation examples from the pair-mining queue and adaptive training scores.
 
 Build balanced synthetic query cohorts for each primary family, feature combinations, invariant-geometry variants, closure subtypes, anomalous amplitudes, and neutral background. Synthetic labels are the current release evidence because no expert-reviewed real-seismic query set is available. Record expert-reviewed real-seismic evaluation as future work, not a current promotion gate.
@@ -324,13 +324,15 @@ Files:
 
 Tasks:
 
-1. Record the remaining experiment-budget and training-origin decisions.
+1. Measure Mac mini throughput and record the screening and final-run wall-clock budgets.
 2. Freeze and record the benchmark dataset and checkpoint.
 3. Move the post-hoc latent diagnostic command into a reusable CLI.
 4. Capture the 512-example baseline and per-feature retrieval slices.
 5. Add reconstruction guardrail metrics and constrained checkpoint-selection specification.
 
 Exit gate: deterministic baseline report can be reproduced from one command.
+
+Runtime gate: benchmark dataset generation, training throughput, validation, adaptive snapshots, and tokenizer diagnostics separately on the Mac mini. Use the measured sustained rate to project the final run before launching it. The projected final training run must complete in no more than 14 wall-clock days with at least a 20 percent contingency margin; therefore the nominal projection should be at most 11.2 days. Reduce epochs, batches per epoch, diagnostic frequency, or snapshot frequency before reducing benchmark correctness or violating reconstruction/retrieval gates.
 
 ### Phase 1: Metadata calibration and metric correctness
 
@@ -411,9 +413,10 @@ Tasks:
 1. Test same-patch view consistency at low weight.
 2. Verify metadata handling for mixup or exclude mixup from paired consistency.
 3. Tune geology weights and thresholds on training folds only.
-4. Run at least three final seeds.
+4. Run multiple short seeded screens that are long enough to compare trend direction and stability.
+5. Promote one configuration to the clean or clearly staged final run.
 
-Exit gate: gains are repeatable and confidence intervals do not indicate a one-seed result.
+Exit gate: short seeded screens show consistent gains, bootstrap confidence intervals on the frozen benchmark support promotion, and the selected full run remains within the 14-day wall-clock limit.
 
 ### Phase 6: Tokenizer acceptance test
 
@@ -481,21 +484,18 @@ Persist:
 9. Reconstruction promotion limits are 3 percent validation MAE, 5 percent LPIPS, and 10 percent per-slice MAE regression.
 10. Retrieval promotion requires 25 percent relative improvement in neighbor overlap and nDCG at 5, improvement in at least three of five primary families, and no statistically credible primary-family regression.
 
-## Remaining clarifications
+## Confirmed execution constraints
 
-The semantic goals and promotion gates are sufficiently clear for Phase 0 implementation. Two experiment-management decisions remain:
-
-### 1. Compute and experiment budget
-
-Question: How many full training runs and seeds are affordable?
-
-Recommended minimum: short screening runs for objective choices, followed by three full seeds for the selected configuration and baseline-equivalent control.
-
-### 2. Resume versus clean retraining
-
-Question: Should geology shaping continue from epoch 657 or begin from a reconstruction baseline before geology-aware scheduling?
-
-Recommended default: use epoch 657 for fast feasibility experiments, but confirm the final result with a clean or clearly staged baseline-to-geology run so optimizer history and prior training do not confound conclusions.
+1. Training and synthetic seismic generation run on one Mac mini.
+2. Monetary experiment cost is not a limiting constraint; machine wall-clock time is the limiting resource.
+3. The selected final VAE training run must finish in less than 14 wall-clock days.
+4. Phase 0 must profile sustained throughput and enforce a nominal projection of at most 11.2 days, preserving a 20 percent contingency margin.
+5. Synthetic dataset generation and final training should not compete concurrently for CPU, memory, storage bandwidth, or accelerator resources. Generate, validate, and freeze the required datasets before the final run.
+6. Use checkpointing and complete resume state for the optimizer, scheduler, loss schedules, adaptive sampler, memory queue policy, random generators, and elapsed-training counters. An interruption must not require restarting the final run.
+7. Use epoch 657 for fast feasibility experiments and objective/sampler screening.
+8. Use a clean or clearly staged baseline-to-geology run for final promotion evidence so prior optimizer history does not confound the result.
+9. Use repeated short seeded screens rather than three sequential full runs. Quantify final retrieval uncertainty with frozen-query bootstrap confidence intervals and feature-cohort slices.
+10. If the projected final run exceeds the runtime gate, first reduce redundant epochs or batches and expensive diagnostic cadence. Do not weaken the frozen benchmark, reconstruction guardrails, or promotion criteria to meet runtime.
 
 ## Agent handoff checklist
 
@@ -506,7 +506,7 @@ An agentic implementation should not begin model changes until it can state:
 3. the metadata schema and calibration policy;
 4. positive, negative, and background semantics;
 5. reconstruction and retrieval promotion thresholds;
-6. experiment and compute budget;
+6. the measured Mac mini throughput, short-screen budget, and projected final runtime;
 7. that synthetic labels are the current acceptance source and real-seismic expert review is deferred;
 8. the first focused test that will falsify each implementation hypothesis.
 
