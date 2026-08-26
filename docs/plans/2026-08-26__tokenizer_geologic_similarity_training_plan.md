@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-- Status: proposed implementation plan; decisions in "Clarifications required" must be confirmed before implementation.
+- Status: approved direction with confirmed similarity semantics and promotion gates; only experiment-budget and training-origin decisions remain open.
 - Repository: `synthoseis-3dvae-poc`.
 - Primary downstream workflow: compare pairs of seismic patches using cosine similarity between deterministic encoder `mu` vectors in the seismic tokenizer.
 - Primary objective: make tokenizer-near patches geologically similar and tokenizer-distant patches geologically dissimilar.
@@ -50,7 +50,7 @@ These values indicate weak, slightly above-random geological organization. They 
 
 The trained encoder should satisfy all of the following:
 
-1. `mu` cosine ranking reflects the selected geology semantics for faults, fault intersections, channels, channel cores, flat spots, onlaps, and onlap variability.
+1. `mu` cosine ranking reflects the selected geology semantics for faults, channels, flat spots, onlaps, closures, anomalous amplitudes, and their meaningful combinations.
 2. Similar patches move closer and dissimilar patches move farther apart in normalized `mu` space.
 3. Retrieval quality improves at the top of the ranking, not only in global pairwise correlation.
 4. Results are deterministic for a fixed checkpoint and patch because evaluation uses tokenizer preprocessing and `mu`.
@@ -66,17 +66,61 @@ The trained encoder should satisfy all of the following:
 - L2-normalize `mu` immediately before cosine-oriented objectives.
 - Continue using sampled `z` for VAE decoding and reconstruction training.
 
-### Geology vector
+### Geology representation
 
-Initial ordered features:
+The supervision target must combine feature quantity with orientation- and translation-invariant geometry and topology. Matching fractions alone are insufficient: two patches with different morphology or topology should be less similar, while rotating or translating the same geological structure within a patch should not reduce similarity.
+
+The five equally important primary feature families are:
+
+1. fault
+2. channel
+3. flat spot
+4. onlap
+5. closure
+
+Initial quantity features:
 
 1. fault fraction
-2. fault-intersection fraction
+2. fault-intersection fraction as a fault modifier
 3. channel fraction
-4. channel-core fraction
+4. channel-core fraction as a channel modifier
 5. flat-spot fraction
 6. onlap fraction
 7. onlap variability
+8. closure fraction
+9. closure subtype fractions where available, including simple, faulted, stratigraphic, oil, gas, brine, and other retained closure labels
+10. anomalous-amplitude quantity and strength derived from seismic amplitudes using a training-fitted, robust threshold policy
+
+Closure source arrays must be audited in Phase 0. Expected synthetic Zarr candidates include `simple_closures`, `faulted_closures`, `strat_closures`, `oil_closures`, `gas_closures`, `brine_closures`, `closure_segments_id`, and any canonical aggregate closure array present in the generated schema. The implementation must record which arrays are authoritative and how overlapping closure subtypes are combined.
+
+For each primary family, add descriptors that preserve morphology and topology without encoding absolute orientation or location. Candidate descriptors include:
+
+- connected-component count and component-size distribution;
+- Euler characteristic or equivalent hole/connectivity measure;
+- skeleton length, endpoint count, branch-point count, and loop count where meaningful;
+- surface-to-volume or boundary-to-area ratio;
+- compactness and elongation eigenvalue ratios, excluding eigenvector direction;
+- distance-distribution summaries relative to each feature's own centroid, excluding absolute centroid coordinates;
+- translation-invariant relative-distance summaries between co-occurring feature families.
+
+Do not include absolute centroid coordinates, absolute orientation angles, or rotation-sensitive directional components in the similarity target. Unit tests must prove that translating or rotating a synthetic label structure leaves its target similarity effectively unchanged, while changing its connectivity or shape lowers similarity.
+
+Represent the target as grouped sub-vectors rather than one flat unweighted list:
+
+```text
+geology_target = {
+        primary_presence_and_fraction,
+        family_modifiers,
+        invariant_morphology,
+        invariant_topology,
+        cross_family_relations,
+        amplitude_anomaly,
+}
+```
+
+Give the five primary families equal top-level weight. Normalize descriptors within each family before combining family similarities so families with more descriptors do not dominate. Fault intersection modifies the fault-family similarity rather than acting as a sixth equally weighted family. Channel core follows the same parent-modifier pattern for channels.
+
+Mixed-feature ordering must be explicit. A fault-plus-channel patch is closest to another fault-plus-channel patch, partially similar to fault-only and channel-only patches, and farthest from a patch containing neither. Continuous multi-label family overlap supplies this ordering; interaction and cross-family geometry descriptors distinguish different fault-plus-channel arrangements.
 
 Fit feature calibration statistics on the training split only. Persist them in the sampled Zarr attributes and checkpoints. Apply the same transform to training, validation, diagnostics, and post-hoc evaluation.
 
@@ -86,10 +130,12 @@ Recommended initial transform:
 2. apply `log1p(value / scale)` to sparse non-negative fractions, with a scale derived from the nonzero training distribution;
 3. robustly scale each feature using training median and interquartile range or a documented percentile scale;
 4. apply explicit feature weights only after an unweighted baseline;
-5. append a background/no-selected-geology indicator if background similarity is part of the desired semantics;
+5. retain an explicit `has_selected_geology` mask for loss masking and cohort reporting, but do not turn background into a positive geology class;
 6. L2-normalize the final vector for cosine targets.
 
-The calibration artifact must include feature order, transform, fitted statistics, zero/background policy, schema version, and source training dataset identity.
+Background patches are neutral for geology similarity. They continue to train reconstruction, LPIPS, and KL, but pairs involving a patch with no selected geology are excluded from geology geometry/ranking losses and from positive/negative retrieval denominators. They are reported as a separate benchmark cohort to detect accidental latent collapse or false high-similarity retrieval.
+
+The calibration artifact must include feature order, family hierarchy, modifier relationships, descriptor definitions, transform, fitted statistics, zero/background policy, closure source mapping, anomalous-amplitude policy, schema version, and source training dataset identity.
 
 ## Training objective
 
@@ -109,8 +155,10 @@ L_total = L_reconstruction
 Retain the current continuous metadata-to-latent geometry concept, with these corrections:
 
 - operate on normalized `mu`;
-- use calibrated metadata vectors;
+- use calibrated grouped geology targets;
 - exclude diagonal pairs;
+- exclude neutral background pairs;
+- combine equal-weight family similarity with invariant geometry/topology similarity;
 - optionally downweight ambiguous middle-similarity pairs;
 - report the loss independently from total loss;
 - test zero-vector and duplicate-vector behavior explicitly.
@@ -164,7 +212,7 @@ Each batch should target:
 - source-volume diversity to reduce memorization of one synthetic realization;
 - no duplicate dataset index within a batch unless explicitly testing augmentation consistency.
 
-Create coarse strata from calibrated metadata using presence thresholds and/or clustering. Multi-label patches remain multi-label; a primary stratum is only a sampling aid and must not replace the continuous target vector.
+Create coarse strata from calibrated metadata using presence thresholds and/or clustering. Multi-label patches remain multi-label; a primary stratum is only a sampling aid and must not replace the continuous target representation. Include single-family, mixed-family, closure-subtype, anomalous-amplitude, and neutral-background cohorts. Pair construction must enforce the confirmed ordering for mixed patches.
 
 ## Adaptive sampling redesign
 
@@ -236,6 +284,8 @@ Before changing training behavior:
 4. evaluate at least three training seeds for final candidate comparisons;
 5. prohibit validation examples from the pair-mining queue and adaptive training scores.
 
+Build balanced synthetic query cohorts for each primary family, feature combinations, invariant-geometry variants, closure subtypes, anomalous amplitudes, and neutral background. Synthetic labels are the current release evidence because no expert-reviewed real-seismic query set is available. Record expert-reviewed real-seismic evaluation as future work, not a current promotion gate.
+
 ### Primary tokenizer metrics
 
 - metadata-neighbor overlap at `k = 5, 10, 20`;
@@ -249,14 +299,16 @@ Report bootstrap confidence intervals over query patches. Slice every metric by 
 
 ### Reconstruction guardrails
 
-Recommended defaults pending user confirmation:
-
 - validation MAE no more than 3 percent worse than baseline;
 - validation LPIPS no more than 5 percent worse than baseline;
 - no feature slice more than 10 percent worse in MAE;
 - no visual collapse, amplitude instability, or decoder artifacts in fixed representative patches.
 
+These reconstruction limits are confirmed promotion gates.
+
 Checkpoint selection must be constrained multi-objective selection. A checkpoint is eligible only if it passes reconstruction guardrails; among eligible checkpoints, rank primarily by validation neighbor overlap and nDCG.
+
+Promotion additionally requires at least 25 percent relative improvement over baseline in neighbor overlap and nDCG at 5, improvement in at least three of the five primary feature families, and no statistically credible regression in any primary family. These criteria are confirmed.
 
 Early stopping and the learning-rate scheduler must not continue to use total reconstruction-oriented validation loss as the sole decision signal. Add a configurable constrained retrieval score for checkpoint promotion while retaining reconstruction as a rejection gate.
 
@@ -272,7 +324,7 @@ Files:
 
 Tasks:
 
-1. Resolve all decisions under "Clarifications required."
+1. Record the remaining experiment-budget and training-origin decisions.
 2. Freeze and record the benchmark dataset and checkpoint.
 3. Move the post-hoc latent diagnostic command into a reusable CLI.
 4. Capture the 512-example baseline and per-feature retrieval slices.
@@ -416,79 +468,30 @@ Persist:
 - baseline and candidate retrieval reports;
 - final checkpoint-selection decision.
 
-## Clarifications required
+## Confirmed semantic decisions
 
-The following decisions materially change implementation. Recommended defaults are provided so an agent can proceed after confirmation.
+1. Similarity combines feature fractions with similar geometry and topology.
+2. Absolute orientation and absolute location within a patch must not reduce similarity.
+3. Background patches are neutral to geology objectives.
+4. Mixed-feature patches are closest to the same combination, partially similar to matching single-feature patches, and farthest from patches containing neither feature.
+5. Fault, channel, flat spot, onlap, and closure are equally important primary families.
+6. Fault intersection modifies fault similarity rather than acting as an equal primary family.
+7. Queries are varied and include combinations, anomalous amplitudes, and hydrocarbon-trapping closure geometries.
+8. Synthetic labeled data is the current quantitative acceptance source; no expert-reviewed real-seismic set is currently available.
+9. Reconstruction promotion limits are 3 percent validation MAE, 5 percent LPIPS, and 10 percent per-slice MAE regression.
+10. Retrieval promotion requires 25 percent relative improvement in neighbor overlap and nDCG at 5, improvement in at least three of five primary families, and no statistically credible primary-family regression.
 
-### 1. Meaning of geologic similarity
+## Remaining clarifications
 
-Question: Should similarity mean proportional agreement across all seven features, shared presence of a dominant feature, or a hierarchy where some features matter more?
+The semantic goals and promotion gates are sufficiently clear for Phase 0 implementation. Two experiment-management decisions remain:
 
-Recommended default: continuous calibrated seven-feature similarity, with equal initial feature weights and feature-sliced evaluation. Do not impose domain weights until baseline distributions and retrieval errors are reviewed.
-
-### 2. Background patches
-
-Question: Should two patches containing none of the selected features be considered similar, neutral, or not useful for tokenizer matching?
-
-Recommended default: add an explicit background indicator, treat background-background as weak positives, and cap their share of every batch and benchmark.
-
-### 3. Mixed geology
-
-Question: Should a fault-plus-channel patch be close to fault-only, channel-only, both, or only other mixed patches?
-
-Recommended default: use continuous overlap so it can be partially similar to both; reserve hard positives for sufficiently high metadata cosine.
-
-### 4. Feature priority
-
-Question: Are faults, channels, flat spots, and onlaps equally important to the user workflow? Is fault intersection a distinct target or primarily a modifier of fault similarity?
-
-Recommended default: keep all seven dimensions, report each separately, and treat intersection/core features as independent dimensions until retrieval review supports hierarchical weighting.
-
-### 5. Spatial and orientation invariance
-
-Question: Should two patches with the same feature fraction but different geometry, orientation, topology, or spatial arrangement be considered similar?
-
-This is the largest semantic uncertainty. Fractions alone cannot distinguish a straight channel from a branching channel or one fault from a fault network.
-
-Recommended default: regard fractions as weak supervision, not complete ground truth. Plan a later metadata extension for morphology, orientation, topology, and relative spatial arrangement after the first retrieval baseline.
-
-### 6. Positive and negative thresholds
-
-Question: What metadata cosine values define an acceptable positive and definite negative?
-
-Recommended default: derive thresholds from training-distribution quantiles, initially top 10 percent as positives and bottom 10 percent as negatives, then inspect examples before freezing them.
-
-### 7. Reconstruction regression budget
-
-Question: What degradation is acceptable in MAE, LPIPS, and feature-specific reconstruction?
-
-Recommended default: at most 3 percent validation MAE regression, 5 percent LPIPS regression, and 10 percent MAE regression in any geology slice.
-
-### 8. Retrieval success threshold
-
-Question: What minimum improvement justifies promoting a model?
-
-Recommended default: at least 25 percent relative improvement over baseline neighbor overlap and nDCG at 5, improvement in at least three of four primary feature families, and no statistically credible regression in any primary family.
-
-### 9. Query population
-
-Question: Will production queries mostly contain one clear feature, mixed geology, background, or subtle analogs with low feature fractions?
-
-Recommended default: construct and report separate benchmark cohorts rather than allowing the most common patch type to dominate the aggregate.
-
-### 10. Synthetic-to-real expectations
-
-Question: Is synthetic retrieval performance the release criterion, or must a small expert-reviewed real-seismic query set also pass?
-
-Recommended default: use synthetic labels for quantitative development and require a fixed expert-reviewed real-seismic smoke benchmark before declaring production readiness.
-
-### 11. Compute and experiment budget
+### 1. Compute and experiment budget
 
 Question: How many full training runs and seeds are affordable?
 
 Recommended minimum: short screening runs for objective choices, followed by three full seeds for the selected configuration and baseline-equivalent control.
 
-### 12. Resume versus clean retraining
+### 2. Resume versus clean retraining
 
 Question: Should geology shaping continue from epoch 657 or begin from a reconstruction baseline before geology-aware scheduling?
 
@@ -498,13 +501,13 @@ Recommended default: use epoch 657 for fast feasibility experiments, but confirm
 
 An agentic implementation should not begin model changes until it can state:
 
-1. the confirmed answers to all high-impact clarifications above;
+1. the confirmed semantic decisions above;
 2. the exact frozen train and validation dataset identities and seeds;
 3. the metadata schema and calibration policy;
 4. positive, negative, and background semantics;
 5. reconstruction and retrieval promotion thresholds;
 6. experiment and compute budget;
-7. whether the final evidence requires real-seismic expert review;
+7. that synthetic labels are the current acceptance source and real-seismic expert review is deferred;
 8. the first focused test that will falsify each implementation hypothesis.
 
 Once those are recorded, implementation should proceed phase by phase, with one focused executable validation immediately after each initial edit and no promotion past a phase gate without saved evidence.
