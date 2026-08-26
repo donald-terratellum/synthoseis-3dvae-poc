@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+import random
 import unittest
 from types import SimpleNamespace
 
@@ -11,9 +12,32 @@ from scripts import train as train_script
 from scripts.train import ZarrPatchDataset
 from src import augmentations
 import scripts.train as train_mod
+from scripts import sample_patches as sample_patches_script
 
 
 class InputAugmentationTests(unittest.TestCase):
+    def test_patch_sampling_seed_controls_origins(self):
+        geoscore = np.ones((16, 16, 16), dtype=np.float32)
+
+        random.seed(123)
+        np.random.seed(123)
+        first = sample_patches_script.pick_weighted_positions(
+            geoscore, geoscore.shape, (8, 8, 8), n_picks=8, n_candidates=40
+        )
+        random.seed(123)
+        np.random.seed(123)
+        replay = sample_patches_script.pick_weighted_positions(
+            geoscore, geoscore.shape, (8, 8, 8), n_picks=8, n_candidates=40
+        )
+        random.seed(456)
+        np.random.seed(456)
+        different = sample_patches_script.pick_weighted_positions(
+            geoscore, geoscore.shape, (8, 8, 8), n_picks=8, n_candidates=40
+        )
+
+        self.assertEqual(first, replay)
+        self.assertNotEqual(first, different)
+
     def test_sparse_keep_count_and_edge_fraction_behavior(self):
         x = np.arange(1, 1 + 8 * 8 * 8, dtype=np.float32).reshape(8, 8, 8)
 
@@ -239,6 +263,102 @@ class InputAugmentationTests(unittest.TestCase):
         )
         self.assertLess(aligned_loss.item(), 1e-6)
 
+    def test_geology_similarity_loss_accepts_collated_dict_metadata_batch(self):
+        latent = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        metadata_batch = {
+            'fault_summary': torch.tensor([1.0, 0.0], dtype=torch.float32),
+            'geologic_score': torch.tensor([0.0, 1.0], dtype=torch.float32),
+        }
+        aligned_loss = train_script.compute_geology_similarity_loss(
+            latent,
+            metadata_batch,
+            ('fault_summary', 'geologic_score'),
+        )
+        self.assertLess(aligned_loss.item(), 1e-6)
+
+    def test_latent_geology_diagnostics_detect_aligned_cosine_geometry(self):
+        metadata = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.0, 1.0],
+                [0.1, 0.9],
+            ],
+            dtype=torch.float32,
+        )
+
+        metrics = train_script.compute_latent_geology_diagnostics(
+            latent_vectors=metadata.clone(),
+            metadata_vectors=metadata,
+            neighbor_k=1,
+        )
+
+        self.assertGreater(metrics['pair_cosine_correlation'], 0.999)
+        self.assertGreater(metrics['cosine_separation'], 0.9)
+        self.assertEqual(metrics['neighbor_overlap'], 1.0)
+
+    def test_sample_patches_can_return_derived_metadata_vectors(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zarr_path = Path(tmp_dir) / 'model_data.zarr'
+            root = zarr.open(str(zarr_path), mode='w')
+            shape = (16, 16, 16)
+            seismic = np.random.RandomState(0).normal(size=shape).astype(np.float32)
+            geoscore = np.abs(np.random.RandomState(1).normal(size=shape)).astype(np.float32)
+
+            # A ramp in depth plus gentle x/y trend yields non-trivial dip and azimuth.
+            x = np.linspace(0.0, 1.0, shape[0], dtype=np.float32)[:, None, None]
+            y = np.linspace(0.0, 1.0, shape[1], dtype=np.float32)[None, :, None]
+            z = np.linspace(0.0, 1.0, shape[2], dtype=np.float32)[None, None, :]
+            geologic_age_faulted = (0.2 * x + 0.1 * y + 0.7 * z).astype(np.float32)
+            fault_segments = np.ones(shape, dtype=np.uint32)
+            fault_intersection = np.zeros(shape, dtype=np.float32)
+            fault_intersection[4:12, 4:12, 4:12] = 1.0
+            faulted_lithology = np.linspace(-1.0, 1.0, shape[0], dtype=np.float32)[:, None, None] * np.ones(shape, dtype=np.float32)
+            # Cover the whole volume so any 8^3 patch will contain these features.
+            flat_spot = np.ones(shape, dtype=np.uint8)
+            onlap_segments = np.ones(shape, dtype=np.float32)
+            channel_labels = np.full(shape, 2, dtype=np.uint8)
+
+            root.create_array('seismicCubes_cumsum_fullstack', data=seismic)
+            root.create_array('geologic_score', data=geoscore)
+            root.create_array('geologic_age_faulted', data=geologic_age_faulted)
+            root.create_array('fault_segments_id', data=fault_segments)
+            root.create_array('fault_intersection_segments', data=fault_intersection)
+            root.create_array('faulted_lithology', data=faulted_lithology)
+            root.create_array('flat_spot', data=flat_spot)
+            root.create_array('onlap_segments', data=onlap_segments)
+            faults_group = root.create_group('faults')
+            faults_group.create_array('faulted_channel_labels', data=channel_labels)
+
+            items = sample_patches_script.sample_patches_from_model(
+                root,
+                'seismicCubes_cumsum_fullstack',
+                'geologic_score',
+                (8, 8, 8),
+                n_patches_per_vol=2,
+                allow_overlap=False,
+                return_metadata=True,
+            )
+            self.assertTrue(items)
+            patch, metadata = items[0]
+            self.assertEqual(patch.shape, (8, 8, 8))
+            for key in sample_patches_script.DERIVED_METADATA_KEYS:
+                self.assertIn(key, metadata)
+                self.assertTrue(np.isfinite(float(metadata[key])))
+            self.assertEqual(float(metadata['meta_fault_fraction']), 1.0)
+            self.assertGreater(float(metadata['meta_fault_intersection_fraction']), 0.0)
+            self.assertGreaterEqual(float(metadata['meta_sand_fraction']), 0.0)
+            self.assertGreaterEqual(float(metadata['meta_shale_fraction']), 0.0)
+            self.assertGreater(float(metadata['meta_flat_spot_fraction']), 0.0)
+            self.assertGreater(float(metadata['meta_onlap_fraction']), 0.0)
+            self.assertGreater(float(metadata['meta_channel_fraction']), 0.0)
+
     def test_vae_supports_residual_encoder_variant(self):
         model = train_script.VAE3D(
             patch_shape=(32, 32, 32),
@@ -251,6 +371,19 @@ class InputAugmentationTests(unittest.TestCase):
         self.assertEqual(recon.shape, x.shape)
         self.assertEqual(mu.shape, (2, 16))
         self.assertEqual(logvar.shape, (2, 16))
+
+    def test_discover_model_data_volumes_prefers_synthetic_run_folders(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / 'fake_data'
+            good_run = root / 'seismic__2026.123__synthoseis_run_42' / 'model_data.zarr'
+            good_run.mkdir(parents=True)
+            bad_run = root / 'seismic__2026.456__synthoseis_run_43' / 'model_data.zarr'
+            bad_run.mkdir(parents=True)
+            (bad_run.parent.parent / 'temp_folder__2026.456__synthoseis_run_43').mkdir()
+
+            discovered = train_script.discover_model_data_volumes(root)
+            self.assertIn(good_run, discovered)
+            self.assertNotIn(bad_run, discovered)
 
     def test_validation_uses_same_input_transform_weights_as_training(self):
         captured = {}
@@ -288,6 +421,8 @@ class InputAugmentationTests(unittest.TestCase):
             sparse_keep_fraction_min=0.10,
             sparse_keep_fraction_max=0.30,
             sparse_poisson_radius_scale=0.85,
+            geology_loss_weight=0.0,
+            geology_metadata_keys=(),
             current_kl_weight=0.0,
             deep_supervision=False,
             patch_size_xyz=(32, 32, 32),

@@ -63,7 +63,7 @@ class TrainLPIPSTests(unittest.TestCase):
         logvar = torch.zeros(2, 4)
         lpips_mock = mock.Mock(side_effect=AssertionError('lpips should not be called'))
 
-        total_loss, rec_loss, kld, lpips_loss = train_script.compute_vae_losses(
+        total_loss, rec_loss, kld, lpips_loss, geology_loss = train_script.compute_vae_losses(
             recon,
             target,
             mu,
@@ -76,6 +76,7 @@ class TrainLPIPSTests(unittest.TestCase):
 
         self.assertEqual(lpips_mock.call_count, 0)
         self.assertEqual(float(lpips_loss.item()), 0.0)
+        self.assertEqual(float(geology_loss.item()), 0.0)
         self.assertTrue(torch.allclose(total_loss, rec_loss + (1e-3 * kld)))
 
     def test_train_one_epoch_gan_metrics_match_when_lpips_weight_zero(self):

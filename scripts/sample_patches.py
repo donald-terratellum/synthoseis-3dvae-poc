@@ -16,10 +16,30 @@ if SCRIPT_DIR in sys.path:
 
 import argparse
 import random
+import secrets
 import numpy as np
 import zarr
 import math
 from typing import Any, cast
+
+
+DERIVED_METADATA_KEYS = (
+    "meta_dip_mean_deg",
+    "meta_dip_std_deg",
+    "meta_azimuth_mean_deg",
+    "meta_azimuth_circular_variance",
+    "meta_fault_fraction",
+    "meta_fault_intersection_fraction",
+    "meta_geologic_score_mean",
+    "meta_sand_fraction",
+    "meta_shale_fraction",
+    "meta_flat_spot_fraction",
+    "meta_onlap_fraction",
+    "meta_onlap_variability",
+    "meta_channel_fraction",
+    "meta_channel_core_fraction",
+    "meta_structural_complexity",
+)
 
 
 def normalize_patch_size(values):
@@ -82,7 +102,129 @@ def pick_weighted_positions(geoscore, sampling_shape, patch_size, n_picks, n_can
     return [candidates[i] for i in idx]
 
 
-def sample_patches_from_model(zvol, seismic_key, geoscore_key, patch_size, n_patches_per_vol=100, allow_overlap=True):
+def _safe_extract_patch(array, origin, patch_size):
+    i, j, k = origin
+    sx, sy, sz = patch_size
+    patch = np.asarray(array[i:i+sx, j:j+sy, k:k+sz], dtype=np.float32)
+    if patch.shape != (sx, sy, sz):
+        return None
+    return patch
+
+
+def _safe_extract_patch_by_key(zvol, key, origin, patch_size):
+    try:
+        if key not in zvol:
+            return None
+        return _safe_extract_patch(zvol[key], origin, patch_size)
+    except Exception:
+        return None
+
+
+def _compute_dip_azimuth_features(structural_patch):
+    eps = 1e-8
+    gx, gy, gz = np.gradient(structural_patch.astype(np.float32), edge_order=1)
+    horizontal_mag = np.sqrt(gx * gx + gy * gy)
+    dip_rad = np.arctan2(horizontal_mag, np.abs(gz) + eps)
+    dip_deg = np.degrees(dip_rad)
+
+    azimuth_rad = np.arctan2(gy, gx)
+    valid_mask = horizontal_mag > 1e-6
+    if np.any(valid_mask):
+        az_valid = azimuth_rad[valid_mask]
+        mean_sin = float(np.mean(np.sin(az_valid)))
+        mean_cos = float(np.mean(np.cos(az_valid)))
+        azimuth_mean_rad = float(np.arctan2(mean_sin, mean_cos))
+        mean_resultant_length = float(np.sqrt(mean_sin * mean_sin + mean_cos * mean_cos))
+        azimuth_circular_variance = float(max(0.0, 1.0 - mean_resultant_length))
+    else:
+        azimuth_mean_rad = 0.0
+        azimuth_circular_variance = 1.0
+
+    azimuth_mean_deg = (float(np.degrees(azimuth_mean_rad)) + 360.0) % 360.0
+    dip_mean_deg = float(np.nanmean(dip_deg))
+    dip_std_deg = float(np.nanstd(dip_deg))
+    return dip_mean_deg, dip_std_deg, azimuth_mean_deg, azimuth_circular_variance
+
+
+def compute_patch_derived_metadata(zvol, origin, patch_size, geoscore_key, dip_source_key="geologic_age_faulted"):
+    metadata = {k: 0.0 for k in DERIVED_METADATA_KEYS}
+
+    geoscore_patch = _safe_extract_patch_by_key(zvol, geoscore_key, origin, patch_size)
+    if geoscore_patch is not None and geoscore_patch.size > 0:
+        geoscore_patch = np.nan_to_num(geoscore_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_geologic_score_mean"] = float(np.mean(geoscore_patch))
+
+    structural_patch = _safe_extract_patch_by_key(zvol, dip_source_key, origin, patch_size)
+    if structural_patch is not None and structural_patch.size > 0:
+        structural_patch = np.nan_to_num(structural_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        dip_mean_deg, dip_std_deg, azimuth_mean_deg, azimuth_circular_variance = _compute_dip_azimuth_features(structural_patch)
+        metadata["meta_dip_mean_deg"] = dip_mean_deg
+        metadata["meta_dip_std_deg"] = dip_std_deg
+        metadata["meta_azimuth_mean_deg"] = azimuth_mean_deg
+        metadata["meta_azimuth_circular_variance"] = azimuth_circular_variance
+
+    fault_segment_patch = _safe_extract_patch_by_key(zvol, "fault_segments_id", origin, patch_size)
+    if fault_segment_patch is not None and fault_segment_patch.size > 0:
+        fault_segment_patch = np.nan_to_num(fault_segment_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_fault_fraction"] = float(np.mean(fault_segment_patch > 0.0))
+
+    fault_intersection_patch = _safe_extract_patch_by_key(zvol, "fault_intersection_segments", origin, patch_size)
+    if fault_intersection_patch is not None and fault_intersection_patch.size > 0:
+        fault_intersection_patch = np.nan_to_num(fault_intersection_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_fault_intersection_fraction"] = float(np.mean(fault_intersection_patch > 0.0))
+
+    # faulted_lithology ranges [-1, 1] in synthetic data: map to [0, 1] for sandness.
+    lith_patch = _safe_extract_patch_by_key(zvol, "faulted_lithology", origin, patch_size)
+    if lith_patch is not None and lith_patch.size > 0:
+        lith_patch = np.nan_to_num(lith_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        sandness = np.clip((lith_patch + 1.0) * 0.5, 0.0, 1.0)
+        metadata["meta_sand_fraction"] = float(np.mean(sandness))
+        metadata["meta_shale_fraction"] = float(np.mean(1.0 - sandness))
+
+    flat_spot_patch = _safe_extract_patch_by_key(zvol, "flat_spot", origin, patch_size)
+    if flat_spot_patch is not None and flat_spot_patch.size > 0:
+        flat_spot_patch = np.nan_to_num(flat_spot_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_flat_spot_fraction"] = float(np.mean(flat_spot_patch > 0.0))
+
+    onlap_patch = _safe_extract_patch_by_key(zvol, "onlap_segments", origin, patch_size)
+    if onlap_patch is not None and onlap_patch.size > 0:
+        onlap_patch = np.nan_to_num(onlap_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_onlap_fraction"] = float(np.mean(onlap_patch > 0.0))
+        metadata["meta_onlap_variability"] = float(np.std(onlap_patch))
+
+    channel_patch = _safe_extract_patch_by_key(zvol, "faults/faulted_channel_labels", origin, patch_size)
+    if channel_patch is not None and channel_patch.size > 0:
+        channel_patch = np.nan_to_num(channel_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_channel_fraction"] = float(np.mean(channel_patch > 0.0))
+        metadata["meta_channel_core_fraction"] = float(np.mean(channel_patch >= 2.0))
+
+    # Composite structural complexity: dip variability + azimuth dispersion + fault-intersection density.
+    metadata["meta_structural_complexity"] = float(
+        max(0.0,
+            0.35 * (metadata["meta_dip_std_deg"] / 45.0)
+            + 0.20 * metadata["meta_azimuth_circular_variance"]
+            + 0.20 * metadata["meta_fault_intersection_fraction"]
+            + 0.15 * metadata["meta_onlap_variability"]
+            + 0.10 * metadata["meta_channel_fraction"]
+        )
+    )
+
+    for key, val in metadata.items():
+        if not np.isfinite(val):
+            metadata[key] = 0.0
+    return metadata
+
+
+def sample_patches_from_model(
+    zvol,
+    seismic_key,
+    geoscore_key,
+    patch_size,
+    n_patches_per_vol=100,
+    allow_overlap=True,
+    return_metadata=False,
+    return_origin=False,
+):
     # zvol: root group for a model_data.zarr (zarr.core.Array or Group)
     # seismic_key: key in zvol pointing to seismic array
     # geoscore_key: key in zvol for geologic_score
@@ -113,7 +255,21 @@ def sample_patches_from_model(zvol, seismic_key, geoscore_key, patch_size, n_pat
     for (i,j,k) in picks:
         patch = seismic[i:i+sx, j:j+sy, k:k+sz]
         if patch.shape == (sx, sy, sz):
-            patches.append(patch)
+            if return_metadata:
+                metadata = compute_patch_derived_metadata(
+                    zvol,
+                    (i, j, k),
+                    patch_size,
+                    geoscore_key=geoscore_key,
+                )
+                if return_origin:
+                    patches.append((patch, metadata, (i, j, k)))
+                else:
+                    patches.append((patch, metadata))
+            elif return_origin:
+                patches.append((patch, (i, j, k)))
+            else:
+                patches.append(patch)
     return patches
 
 
@@ -251,6 +407,12 @@ def main():
     p.add_argument("--patch_size", type=int, nargs='+', default=[32], help="Patch size: one value for cubic or three values X Y Z")
     p.add_argument("--n_patches", type=int, default=5000)
     p.add_argument("--n_per_volume", type=int, default=100)
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Sampling seed. If omitted, generate a new seed from system entropy and record it in the output Zarr attrs.",
+    )
     p.add_argument("--seismic_key", type=str, default="seismicCubes_cumsum__fullstack")
     p.add_argument("--geoscore_key", type=str, default="geologic_score")
     p.add_argument(
@@ -278,6 +440,10 @@ def main():
     p.add_argument("--no_overlap", dest="allow_overlap", action="store_false", help="Disallow overlapping by sampling unique candidate centers.")
     args = p.parse_args()
     patch_size = normalize_patch_size(args.patch_size)
+    sampling_seed = int(args.seed) if args.seed is not None else secrets.randbits(32)
+    random.seed(sampling_seed)
+    np.random.seed(sampling_seed)
+    print(f"Sampling seed: {sampling_seed}")
 
     src = Path(args.source)
     out = Path(args.out)
@@ -292,7 +458,8 @@ def main():
         dst.create_array("patches", shape=(args.n_patches, patch_size[0], patch_size[1], patch_size[2]), dtype="f4", chunks=(1, patch_size[0], patch_size[1], patch_size[2]))
 
     written = 0
-    vols = [vol for vol in src.rglob("model_data.zarr") if not has_temp_folder_sibling(vol)]
+    metadata_arrays = {}
+    vols = sorted(vol for vol in src.rglob("model_data.zarr") if not has_temp_folder_sibling(vol))
     if not vols:
         print("No model_data.zarr volumes found under", src)
         return
@@ -309,9 +476,17 @@ def main():
     dst.attrs["scaling_mode"] = args.scaling
     dst.attrs["scaling_mean"] = float(scaling_mean)
     dst.attrs["scaling_std"] = float(scaling_std)
+    dst.attrs["sampling_seed"] = sampling_seed
+    dst.attrs["source_volumes"] = [str(vol) for vol in vols]
     patches_dst = cast(Any, dst["patches"])
+    provenance_arrays = {}
+    for key in ("source_volume_index", "origin_x", "origin_y", "origin_z"):
+        if hasattr(dst, 'create_dataset'):
+            provenance_arrays[key] = dst.create_dataset(key, shape=(args.n_patches,), dtype="i4", chunks=(min(args.n_patches, 2048),))
+        else:
+            provenance_arrays[key] = dst.create_array(key, shape=(args.n_patches,), dtype="i4", chunks=(min(args.n_patches, 2048),))
 
-    for vol in vols:
+    for volume_index, vol in enumerate(vols):
         print("Scanning", vol)
         try:
             z = cast(Any, zarr.open(str(vol), mode="r"))
@@ -327,19 +502,34 @@ def main():
                         f"min={vol_stats['min']:.6f}",
                         f"max={vol_stats['max']:.6f}",
                     )
-            patches = sample_patches_from_model(
+            patch_items = sample_patches_from_model(
                 z,
                 args.seismic_key,
                 args.geoscore_key,
                 patch_size,
                 n_patches_per_vol=args.n_per_volume,
                 allow_overlap=args.allow_overlap,
+                return_metadata=True,
+                return_origin=True,
             )
-            for pch in patches:
+            for pch, metadata, origin in patch_items:
                 if written >= args.n_patches:
                     break
                 pch = apply_scaling(pch.astype("f4"), args.scaling, scaling_mean, scaling_std)
                 patches_dst[written] = pch.astype("f4")
+                if not metadata_arrays:
+                    for key in DERIVED_METADATA_KEYS:
+                        if hasattr(dst, 'create_dataset'):
+                            metadata_arrays[key] = dst.create_dataset(key, shape=(args.n_patches,), dtype="f4", chunks=(min(args.n_patches, 2048),))
+                        else:
+                            metadata_arrays[key] = dst.create_array(key, shape=(args.n_patches,), dtype="f4", chunks=(min(args.n_patches, 2048),))
+                    dst.attrs["derived_metadata_keys"] = list(DERIVED_METADATA_KEYS)
+                for key in DERIVED_METADATA_KEYS:
+                    metadata_arrays[key][written] = np.float32(metadata.get(key, 0.0))
+                provenance_arrays["source_volume_index"][written] = np.int32(volume_index)
+                provenance_arrays["origin_x"][written] = np.int32(origin[0])
+                provenance_arrays["origin_y"][written] = np.int32(origin[1])
+                provenance_arrays["origin_z"][written] = np.int32(origin[2])
                 written += 1
             if written >= args.n_patches:
                 break

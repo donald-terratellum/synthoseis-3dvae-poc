@@ -1,6 +1,8 @@
 import argparse
 from contextlib import nullcontext
 from pathlib import Path
+import random
+import secrets
 import sys
 from typing import Any, cast, Optional
 import warnings
@@ -37,11 +39,31 @@ from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
 from src.deep_supervision import DeepSupervisionLoss
 from src.model import VAE3D
+from src.tokenizer.core.preprocess import preprocess_for_token
 
 try:
     lpips_lib = importlib.import_module('lpips')
 except ImportError:
     lpips_lib = None
+
+
+DEFAULT_DERIVED_METADATA_KEYS = (
+    'meta_dip_mean_deg',
+    'meta_dip_std_deg',
+    'meta_azimuth_mean_deg',
+    'meta_azimuth_circular_variance',
+    'meta_fault_fraction',
+    'meta_fault_intersection_fraction',
+    'meta_geologic_score_mean',
+    'meta_sand_fraction',
+    'meta_shale_fraction',
+    'meta_flat_spot_fraction',
+    'meta_onlap_fraction',
+    'meta_onlap_variability',
+    'meta_channel_fraction',
+    'meta_channel_core_fraction',
+    'meta_structural_complexity',
+)
 
 
 def normalize_patch_size(values):
@@ -127,7 +149,12 @@ class ZarrPatchDataset(Dataset):
         if self.include_metadata:
             for key in self.geology_metadata_keys:
                 if key not in z:
-                    raise KeyError(f"Required geology metadata key '{key}' was not found in the dataset.")
+                    available_keys = tuple(str(value) for value in z.attrs.get('derived_metadata_keys', ()))
+                    raise KeyError(
+                        f"Required geology metadata key '{key}' was not found in dataset '{zarr_path}'. "
+                        f"Available derived metadata keys: {available_keys}. Regenerate this dataset with "
+                        "scripts/sample_patches.py after updating the derived metadata schema."
+                    )
                 self._metadata_arrays[key] = z[key]
 
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
@@ -322,7 +349,7 @@ class CombinedReconLoss(nn.Module):
     where PMSE = mean((pred-label)^2) / mean(label^2).
     """
 
-    def __init__(self, mse_weight: float = 0.6, eps: float = 1e-8):
+    def __init__(self, mse_weight: float = 0.6, eps: float = 0.01):
         super().__init__()
         if not 0.0 <= mse_weight <= 1.0:
             raise ValueError('mse_weight must be in [0, 1].')
@@ -335,8 +362,18 @@ class CombinedReconLoss(nn.Module):
         if self.pmse_weight == 0.0:
             return mse
         label_energy = (target ** 2).mean()
+        # Use a minimum of 0.01 so near-zero or all-zero patches (e.g., unwritten
+        # zarr slots) don't cause PMSE to blow up to millions.
         pmse = mse / torch.clamp(label_energy, min=self.eps)
         return self.mse_weight * mse + self.pmse_weight * pmse
+
+
+def build_reconstruction_loss(loss_type: str, mse_weight: float = 0.6) -> nn.Module:
+    if loss_type == 'mse_pmse':
+        return CombinedReconLoss(mse_weight=mse_weight)
+    if loss_type == 'mae':
+        return nn.L1Loss()
+    raise ValueError(f"Unsupported reconstruction loss: {loss_type!r}")
 
 
 def _get_primary_prediction(recon):
@@ -444,10 +481,33 @@ def _normalize_metadata_vector(values):
 def compute_geology_similarity_loss(latent_vectors, metadata_batch, metadata_keys):
     if latent_vectors.ndim != 2:
         raise ValueError('latent_vectors must be a 2D tensor of shape [batch, latent_dim].')
-    if len(metadata_batch) != int(latent_vectors.shape[0]):
-        raise ValueError('metadata_batch length must match latent_vectors batch size.')
     if not metadata_keys:
         return latent_vectors.new_zeros(())
+
+    if isinstance(metadata_batch, dict):
+        if not metadata_batch:
+            raise ValueError('metadata_batch dict must contain at least one key.')
+        batch_size = int(latent_vectors.shape[0])
+        normalized_batch = []
+        for idx in range(batch_size):
+            sample = {}
+            for key, value in metadata_batch.items():
+                if isinstance(value, torch.Tensor):
+                    if value.ndim == 0:
+                        sample[key] = float(value.item())
+                    else:
+                        sample[key] = float(value[idx].item())
+                else:
+                    arr = np.asarray(value)
+                    if arr.ndim == 0:
+                        sample[key] = float(arr)
+                    else:
+                        sample[key] = float(arr[idx])
+            normalized_batch.append(sample)
+        metadata_batch = normalized_batch
+
+    if len(metadata_batch) != int(latent_vectors.shape[0]):
+        raise ValueError('metadata_batch length must match latent_vectors batch size.')
 
     key_tuple = tuple(str(k) for k in metadata_keys)
     target_vectors = []
@@ -462,10 +522,80 @@ def compute_geology_similarity_loss(latent_vectors, metadata_batch, metadata_key
         target_vectors.append(_normalize_metadata_vector(np.asarray(vals, dtype=np.float64)))
 
     target = torch.as_tensor(np.stack(target_vectors, axis=0), dtype=latent_vectors.dtype, device=latent_vectors.device)
-    normed = F.normalize(latent_vectors, dim=1)
-    target_norm = F.normalize(target, dim=1)
-    sim = (normed * target_norm).sum(dim=1)
-    return 1.0 - sim.mean()
+    # eps=1e-6 prevents NaN from F.normalize on MPS/CUDA when metadata vectors
+    # are zero (happens when most patches have no structural signal).
+    latent_norm = F.normalize(latent_vectors, dim=1, eps=1e-6)
+    target_norm = F.normalize(target, dim=1, eps=1e-6)
+
+    # Dimension-agnostic alignment: preserve relative neighborhood geometry
+    # by matching pairwise cosine-similarity structure in latent vs metadata space.
+    latent_sim = torch.clamp(latent_norm @ latent_norm.transpose(0, 1), -1.0, 1.0)
+    target_sim = torch.clamp(target_norm @ target_norm.transpose(0, 1), -1.0, 1.0)
+    loss = F.mse_loss(latent_sim, target_sim)
+    if not torch.isfinite(loss):
+        return latent_vectors.new_zeros(())
+    return loss
+
+
+def compute_latent_geology_diagnostics(latent_vectors, metadata_vectors, neighbor_k=5, tail_fraction=0.10):
+    if latent_vectors.ndim != 2 or metadata_vectors.ndim != 2:
+        raise ValueError('latent_vectors and metadata_vectors must both be 2D.')
+    if latent_vectors.shape[0] != metadata_vectors.shape[0]:
+        raise ValueError('latent_vectors and metadata_vectors must have the same number of samples.')
+    sample_count = int(latent_vectors.shape[0])
+    if sample_count < 3:
+        return {
+            'pair_cosine_correlation': 0.0,
+            'similar_latent_cosine': 0.0,
+            'dissimilar_latent_cosine': 0.0,
+            'cosine_separation': 0.0,
+            'neighbor_overlap': 0.0,
+        }
+    if not 0.0 < float(tail_fraction) < 0.5:
+        raise ValueError('tail_fraction must be in (0, 0.5).')
+
+    latent_norm = F.normalize(latent_vectors.float(), dim=1, eps=1e-6)
+    metadata_norm = F.normalize(metadata_vectors.float(), dim=1, eps=1e-6)
+    latent_similarity = torch.clamp(latent_norm @ latent_norm.transpose(0, 1), -1.0, 1.0)
+    metadata_similarity = torch.clamp(metadata_norm @ metadata_norm.transpose(0, 1), -1.0, 1.0)
+
+    pair_mask = torch.triu(
+        torch.ones((sample_count, sample_count), dtype=torch.bool, device=latent_vectors.device),
+        diagonal=1,
+    )
+    latent_pairs = latent_similarity[pair_mask]
+    metadata_pairs = metadata_similarity[pair_mask]
+    latent_centered = latent_pairs - latent_pairs.mean()
+    metadata_centered = metadata_pairs - metadata_pairs.mean()
+    correlation_denom = torch.sqrt(
+        torch.sum(latent_centered.square()) * torch.sum(metadata_centered.square())
+    )
+    if float(correlation_denom.item()) > 1e-12:
+        correlation = torch.sum(latent_centered * metadata_centered) / correlation_denom
+    else:
+        correlation = latent_pairs.new_zeros(())
+
+    lower_threshold = torch.quantile(metadata_pairs, float(tail_fraction))
+    upper_threshold = torch.quantile(metadata_pairs, 1.0 - float(tail_fraction))
+    similar_latent_cosine = latent_pairs[metadata_pairs >= upper_threshold].mean()
+    dissimilar_latent_cosine = latent_pairs[metadata_pairs <= lower_threshold].mean()
+
+    effective_k = min(max(1, int(neighbor_k)), sample_count - 1)
+    diagonal_mask = torch.eye(sample_count, dtype=torch.bool, device=latent_vectors.device)
+    latent_neighbors = latent_similarity.masked_fill(diagonal_mask, float('-inf')).topk(effective_k, dim=1).indices
+    metadata_neighbors = metadata_similarity.masked_fill(diagonal_mask, float('-inf')).topk(effective_k, dim=1).indices
+    neighbor_overlap = (
+        (latent_neighbors.unsqueeze(2) == metadata_neighbors.unsqueeze(1)).any(dim=2).float().sum(dim=1)
+        / float(effective_k)
+    ).mean()
+
+    return {
+        'pair_cosine_correlation': float(correlation.item()),
+        'similar_latent_cosine': float(similar_latent_cosine.item()),
+        'dissimilar_latent_cosine': float(dissimilar_latent_cosine.item()),
+        'cosine_separation': float((similar_latent_cosine - dissimilar_latent_cosine).item()),
+        'neighbor_overlap': float(neighbor_overlap.item()),
+    }
 
 
 def compute_vae_losses(
@@ -684,6 +814,9 @@ METRICS_CSV_COLUMNS = [
     'g_gan_loss',
     'd_gan_loss',
     'd_gan_acc_pct',
+    'val_geo_latent_cosine_corr',
+    'val_geo_latent_cosine_gap',
+    'val_geo_neighbor_overlap',
     'best_model',
 ]
 
@@ -767,9 +900,17 @@ def compute_per_example_combined_recon_loss(recon, targets, mse_weight, eps=1e-8
     return float(mse_weight) * mse_values + (1.0 - float(mse_weight)) * pmse_values
 
 
-def compute_per_example_deep_supervision_combined_recon_loss(outputs, target, weights, mse_weight, eps=1e-8):
+def compute_per_example_recon_loss(recon, targets, loss_type, mse_weight, eps=1e-8):
+    if loss_type == 'mse_pmse':
+        return compute_per_example_combined_recon_loss(recon, targets, mse_weight, eps=eps)
+    if loss_type == 'mae':
+        return (recon - targets).abs().mean(dim=(1, 2, 3, 4))
+    raise ValueError(f"Unsupported reconstruction loss: {loss_type!r}")
+
+
+def compute_per_example_deep_supervision_recon_loss(outputs, target, weights, loss_type, mse_weight, eps=1e-8):
     if isinstance(outputs, torch.Tensor):
-        return compute_per_example_combined_recon_loss(outputs, target, mse_weight, eps=eps)
+        return compute_per_example_recon_loss(outputs, target, loss_type, mse_weight, eps=eps)
     if outputs is None:
         raise ValueError('outputs must not be None')
 
@@ -786,7 +927,7 @@ def compute_per_example_deep_supervision_combined_recon_loss(outputs, target, we
         target_for_scale = target
         if pred.shape[2:] != target.shape[2:]:
             target_for_scale = torch.nn.functional.interpolate(target, size=pred.shape[2:], mode='trilinear', align_corners=False)
-        total = total + (float(weight) * compute_per_example_combined_recon_loss(pred, target_for_scale, mse_weight, eps=eps))
+        total = total + (float(weight) * compute_per_example_recon_loss(pred, target_for_scale, loss_type, mse_weight, eps=eps))
     return total
 
 
@@ -1146,8 +1287,11 @@ def train_one_epoch(
     rec_loss_fn=None,
     lpips_loss_fn=None,
     lpips_weight=0.0,
+    reconstruction_loss='mse_pmse',
     mse_weight=0.6,
     deep_supervision_weights=None,
+    geology_metadata_keys=(),
+    geology_loss_weight=0.0,
 ):
     if steps_per_epoch is None:
         raise ValueError('steps_per_epoch must be provided for train_one_epoch.')
@@ -1166,7 +1310,12 @@ def train_one_epoch(
 
     last_snapshot = None
     for _ in range(steps_per_epoch):
-        inputs, targets = next(batch_iter)
+        batch = next(batch_iter)
+        geology_metadata_batch = None
+        if isinstance(batch, (list, tuple)) and len(batch) == 3:
+            inputs, targets, geology_metadata_batch = batch
+        else:
+            inputs, targets = batch
         inputs = inputs.to(device)
         targets = targets.to(device)
         ds_outputs = None
@@ -1200,6 +1349,10 @@ def train_one_epoch(
                 rec_loss_fn=rec_loss_fn,
                 lpips_loss_fn=lpips_loss_fn,
                 lpips_weight=lpips_weight,
+                geology_metadata_batch=geology_metadata_batch,
+                geology_metadata_keys=geology_metadata_keys,
+                geology_loss_weight=geology_loss_weight,
+                latent_vectors=mu,
             )
         else:
             recon, mu, logvar = model(inputs)
@@ -1212,6 +1365,10 @@ def train_one_epoch(
                 rec_loss_fn=rec_loss_fn,
                 lpips_loss_fn=lpips_loss_fn,
                 lpips_weight=lpips_weight,
+                geology_metadata_batch=geology_metadata_batch,
+                geology_metadata_keys=geology_metadata_keys,
+                geology_loss_weight=geology_loss_weight,
+                latent_vectors=mu,
             )
 
         g_gan_loss_value = 0.0
@@ -1236,17 +1393,19 @@ def train_one_epoch(
             if ds_outputs is None:
                 raise ValueError('deep supervision outputs are required when deep supervision is enabled.')
             ds_outputs_detached = tuple(out.detach() for out in ds_outputs)
-            per_example_mse = compute_per_example_deep_supervision_combined_recon_loss(
+            per_example_mse = compute_per_example_deep_supervision_recon_loss(
                 ds_outputs_detached,
                 targets.detach(),
                 weights=tuple(float(v) for v in deep_supervision_weights),
+                loss_type=reconstruction_loss,
                 mse_weight=mse_weight,
             ).detach().cpu()
         else:
-            per_example_mse = compute_per_example_combined_recon_loss(
+            per_example_mse = compute_per_example_recon_loss(
                 recon.detach(),
                 targets.detach(),
-                mse_weight,
+                loss_type=reconstruction_loss,
+                mse_weight=mse_weight,
             ).detach().cpu()
         last_snapshot = BatchSnapshot(
             inputs=inputs.detach().cpu().clone(),
@@ -1281,7 +1440,26 @@ def update_early_stopping(state, val_loss, min_delta):
     return improved
 
 
+def discover_model_data_volumes(root_path):
+    root = Path(root_path)
+    if not root.exists():
+        return []
+    discovered = []
+    for candidate in sorted(root.rglob('model_data.zarr')):
+        if not candidate.is_dir():
+            continue
+        vol_dir = candidate.parent
+        if vol_dir.name.startswith('seismic__'):
+            temp_name = vol_dir.name.replace('seismic__', 'temp_folder__', 1)
+            if (vol_dir.parent / temp_name).exists():
+                continue
+        discovered.append(candidate)
+    return discovered
+
+
 def build_dataset(args, data_path, augment=False):
+    geology_keys = tuple(str(v) for v in (args.geology_metadata_keys or ()))
+    include_metadata = bool(args.geology_loss_weight > 0.0 and len(geology_keys) > 0)
     return ZarrPatchDataset(
         data_path,
         scaling=args.input_scaling,
@@ -1302,6 +1480,8 @@ def build_dataset(args, data_path, augment=False):
         sparse_keep_fraction_max=args.sparse_keep_fraction_max,
         sparse_poisson_radius_scale=args.sparse_poisson_radius_scale,
         mixup_augment_prob=args.mixup_augment_prob,
+        include_metadata=include_metadata,
+        geology_metadata_keys=geology_keys,
     )
 
 
@@ -1355,7 +1535,7 @@ def build_sampling_eval_dataset(args):
     )
 
 
-def compute_full_dataset_recon_snapshot(model, dataset, batch_size, device, mse_weight, deep_supervision=False, deep_supervision_weights=None):
+def compute_full_dataset_recon_snapshot(model, dataset, batch_size, device, mse_weight, reconstruction_loss='mse_pmse', deep_supervision=False, deep_supervision_weights=None):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
     recon_snapshot = np.zeros((len(dataset),), dtype=np.float32)
 
@@ -1369,16 +1549,17 @@ def compute_full_dataset_recon_snapshot(model, dataset, batch_size, device, mse_
                 if deep_supervision_weights is None:
                     raise ValueError('deep_supervision_weights must be provided when deep_supervision is enabled.')
                 recon, _, _, ds_outputs = model(inputs, return_deep_supervision=True)
-                batch_recon = compute_per_example_deep_supervision_combined_recon_loss(
+                batch_recon = compute_per_example_deep_supervision_recon_loss(
                     ds_outputs,
                     targets,
                     weights=tuple(float(v) for v in deep_supervision_weights),
+                    loss_type=reconstruction_loss,
                     mse_weight=mse_weight,
                 )
             else:
                 recon, _, _ = model(inputs)
 
-                batch_recon = compute_per_example_combined_recon_loss(recon, targets, mse_weight)
+                batch_recon = compute_per_example_recon_loss(recon, targets, reconstruction_loss, mse_weight)
 
             batch_recon_np = batch_recon.detach().cpu().numpy().astype(np.float32)
             batch_count = int(batch_recon_np.shape[0])
@@ -1462,6 +1643,8 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
         sparse_keep_fraction_max=args.sparse_keep_fraction_max,
         sparse_poisson_radius_scale=args.sparse_poisson_radius_scale,
         mixup_augment_prob=0.0,
+        include_metadata=bool(args.geology_loss_weight > 0.0 and len(args.geology_metadata_keys) > 0),
+        geology_metadata_keys=tuple(str(v) for v in args.geology_metadata_keys),
     )
     validation_dl = DataLoader(validation_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
     if validation_ds.patch_shape != args.patch_size_xyz:
@@ -1474,9 +1657,17 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
     total_lpips_loss = 0.0
     batch_iter = itertools.cycle(validation_dl)
     last_snapshot = None
+    diagnostic_latents = []
+    diagnostic_metadata = []
+    diagnostic_max_samples = max(3, int(args.geology_diagnostic_max_samples))
     with torch.no_grad():
         for _ in range(validation_steps):
-            inputs, targets = next(batch_iter)
+            batch = next(batch_iter)
+            geology_metadata_batch = None
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                inputs, targets, geology_metadata_batch = batch
+            else:
+                inputs, targets = batch
             inputs = inputs.to(device)
             targets = targets.to(device)
             ds_outputs = None
@@ -1492,6 +1683,10 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     rec_loss_fn=rec_loss_fn,
                     lpips_loss_fn=lpips_loss_fn,
                     lpips_weight=args.lpips_weight,
+                    geology_metadata_batch=geology_metadata_batch,
+                    geology_metadata_keys=args.geology_metadata_keys,
+                    geology_loss_weight=float(args.geology_loss_weight),
+                    latent_vectors=mu,
                 )
             else:
                 recon, mu, logvar = model(inputs)
@@ -1504,22 +1699,51 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     rec_loss_fn=rec_loss_fn,
                     lpips_loss_fn=lpips_loss_fn,
                     lpips_weight=args.lpips_weight,
+                    geology_metadata_batch=geology_metadata_batch,
+                    geology_metadata_keys=args.geology_metadata_keys,
+                    geology_loss_weight=float(args.geology_loss_weight),
+                    latent_vectors=mu,
                 )
             total_loss += float(loss.item())
             total_lpips_loss += float(lpips_loss.item())
+            diagnostic_count = sum(item.shape[0] for item in diagnostic_latents)
+            if geology_metadata_batch is not None and diagnostic_count < diagnostic_max_samples:
+                diagnostic_batch_size = min(int(targets.shape[0]), diagnostic_max_samples - diagnostic_count)
+                diagnostic_inputs = np.stack([
+                    preprocess_for_token(targets[idx, 0].detach().cpu().numpy())
+                    for idx in range(diagnostic_batch_size)
+                ])
+                diagnostic_mu, _ = model.encoder(
+                    torch.from_numpy(diagnostic_inputs[:, np.newaxis]).to(device)
+                )
+                diagnostic_latents.append(diagnostic_mu.detach().cpu())
+                diagnostic_metadata.append(
+                    torch.as_tensor(
+                        np.stack([
+                            _normalize_metadata_vector([
+                                float(geology_metadata_batch[key][idx])
+                                for key in args.geology_metadata_keys
+                            ])
+                            for idx in range(diagnostic_batch_size)
+                        ]),
+                        dtype=torch.float32,
+                    )
+                )
             if args.deep_supervision:
                 if ds_outputs is None:
                     raise ValueError('deep supervision outputs are required when deep supervision is enabled.')
-                per_example_mse = compute_per_example_deep_supervision_combined_recon_loss(
+                per_example_mse = compute_per_example_deep_supervision_recon_loss(
                     ds_outputs,
                     targets,
                     weights=tuple(float(v) for v in args.deep_supervision_weights),
+                    loss_type=args.reconstruction_loss,
                     mse_weight=float(args.loss_mse_weight),
                 ).detach().cpu()
             else:
-                per_example_mse = compute_per_example_combined_recon_loss(
+                per_example_mse = compute_per_example_recon_loss(
                     recon,
                     targets,
+                    loss_type=args.reconstruction_loss,
                     mse_weight=float(args.loss_mse_weight),
                 ).detach().cpu()
             last_snapshot = BatchSnapshot(
@@ -1528,10 +1752,28 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                 recon=recon.detach().cpu().clone(),
                 per_example_mse=per_example_mse,
             )
-    return total_loss / validation_steps, total_lpips_loss / validation_steps, last_snapshot
+    geology_diagnostics = None
+    if diagnostic_latents:
+        latent_values = torch.cat(diagnostic_latents, dim=0)[:diagnostic_max_samples]
+        metadata_values = torch.cat(diagnostic_metadata, dim=0)[:diagnostic_max_samples]
+        geology_diagnostics = compute_latent_geology_diagnostics(
+            latent_values,
+            metadata_values,
+            neighbor_k=args.geology_diagnostic_neighbor_k,
+        )
+    return total_loss / validation_steps, total_lpips_loss / validation_steps, last_snapshot, geology_diagnostics
 
 
 def train(args):
+    if args.geology_loss_weight < 0.0:
+        raise ValueError('--geology_loss_weight must be non-negative.')
+    if args.geology_loss_weight > 0.0 and not args.geology_metadata_keys:
+        raise ValueError('--geology_metadata_keys must be provided when --geology_loss_weight > 0.')
+    if args.geology_diagnostic_max_samples < 3:
+        raise ValueError('--geology_diagnostic_max_samples must be at least 3.')
+    if args.geology_diagnostic_neighbor_k < 1:
+        raise ValueError('--geology_diagnostic_neighbor_k must be positive.')
+
     ds = build_dataset(args, args.data, augment=args.augment)
     args.patch_size_xyz = resolve_patch_size_xyz(args.patch_size, ds.patch_shape)
     if args.adaptive_sampling_by_mse and args.sampling_snapshot_interval <= 0:
@@ -1574,6 +1816,7 @@ def train(args):
         latent_dim=128,
         patch_shape=args.patch_size_xyz,
         deep_supervision=args.deep_supervision,
+        residual_encoder=args.residual_encoder,
     )
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
@@ -1660,6 +1903,7 @@ def train(args):
         print(f"Resuming epoch numbering from {resume_completed_epochs + 1}")
 
     print(f"Using device: {device}")
+    print(f"Training seed: {args.seed}")
     print(f"Batch size (B): {args.batch_size}, batches/epoch: {steps_per_epoch}, examples/epoch: {samples_per_epoch}")
     print(
         "Augmentations:",
@@ -1703,6 +1947,7 @@ def train(args):
     )
     print(
         'Reconstruction loss:',
+        f"type={args.reconstruction_loss}",
         f"mse_weight={args.loss_mse_weight:.4f}",
         f"pmse_weight={1.0 - args.loss_mse_weight:.4f}",
         f"lpips_weight={args.lpips_weight:.4f}",
@@ -1803,7 +2048,10 @@ def train(args):
     opt = build_optimizer(model, args)
     disc_opt = build_discriminator_optimizer(discriminator, args)
     scheduler = build_scheduler(opt, args)
-    rec_loss_fn = CombinedReconLoss(mse_weight=float(args.loss_mse_weight))
+    rec_loss_fn = build_reconstruction_loss(
+        args.reconstruction_loss,
+        mse_weight=float(args.loss_mse_weight),
+    )
     lpips_loss_fn = None
     if args.lpips_weight > 0.0:
         lpips_loss_fn = SliceLPIPSLoss(min_spatial_size=int(args.lpips_min_size)).to(device)
@@ -1850,13 +2098,13 @@ def train(args):
 
     metrics_csv_path = Path(args.out_dir) / 'training_metrics.csv'
     tensorboard_dir = Path(args.out_dir) / 'tensorboard'
-    representative_metadata_path = Path(args.out_dir) / 'representative_examples_epoch4.pt'
+    representative_metadata_path = Path(args.out_dir) / f'representative_examples_epoch{args.representative_selection_epoch}.pt'
     writer = SummaryWriter(log_dir=str(tensorboard_dir))
     print(f"TensorBoard log dir: {tensorboard_dir}")
     print(f"Run TensorBoard: uv run tensorboard --logdir {tensorboard_dir}")
     representative_examples = {'training': [], 'validation': []}
     representative_examples_ready = False
-    if args.resume is not None and representative_metadata_path.exists():
+    if args.resume is not None and representative_metadata_path.exists() and not args.refresh_representative_examples:
         try:
             representative_examples = _load_representative_example_metadata(representative_metadata_path)
             representative_examples_ready = bool(representative_examples['training']) and bool(representative_examples['validation'])
@@ -1919,10 +2167,13 @@ def train(args):
                 rec_loss_fn=rec_loss_fn,
                 lpips_loss_fn=lpips_loss_fn,
                 lpips_weight=float(args.lpips_weight),
+                reconstruction_loss=args.reconstruction_loss,
                 mse_weight=float(args.loss_mse_weight),
                 deep_supervision_weights=args.deep_supervision_weights,
+                geology_metadata_keys=tuple(str(v) for v in args.geology_metadata_keys),
+                geology_loss_weight=float(args.geology_loss_weight),
             )
-            val_loss, val_lpips_loss, val_last_snapshot = validate(
+            val_loss, val_lpips_loss, val_last_snapshot, geology_diagnostics = validate(
                 model,
                 args,
                 device,
@@ -1965,6 +2216,12 @@ def train(args):
             writer.add_scalar('train/lpips_loss', float(train_lpips_loss), epoch_number)
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
             writer.add_scalar('validation/lpips_loss', float(val_lpips_loss), epoch_number)
+            if geology_diagnostics is not None:
+                writer.add_scalar('validation/geology_latent_pair_cosine_correlation', geology_diagnostics['pair_cosine_correlation'], epoch_number)
+                writer.add_scalar('validation/geology_latent_similar_cosine', geology_diagnostics['similar_latent_cosine'], epoch_number)
+                writer.add_scalar('validation/geology_latent_dissimilar_cosine', geology_diagnostics['dissimilar_latent_cosine'], epoch_number)
+                writer.add_scalar('validation/geology_latent_cosine_separation', geology_diagnostics['cosine_separation'], epoch_number)
+                writer.add_scalar('validation/geology_latent_neighbor_overlap', geology_diagnostics['neighbor_overlap'], epoch_number)
             writer.add_scalar('train/lr', float(current_lr), epoch_number)
             writer.add_scalar('train/gan_weight', float(gan_weight_for_epoch), epoch_number)
             writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
@@ -1980,6 +2237,7 @@ def train(args):
                     adaptive_eval_ds,
                     args.batch_size,
                     device,
+                    reconstruction_loss=args.reconstruction_loss,
                     mse_weight=args.loss_mse_weight,
                     deep_supervision=args.deep_supervision,
                     deep_supervision_weights=args.deep_supervision_weights,
@@ -2069,6 +2327,9 @@ def train(args):
                 f"{g_gan_loss_epoch:.6f}",
                 f"{d_gan_loss_epoch:.6f}",
                 f"{100.0 * d_gan_acc_epoch:.2f}",
+                f"{geology_diagnostics['pair_cosine_correlation']:.6f}" if geology_diagnostics is not None else '',
+                f"{geology_diagnostics['cosine_separation']:.6f}" if geology_diagnostics is not None else '',
+                f"{geology_diagnostics['neighbor_overlap']:.6f}" if geology_diagnostics is not None else '',
                 'best' if improved else '',
             ])
             csv_file.flush()
@@ -2109,6 +2370,15 @@ def train(args):
                 f"{gan_status_display:>10} "
                 f"{elapsed_summary:>33}"
             )
+            if geology_diagnostics is not None:
+                print(
+                    "  Latent geology validation: "
+                    f"pair_cos_corr={geology_diagnostics['pair_cosine_correlation']:.4f} "
+                    f"similar_cos={geology_diagnostics['similar_latent_cosine']:.4f} "
+                    f"dissimilar_cos={geology_diagnostics['dissimilar_latent_cosine']:.4f} "
+                    f"gap={geology_diagnostics['cosine_separation']:.4f} "
+                    f"neighbor_overlap@{args.geology_diagnostic_neighbor_k}={geology_diagnostics['neighbor_overlap']:.4f}"
+                )
 
             if early_stopping.epochs_without_improvement >= args.early_stopping_patience:
                 print(
@@ -2135,6 +2405,7 @@ if __name__ == '__main__':
     p.add_argument('--grad_clip', type=float, default=2.0)
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--device', type=str, default='auto')
+    p.add_argument('--seed', type=int, default=None, help='Training and augmentation seed. If omitted, generate a new seed from system entropy.')
     p.add_argument('--input_scaling', type=str, default='none', choices=['none', 'divide_by_std', 'zscore'])
     p.add_argument('--input_mean', type=float, default=0.0)
     p.add_argument('--input_std', type=float, default=1.0)
@@ -2164,7 +2435,18 @@ if __name__ == '__main__':
     p.add_argument('--kl_warmup_epochs', type=int, default=15)
     p.add_argument('--kl_fixed', type=float, default=1e-3)
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
+    p.add_argument('--residual_encoder', action='store_true', help='Use the residual encoder variant while keeping the external latent contract unchanged.')
+    p.add_argument('--geology_loss_weight', type=float, default=0.0, help='Weight for metadata-to-latent geology similarity loss. Set >0 to enable geology-aware latent shaping.')
+    p.add_argument('--geology_diagnostic_max_samples', type=int, default=512, help='Maximum validation patches used for latent/geology cosine diagnostics each epoch.')
+    p.add_argument('--geology_diagnostic_neighbor_k', type=int, default=5, help='Neighbor count for validation latent/geology top-k overlap.')
+    p.add_argument(
+        '--geology_metadata_keys',
+        nargs='+',
+        default=list(DEFAULT_DERIVED_METADATA_KEYS),
+        help='Per-patch metadata array keys stored in sampled zarr datasets for geology-aware loss.',
+    )
     p.add_argument('--deep_supervision_weights', type=float, nargs=3, default=[1.0, 0.5, 0.25], help='Three deep supervision reconstruction loss weights (fine, mid, coarse).')
+    p.add_argument('--reconstruction_loss', type=str, default='mse_pmse', choices=['mse_pmse', 'mae'], help='Voxelwise reconstruction objective. mse_pmse preserves the existing blended MSE/PMSE behavior; mae uses L1 loss.')
     p.add_argument('--loss_mse_weight', type=float, default=0.6, help='Weight for MSE component of reconstruction loss in [0, 1]; PMSE weight = 1 - this value.')
     p.add_argument('--lpips_weight', type=float, default=0.0, help='Weight for optional slice-wise LPIPS perceptual loss. Default 0 keeps baseline behavior.')
     p.add_argument('--lpips_min_size', type=int, default=64, help='Minimum LPIPS slice height/width. Smaller slices are bilinearly upsampled before LPIPS.')
@@ -2200,6 +2482,7 @@ if __name__ == '__main__':
     p.set_defaults(save_epoch_checkpoints=True)
     p.add_argument('--representative_selection_epoch', type=int, default=4, help='Epoch number used to select representative examples from last-batch MSE percentiles.')
     p.add_argument('--representative_plot_interval', type=int, default=5, help='Generate representative plots every N epochs, reusing the selected examples.')
+    p.add_argument('--refresh_representative_examples', action='store_true', help='Ignore saved representative examples when resuming and select new examples from the active datasets.')
     p.add_argument('--adaptive_sampling_by_mse', action='store_true', help='Enable adaptive training sampling probabilities from full-dataset blended reconstruction-loss snapshots.')
     p.add_argument('--sampling_snapshot_interval', type=int, default=5, help='Recompute full-dataset blended reconstruction loss every N epochs when adaptive sampling is enabled.')
     p.add_argument('--sampling_improvement_window', type=int, default=3, help='Number of recent reconstruction-loss snapshots kept to compute average improvement (>=2).')
@@ -2207,6 +2490,10 @@ if __name__ == '__main__':
     p.add_argument('--sampling_snapshot_filename', type=str, default='adaptive_sampling_snapshots.pt', help='Output filename under --out_dir for stored per-example adaptive sampling snapshots.')
     p.add_argument('--out_dir', type=str, default='checkpoints')
     args = p.parse_args()
+    args.seed = int(args.seed) if args.seed is not None else secrets.randbits(32)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     args.patch_size_xyz = normalize_patch_size(args.patch_size) if args.patch_size is not None else None
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     train(args)
