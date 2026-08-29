@@ -18,3 +18,6 @@ scripts/generate_reconstructions.py
 docs/plans/*.png
 .tmp_pdf_extract/
 src/synthoseis_3dvae_poc.egg-info/
+
+# Generated benchmark artifacts (commit only when explicitly requested)
+docs/benchmarks/*.json
