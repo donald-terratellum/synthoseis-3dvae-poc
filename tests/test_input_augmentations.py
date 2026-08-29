@@ -303,6 +303,134 @@ class InputAugmentationTests(unittest.TestCase):
         self.assertGreater(metrics['cosine_separation'], 0.9)
         self.assertEqual(metrics['neighbor_overlap'], 1.0)
 
+    def test_geology_similarity_loss_excludes_diagonal_and_background_pairs(self):
+        latent = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        metadata_batch = [
+            {'fault_summary': 1.0, 'geologic_score': 0.0},
+            {'fault_summary': 0.0, 'geologic_score': 1.0},
+            {'fault_summary': 0.0, 'geologic_score': 0.0},
+        ]
+
+        # Third sample is treated as background via key index 0 and threshold.
+        loss = train_script.compute_geology_similarity_loss(
+            latent,
+            metadata_batch,
+            ('fault_summary', 'geologic_score'),
+            background_threshold=1e-6,
+            background_key_indices=(0, 1),
+            offdiag_only=True,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(float(loss.item()), 0.0)
+
+    def test_geology_similarity_loss_supports_huber_mode(self):
+        latent = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        metadata_batch = [
+            {'fault_summary': 1.0, 'geologic_score': 0.0},
+            {'fault_summary': 0.0, 'geologic_score': 1.0},
+            {'fault_summary': 0.0, 'geologic_score': 1.0},
+        ]
+        mse_loss = train_script.compute_geology_similarity_loss(
+            latent,
+            metadata_batch,
+            ('fault_summary', 'geologic_score'),
+            loss_type='mse',
+            offdiag_only=True,
+        )
+        huber_loss = train_script.compute_geology_similarity_loss(
+            latent,
+            metadata_batch,
+            ('fault_summary', 'geologic_score'),
+            loss_type='huber',
+            huber_delta=0.1,
+            offdiag_only=True,
+        )
+        self.assertTrue(torch.isfinite(mse_loss))
+        self.assertTrue(torch.isfinite(huber_loss))
+        self.assertGreaterEqual(float(mse_loss.item()), 0.0)
+        self.assertGreaterEqual(float(huber_loss.item()), 0.0)
+
+    def test_fit_geology_metadata_calibration_and_prepare_vectors(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zarr_path = Path(tmp_dir) / 'data.zarr'
+            root = zarr.open(str(zarr_path), mode='w')
+            patches = np.zeros((4, 4, 4, 4), dtype=np.float32)
+            root.create_array('patches', data=patches)
+            root.create_array('fault_summary', data=np.array([0.0, 0.2, 0.4, 0.8], dtype=np.float32))
+            root.create_array('geologic_score', data=np.array([0.0, 0.1, 0.2, 0.3], dtype=np.float32))
+
+            ds = ZarrPatchDataset(
+                zarr_path,
+                augment=False,
+                include_metadata=True,
+                geology_metadata_keys=('fault_summary', 'geologic_score'),
+                mixup_augment_prob=0.0,
+            )
+            calibration = train_script.fit_geology_metadata_calibration(
+                ds,
+                ('fault_summary', 'geologic_score'),
+                strategy='robust_log1p',
+                eps=1e-6,
+                clip=6.0,
+                background_keys=('fault_summary',),
+            )
+
+            metadata_batch = {
+                'fault_summary': torch.tensor([0.0, 0.4], dtype=torch.float32),
+                'geologic_score': torch.tensor([0.0, 0.2], dtype=torch.float32),
+            }
+            vectors, has_selected = train_script.prepare_geology_metadata_vectors(
+                metadata_batch,
+                ('fault_summary', 'geologic_score'),
+                device='cpu',
+                dtype=torch.float32,
+                geology_metadata_calibration=calibration,
+                background_threshold=1e-6,
+                background_key_indices=(0,),
+            )
+
+            self.assertEqual(tuple(vectors.shape), (2, 2))
+            self.assertFalse(bool(has_selected[0].item()))
+            self.assertTrue(bool(has_selected[1].item()))
+
+    def test_latent_geology_diagnostics_reports_multiple_topk_metrics(self):
+        samples = []
+        for idx in range(32):
+            angle = (2.0 * np.pi * float(idx)) / 32.0
+            samples.append([np.cos(angle), np.sin(angle), 0.1 * np.cos(2.0 * angle)])
+        metadata = torch.tensor(samples, dtype=torch.float32)
+        mask = torch.ones((metadata.shape[0],), dtype=torch.bool)
+
+        metrics = train_script.compute_latent_geology_diagnostics(
+            latent_vectors=metadata.clone(),
+            metadata_vectors=metadata,
+            neighbor_k=5,
+            neighbor_ks=[5, 10, 20],
+            has_selected_geology=mask,
+        )
+
+        self.assertIn('neighbor_overlap', metrics)
+        self.assertIn('neighbor_overlap_at_5', metrics)
+        self.assertIn('neighbor_overlap_at_10', metrics)
+        self.assertIn('neighbor_overlap_at_20', metrics)
+        self.assertEqual(metrics['neighbor_overlap_at_5'], 1.0)
+        self.assertEqual(metrics['neighbor_overlap_at_10'], 1.0)
+        self.assertEqual(metrics['neighbor_overlap_at_20'], 1.0)
+
     def test_sample_patches_can_return_derived_metadata_vectors(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             zarr_path = Path(tmp_dir) / 'model_data.zarr'

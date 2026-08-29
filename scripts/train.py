@@ -4,7 +4,7 @@ from pathlib import Path
 import random
 import secrets
 import sys
-from typing import Any, cast, Optional
+from typing import Any, cast, Optional, Sequence
 import warnings
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +38,7 @@ from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
 from src.deep_supervision import DeepSupervisionLoss
+from src.geology_sampler import GeologyAwareBatchSampler, build_multilabel_strata
 from src.model import VAE3D
 from src.tokenizer.core.preprocess import preprocess_for_token
 
@@ -63,6 +64,16 @@ DEFAULT_DERIVED_METADATA_KEYS = (
     'meta_channel_fraction',
     'meta_channel_core_fraction',
     'meta_structural_complexity',
+)
+
+
+DEFAULT_BACKGROUND_METADATA_KEYS = (
+    'meta_fault_fraction',
+    'meta_fault_intersection_fraction',
+    'meta_flat_spot_fraction',
+    'meta_onlap_fraction',
+    'meta_channel_fraction',
+    'meta_channel_core_fraction',
 )
 
 
@@ -478,39 +489,35 @@ def _normalize_metadata_vector(values):
     return arr / norm
 
 
-def compute_geology_similarity_loss(latent_vectors, metadata_batch, metadata_keys):
-    if latent_vectors.ndim != 2:
-        raise ValueError('latent_vectors must be a 2D tensor of shape [batch, latent_dim].')
-    if not metadata_keys:
-        return latent_vectors.new_zeros(())
+def _metadata_batch_to_matrix(metadata_batch, metadata_keys):
+    key_tuple = tuple(str(k) for k in metadata_keys)
+    if not key_tuple:
+        raise ValueError('metadata_keys must not be empty when geology metadata is enabled.')
 
     if isinstance(metadata_batch, dict):
         if not metadata_batch:
             raise ValueError('metadata_batch dict must contain at least one key.')
-        batch_size = int(latent_vectors.shape[0])
-        normalized_batch = []
-        for idx in range(batch_size):
-            sample = {}
-            for key, value in metadata_batch.items():
-                if isinstance(value, torch.Tensor):
-                    if value.ndim == 0:
-                        sample[key] = float(value.item())
-                    else:
-                        sample[key] = float(value[idx].item())
-                else:
-                    arr = np.asarray(value)
-                    if arr.ndim == 0:
-                        sample[key] = float(arr)
-                    else:
-                        sample[key] = float(arr[idx])
-            normalized_batch.append(sample)
-        metadata_batch = normalized_batch
+        columns = []
+        batch_size = None
+        for key in key_tuple:
+            if key not in metadata_batch:
+                raise KeyError(f"Missing geology metadata key '{key}' in batch metadata.")
+            value = metadata_batch[key]
+            if isinstance(value, torch.Tensor):
+                arr = value.detach().cpu().numpy().reshape(-1)
+            else:
+                arr = np.asarray(value).reshape(-1)
+            if batch_size is None:
+                batch_size = int(arr.shape[0])
+            elif int(arr.shape[0]) != batch_size:
+                raise ValueError('Collated metadata arrays must share the same batch axis length.')
+            columns.append(arr.astype(np.float64, copy=False))
+        matrix = np.stack(columns, axis=1)
+        return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
-    if len(metadata_batch) != int(latent_vectors.shape[0]):
-        raise ValueError('metadata_batch length must match latent_vectors batch size.')
-
-    key_tuple = tuple(str(k) for k in metadata_keys)
-    target_vectors = []
+    if len(metadata_batch) == 0:
+        raise ValueError('metadata_batch must contain at least one sample.')
+    rows = []
     for sample in metadata_batch:
         if not isinstance(sample, dict):
             raise ValueError('Each metadata item must be a dict keyed by geology metadata name.')
@@ -519,9 +526,165 @@ def compute_geology_similarity_loss(latent_vectors, metadata_batch, metadata_key
             if key not in sample:
                 raise KeyError(f"Missing geology metadata key '{key}' in batch metadata.")
             vals.append(float(sample[key]))
-        target_vectors.append(_normalize_metadata_vector(np.asarray(vals, dtype=np.float64)))
+        rows.append(vals)
+    matrix = np.asarray(rows, dtype=np.float64)
+    return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
-    target = torch.as_tensor(np.stack(target_vectors, axis=0), dtype=latent_vectors.dtype, device=latent_vectors.device)
+
+def resolve_background_key_indices(metadata_keys, background_keys):
+    key_tuple = tuple(str(v) for v in metadata_keys)
+    wanted = tuple(str(v) for v in (background_keys or ()))
+    index_map = {key: idx for idx, key in enumerate(key_tuple)}
+    indices = [index_map[key] for key in wanted if key in index_map]
+    if indices:
+        return tuple(indices)
+    return tuple(range(len(key_tuple)))
+
+
+def fit_geology_metadata_calibration(
+    dataset,
+    metadata_keys,
+    strategy='robust_log1p',
+    eps=1e-6,
+    clip=6.0,
+    background_keys=(),
+):
+    key_tuple = tuple(str(v) for v in metadata_keys)
+    if not key_tuple:
+        return None
+    if strategy not in {'none', 'robust_log1p'}:
+        raise ValueError("geology calibration strategy must be one of: 'none', 'robust_log1p'.")
+    if not hasattr(dataset, '_metadata_arrays'):
+        raise ValueError('dataset does not expose metadata arrays required for calibration fitting.')
+
+    columns = []
+    for key in key_tuple:
+        if key not in dataset._metadata_arrays:
+            raise KeyError(f"Missing geology metadata key '{key}' in dataset metadata arrays.")
+        arr = np.asarray(dataset._metadata_arrays[key][:], dtype=np.float64).reshape(-1)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        columns.append(arr)
+    raw_matrix = np.stack(columns, axis=1)
+
+    if strategy == 'none':
+        nonzero_scale = np.ones((raw_matrix.shape[1],), dtype=np.float64)
+        center = np.zeros((raw_matrix.shape[1],), dtype=np.float64)
+        scale = np.ones((raw_matrix.shape[1],), dtype=np.float64)
+    else:
+        nonzero_scale = np.ones((raw_matrix.shape[1],), dtype=np.float64)
+        for idx in range(raw_matrix.shape[1]):
+            col = raw_matrix[:, idx]
+            positive = col[col > 0.0]
+            if positive.size > 0:
+                nonzero_scale[idx] = max(float(np.median(positive)), float(eps))
+            else:
+                nonzero_scale[idx] = 1.0
+
+        transformed = np.log1p(np.clip(raw_matrix, a_min=0.0, a_max=None) / nonzero_scale.reshape(1, -1))
+        center = np.median(transformed, axis=0)
+        q25 = np.percentile(transformed, 25.0, axis=0)
+        q75 = np.percentile(transformed, 75.0, axis=0)
+        scale = np.maximum(q75 - q25, float(eps))
+
+    return {
+        'schema_version': 1,
+        'keys': list(key_tuple),
+        'strategy': str(strategy),
+        'eps': float(eps),
+        'clip': float(clip),
+        'nonzero_scale': nonzero_scale.astype(np.float64).tolist(),
+        'center': center.astype(np.float64).tolist(),
+        'scale': scale.astype(np.float64).tolist(),
+        'background_keys': list(tuple(str(v) for v in (background_keys or ()))),
+    }
+
+
+def prepare_geology_metadata_vectors(
+    metadata_batch,
+    metadata_keys,
+    device,
+    dtype,
+    geology_metadata_calibration=None,
+    background_threshold=1e-6,
+    background_key_indices=(),
+):
+    raw_matrix = _metadata_batch_to_matrix(metadata_batch, metadata_keys)
+    key_count = int(raw_matrix.shape[1])
+
+    mask_indices = tuple(int(v) for v in (background_key_indices or ()))
+    if mask_indices:
+        selected_matrix = raw_matrix[:, list(mask_indices)]
+    else:
+        selected_matrix = raw_matrix
+    has_selected = np.any(selected_matrix > float(background_threshold), axis=1)
+
+    transformed = raw_matrix.copy()
+    if geology_metadata_calibration is not None:
+        calibration_keys = tuple(str(v) for v in geology_metadata_calibration.get('keys', ()))
+        expected_keys = tuple(str(v) for v in metadata_keys)
+        if calibration_keys != expected_keys:
+            raise ValueError(
+                'geology calibration keys do not match active metadata keys. '
+                f'calibration_keys={calibration_keys}, active_keys={expected_keys}'
+            )
+
+        strategy = str(geology_metadata_calibration.get('strategy', 'none'))
+        eps = float(geology_metadata_calibration.get('eps', 1e-6))
+        clip = float(geology_metadata_calibration.get('clip', 0.0))
+        nonzero_scale = np.asarray(geology_metadata_calibration.get('nonzero_scale', np.ones((key_count,))), dtype=np.float64)
+        center = np.asarray(geology_metadata_calibration.get('center', np.zeros((key_count,))), dtype=np.float64)
+        scale = np.asarray(geology_metadata_calibration.get('scale', np.ones((key_count,))), dtype=np.float64)
+
+        if strategy == 'robust_log1p':
+            transformed = np.log1p(np.clip(transformed, a_min=0.0, a_max=None) / np.maximum(nonzero_scale.reshape(1, -1), eps))
+        elif strategy != 'none':
+            raise ValueError(f'Unsupported geology calibration strategy: {strategy}')
+
+        transformed = (transformed - center.reshape(1, -1)) / np.maximum(scale.reshape(1, -1), eps)
+        if clip > 0.0:
+            transformed = np.clip(transformed, a_min=-clip, a_max=clip)
+
+    normalized = np.stack([_normalize_metadata_vector(row) for row in transformed], axis=0)
+    metadata_vectors = torch.as_tensor(normalized, dtype=dtype, device=device)
+    has_selected_tensor = torch.as_tensor(has_selected, dtype=torch.bool, device=device)
+    return metadata_vectors, has_selected_tensor
+
+
+def compute_geology_similarity_loss(
+    latent_vectors,
+    metadata_batch,
+    metadata_keys,
+    geology_metadata_calibration=None,
+    background_threshold=1e-6,
+    background_key_indices=(),
+    loss_type='mse',
+    huber_delta=0.1,
+    offdiag_only=True,
+):
+    if latent_vectors.ndim != 2:
+        raise ValueError('latent_vectors must be a 2D tensor of shape [batch, latent_dim].')
+    if not metadata_keys:
+        return latent_vectors.new_zeros(())
+
+    if isinstance(metadata_batch, dict):
+        if not metadata_batch:
+            raise ValueError('metadata_batch dict must contain at least one key.')
+        first_value = next(iter(metadata_batch.values()))
+        sample_count = int(np.asarray(first_value).reshape(-1).shape[0])
+    else:
+        sample_count = len(metadata_batch)
+    if sample_count != int(latent_vectors.shape[0]):
+        raise ValueError('metadata_batch length must match latent_vectors batch size.')
+
+    target, has_selected = prepare_geology_metadata_vectors(
+        metadata_batch,
+        metadata_keys,
+        device=latent_vectors.device,
+        dtype=latent_vectors.dtype,
+        geology_metadata_calibration=geology_metadata_calibration,
+        background_threshold=background_threshold,
+        background_key_indices=background_key_indices,
+    )
     # eps=1e-6 prevents NaN from F.normalize on MPS/CUDA when metadata vectors
     # are zero (happens when most patches have no structural signal).
     latent_norm = F.normalize(latent_vectors, dim=1, eps=1e-6)
@@ -531,26 +694,74 @@ def compute_geology_similarity_loss(latent_vectors, metadata_batch, metadata_key
     # by matching pairwise cosine-similarity structure in latent vs metadata space.
     latent_sim = torch.clamp(latent_norm @ latent_norm.transpose(0, 1), -1.0, 1.0)
     target_sim = torch.clamp(target_norm @ target_norm.transpose(0, 1), -1.0, 1.0)
-    loss = F.mse_loss(latent_sim, target_sim)
+
+    pair_mask = torch.ones(
+        (int(latent_vectors.shape[0]), int(latent_vectors.shape[0])),
+        dtype=torch.bool,
+        device=latent_vectors.device,
+    )
+    if offdiag_only:
+        pair_mask = torch.triu(pair_mask, diagonal=1)
+    if has_selected is not None:
+        pair_mask = pair_mask & has_selected.unsqueeze(1) & has_selected.unsqueeze(0)
+    if int(pair_mask.sum().item()) < 1:
+        return latent_vectors.new_zeros(())
+
+    diff = latent_sim[pair_mask] - target_sim[pair_mask]
+    if loss_type == 'mse':
+        loss = torch.mean(diff.square())
+    elif loss_type == 'huber':
+        loss = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=float(huber_delta), reduction='mean')
+    else:
+        raise ValueError("loss_type must be one of: 'mse', 'huber'.")
     if not torch.isfinite(loss):
         return latent_vectors.new_zeros(())
     return loss
 
 
-def compute_latent_geology_diagnostics(latent_vectors, metadata_vectors, neighbor_k=5, tail_fraction=0.10):
+def compute_latent_geology_diagnostics(
+    latent_vectors,
+    metadata_vectors,
+    neighbor_k=5,
+    tail_fraction=0.10,
+    neighbor_ks: Optional[Sequence[int]] = None,
+    has_selected_geology: Optional[torch.Tensor] = None,
+):
     if latent_vectors.ndim != 2 or metadata_vectors.ndim != 2:
         raise ValueError('latent_vectors and metadata_vectors must both be 2D.')
     if latent_vectors.shape[0] != metadata_vectors.shape[0]:
         raise ValueError('latent_vectors and metadata_vectors must have the same number of samples.')
+
+    if has_selected_geology is not None:
+        if has_selected_geology.ndim != 1 or int(has_selected_geology.shape[0]) != int(latent_vectors.shape[0]):
+            raise ValueError('has_selected_geology must be a 1D mask aligned with sample count.')
+        selected_mask = has_selected_geology.to(dtype=torch.bool, device=latent_vectors.device)
+        latent_vectors = latent_vectors[selected_mask]
+        metadata_vectors = metadata_vectors[selected_mask]
+
     sample_count = int(latent_vectors.shape[0])
+    ks_requested = list(neighbor_ks) if neighbor_ks is not None else [int(neighbor_k)]
+    if not ks_requested:
+        ks_requested = [int(neighbor_k)]
+    ks_requested = [int(max(1, v)) for v in ks_requested]
+    if int(neighbor_k) not in ks_requested:
+        ks_requested.insert(0, int(neighbor_k))
+
+    empty_neighbor_metrics = {
+        'neighbor_overlap': 0.0,
+    }
+    for k_value in ks_requested:
+        empty_neighbor_metrics[f'neighbor_overlap_at_{int(k_value)}'] = 0.0
+
     if sample_count < 3:
-        return {
+        metrics = {
             'pair_cosine_correlation': 0.0,
             'similar_latent_cosine': 0.0,
             'dissimilar_latent_cosine': 0.0,
             'cosine_separation': 0.0,
-            'neighbor_overlap': 0.0,
         }
+        metrics.update(empty_neighbor_metrics)
+        return metrics
     if not 0.0 < float(tail_fraction) < 0.5:
         raise ValueError('tail_fraction must be in (0, 0.5).')
 
@@ -580,22 +791,27 @@ def compute_latent_geology_diagnostics(latent_vectors, metadata_vectors, neighbo
     similar_latent_cosine = latent_pairs[metadata_pairs >= upper_threshold].mean()
     dissimilar_latent_cosine = latent_pairs[metadata_pairs <= lower_threshold].mean()
 
-    effective_k = min(max(1, int(neighbor_k)), sample_count - 1)
     diagonal_mask = torch.eye(sample_count, dtype=torch.bool, device=latent_vectors.device)
-    latent_neighbors = latent_similarity.masked_fill(diagonal_mask, float('-inf')).topk(effective_k, dim=1).indices
-    metadata_neighbors = metadata_similarity.masked_fill(diagonal_mask, float('-inf')).topk(effective_k, dim=1).indices
-    neighbor_overlap = (
-        (latent_neighbors.unsqueeze(2) == metadata_neighbors.unsqueeze(1)).any(dim=2).float().sum(dim=1)
-        / float(effective_k)
-    ).mean()
+    neighbor_metrics = {}
+    for raw_k in ks_requested:
+        effective_k = min(max(1, int(raw_k)), sample_count - 1)
+        latent_neighbors = latent_similarity.masked_fill(diagonal_mask, float('-inf')).topk(effective_k, dim=1).indices
+        metadata_neighbors = metadata_similarity.masked_fill(diagonal_mask, float('-inf')).topk(effective_k, dim=1).indices
+        overlap = (
+            (latent_neighbors.unsqueeze(2) == metadata_neighbors.unsqueeze(1)).any(dim=2).float().sum(dim=1)
+            / float(effective_k)
+        ).mean()
+        neighbor_metrics[f'neighbor_overlap_at_{int(raw_k)}'] = float(overlap.item())
 
-    return {
+    metrics = {
         'pair_cosine_correlation': float(correlation.item()),
         'similar_latent_cosine': float(similar_latent_cosine.item()),
         'dissimilar_latent_cosine': float(dissimilar_latent_cosine.item()),
         'cosine_separation': float((similar_latent_cosine - dissimilar_latent_cosine).item()),
-        'neighbor_overlap': float(neighbor_overlap.item()),
+        'neighbor_overlap': float(neighbor_metrics.get(f'neighbor_overlap_at_{int(neighbor_k)}', 0.0)),
     }
+    metrics.update(neighbor_metrics)
+    return metrics
 
 
 def compute_vae_losses(
@@ -612,6 +828,12 @@ def compute_vae_losses(
     geology_metadata_keys=None,
     geology_loss_weight=0.0,
     latent_vectors=None,
+    geology_metadata_calibration=None,
+    geology_background_threshold=1e-6,
+    geology_background_key_indices=(),
+    geology_loss_type='mse',
+    geology_huber_delta=0.1,
+    geology_offdiag_only=True,
 ):
     if deep_supervision_loss is not None:
         rec_loss = deep_supervision_loss(recon, targets)
@@ -627,7 +849,17 @@ def compute_vae_losses(
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / targets.numel()
     geology_loss = rec_loss.new_zeros(())
     if geology_loss_weight > 0.0 and geology_metadata_batch is not None and geology_metadata_keys and latent_vectors is not None:
-        geology_loss = compute_geology_similarity_loss(latent_vectors, geology_metadata_batch, geology_metadata_keys)
+        geology_loss = compute_geology_similarity_loss(
+            latent_vectors,
+            geology_metadata_batch,
+            geology_metadata_keys,
+            geology_metadata_calibration=geology_metadata_calibration,
+            background_threshold=geology_background_threshold,
+            background_key_indices=geology_background_key_indices,
+            loss_type=geology_loss_type,
+            huber_delta=geology_huber_delta,
+            offdiag_only=geology_offdiag_only,
+        )
     loss = rec_loss + (float(lpips_weight) * lpips_loss) + kl_weight * kld + float(geology_loss_weight) * geology_loss
     return loss, rec_loss, kld, lpips_loss, geology_loss
 
@@ -678,7 +910,7 @@ def compute_average_loss(
         raise ValueError('steps must be a positive integer.')
     model.eval()
     total_loss = 0.0
-    batch_iter = itertools.cycle(dataloader)
+    batch_iter = iter(dataloader)
     with torch.no_grad():
         for _ in range(steps):
             inputs, targets = next(batch_iter)
@@ -817,6 +1049,9 @@ METRICS_CSV_COLUMNS = [
     'val_geo_latent_cosine_corr',
     'val_geo_latent_cosine_gap',
     'val_geo_neighbor_overlap',
+    'val_geo_neighbor_overlap_at_5',
+    'val_geo_neighbor_overlap_at_10',
+    'val_geo_neighbor_overlap_at_20',
     'best_model',
 ]
 
@@ -852,7 +1087,7 @@ def clamp_float(value, lower, upper):
     return max(lower, min(upper, value))
 
 
-def build_checkpoint_payload(model, epoch=None):
+def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=None):
     payload = {
         'model_state_dict': model.state_dict(),
         'patch_shape': [int(v) for v in model.patch_shape],
@@ -862,6 +1097,8 @@ def build_checkpoint_payload(model, epoch=None):
     }
     if epoch is not None:
         payload['epoch'] = int(epoch)
+    if geology_metadata_calibration is not None:
+        payload['geology_metadata_calibration'] = geology_metadata_calibration
     return payload
 
 
@@ -1292,6 +1529,12 @@ def train_one_epoch(
     deep_supervision_weights=None,
     geology_metadata_keys=(),
     geology_loss_weight=0.0,
+    geology_metadata_calibration=None,
+    geology_background_threshold=1e-6,
+    geology_background_key_indices=(),
+    geology_loss_type='mse',
+    geology_huber_delta=0.1,
+    geology_offdiag_only=True,
 ):
     if steps_per_epoch is None:
         raise ValueError('steps_per_epoch must be provided for train_one_epoch.')
@@ -1310,7 +1553,11 @@ def train_one_epoch(
 
     last_snapshot = None
     for _ in range(steps_per_epoch):
-        batch = next(batch_iter)
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            batch_iter = iter(dataloader)
+            batch = next(batch_iter)
         geology_metadata_batch = None
         if isinstance(batch, (list, tuple)) and len(batch) == 3:
             inputs, targets, geology_metadata_batch = batch
@@ -1353,6 +1600,12 @@ def train_one_epoch(
                 geology_metadata_keys=geology_metadata_keys,
                 geology_loss_weight=geology_loss_weight,
                 latent_vectors=mu,
+                geology_metadata_calibration=geology_metadata_calibration,
+                geology_background_threshold=geology_background_threshold,
+                geology_background_key_indices=geology_background_key_indices,
+                geology_loss_type=geology_loss_type,
+                geology_huber_delta=geology_huber_delta,
+                geology_offdiag_only=geology_offdiag_only,
             )
         else:
             recon, mu, logvar = model(inputs)
@@ -1369,6 +1622,12 @@ def train_one_epoch(
                 geology_metadata_keys=geology_metadata_keys,
                 geology_loss_weight=geology_loss_weight,
                 latent_vectors=mu,
+                geology_metadata_calibration=geology_metadata_calibration,
+                geology_background_threshold=geology_background_threshold,
+                geology_background_key_indices=geology_background_key_indices,
+                geology_loss_type=geology_loss_type,
+                geology_huber_delta=geology_huber_delta,
+                geology_offdiag_only=geology_offdiag_only,
             )
 
         g_gan_loss_value = 0.0
@@ -1459,7 +1718,13 @@ def discover_model_data_volumes(root_path):
 
 def build_dataset(args, data_path, augment=False):
     geology_keys = tuple(str(v) for v in (args.geology_metadata_keys or ()))
-    include_metadata = bool(args.geology_loss_weight > 0.0 and len(geology_keys) > 0)
+    include_metadata = bool(
+        len(geology_keys) > 0
+        and (
+            args.geology_loss_weight > 0.0
+            or bool(getattr(args, 'geology_batch_sampler', False))
+        )
+    )
     return ZarrPatchDataset(
         data_path,
         scaling=args.input_scaling,
@@ -1485,7 +1750,60 @@ def build_dataset(args, data_path, augment=False):
     )
 
 
-def build_train_dataloader(dataset, args, sample_weights=None):
+def build_train_dataloader(
+    dataset,
+    args,
+    sample_weights=None,
+    geology_metadata_calibration=None,
+    geology_background_key_indices=(),
+):
+    if bool(getattr(args, 'geology_batch_sampler', False)):
+        if not getattr(dataset, 'include_metadata', False):
+            raise ValueError('geology_batch_sampler requires metadata-enabled training dataset.')
+
+        metadata_keys = tuple(str(v) for v in getattr(dataset, 'geology_metadata_keys', ()))
+        metadata_dict = {
+            key: np.asarray(dataset._metadata_arrays[key][:], dtype=np.float64)
+            for key in metadata_keys
+        }
+        metadata_matrix = _metadata_batch_to_matrix(metadata_dict, metadata_keys)
+        metadata_vectors, _ = prepare_geology_metadata_vectors(
+            metadata_dict,
+            metadata_keys,
+            device='cpu',
+            dtype=torch.float32,
+            geology_metadata_calibration=geology_metadata_calibration,
+            background_threshold=float(args.geology_background_threshold),
+            background_key_indices=geology_background_key_indices,
+        )
+        strata = build_multilabel_strata(
+            metadata_vectors.detach().cpu().numpy(),
+            metadata_keys,
+            threshold=float(args.geology_strata_presence_threshold),
+            active_key_indices=geology_background_key_indices,
+            max_active_keys_per_stratum=int(args.geology_strata_max_active_keys),
+        )
+
+        if args.number_batches is not None:
+            num_batches = int(args.number_batches)
+        else:
+            num_batches = int(math.ceil(len(dataset) / float(max(1, int(args.batch_size)))))
+
+        sampler = GeologyAwareBatchSampler(
+            strata_labels=strata.labels,
+            batch_size=int(args.batch_size),
+            num_batches=num_batches,
+            seed=int(args.seed),
+            sample_weights=np.asarray(sample_weights, dtype=np.float64) if sample_weights is not None else None,
+            background_fraction=float(args.geology_batch_background_fraction),
+            hard_fraction=float(args.geology_batch_hard_fraction),
+            hard_top_quantile=float(args.geology_batch_hard_top_quantile),
+            min_negative_strata=int(args.geology_batch_min_negative_strata),
+            require_positive_pair=bool(args.geology_batch_require_positive_pair),
+            allow_duplicates=bool(args.geology_batch_allow_duplicates),
+        )
+        return DataLoader(dataset, batch_sampler=sampler, num_workers=2)
+
     if sample_weights is None:
         return DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
@@ -1621,7 +1939,17 @@ def infer_completed_epochs_from_resume_path(path):
     return int(match.group(1))
 
 
-def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=None, rec_loss_fn=None, lpips_loss_fn=None):
+def validate(
+    model,
+    args,
+    device,
+    train_steps_per_epoch,
+    deep_supervision_loss=None,
+    rec_loss_fn=None,
+    lpips_loss_fn=None,
+    geology_metadata_calibration=None,
+    geology_background_key_indices=(),
+):
     validation_extrema_mode = None if args.validation_extrema_only else False
     validation_ds = ZarrPatchDataset(
         args.validation_data,
@@ -1659,6 +1987,7 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
     last_snapshot = None
     diagnostic_latents = []
     diagnostic_metadata = []
+    diagnostic_has_selected = []
     diagnostic_max_samples = max(3, int(args.geology_diagnostic_max_samples))
     with torch.no_grad():
         for _ in range(validation_steps):
@@ -1687,6 +2016,12 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     geology_metadata_keys=args.geology_metadata_keys,
                     geology_loss_weight=float(args.geology_loss_weight),
                     latent_vectors=mu,
+                    geology_metadata_calibration=geology_metadata_calibration,
+                    geology_background_threshold=float(args.geology_background_threshold),
+                    geology_background_key_indices=geology_background_key_indices,
+                    geology_loss_type=str(args.geology_loss_type),
+                    geology_huber_delta=float(args.geology_huber_delta),
+                    geology_offdiag_only=bool(args.geology_offdiag_only),
                 )
             else:
                 recon, mu, logvar = model(inputs)
@@ -1703,6 +2038,12 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     geology_metadata_keys=args.geology_metadata_keys,
                     geology_loss_weight=float(args.geology_loss_weight),
                     latent_vectors=mu,
+                    geology_metadata_calibration=geology_metadata_calibration,
+                    geology_background_threshold=float(args.geology_background_threshold),
+                    geology_background_key_indices=geology_background_key_indices,
+                    geology_loss_type=str(args.geology_loss_type),
+                    geology_huber_delta=float(args.geology_huber_delta),
+                    geology_offdiag_only=bool(args.geology_offdiag_only),
                 )
             total_loss += float(loss.item())
             total_lpips_loss += float(lpips_loss.item())
@@ -1717,18 +2058,21 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
                     torch.from_numpy(diagnostic_inputs[:, np.newaxis]).to(device)
                 )
                 diagnostic_latents.append(diagnostic_mu.detach().cpu())
-                diagnostic_metadata.append(
-                    torch.as_tensor(
-                        np.stack([
-                            _normalize_metadata_vector([
-                                float(geology_metadata_batch[key][idx])
-                                for key in args.geology_metadata_keys
-                            ])
-                            for idx in range(diagnostic_batch_size)
-                        ]),
-                        dtype=torch.float32,
-                    )
+                diagnostic_batch = {
+                    key: (value[:diagnostic_batch_size] if isinstance(value, torch.Tensor) else np.asarray(value)[:diagnostic_batch_size])
+                    for key, value in geology_metadata_batch.items()
+                }
+                metadata_vectors, has_selected = prepare_geology_metadata_vectors(
+                    diagnostic_batch,
+                    args.geology_metadata_keys,
+                    device='cpu',
+                    dtype=torch.float32,
+                    geology_metadata_calibration=geology_metadata_calibration,
+                    background_threshold=float(args.geology_background_threshold),
+                    background_key_indices=geology_background_key_indices,
                 )
+                diagnostic_metadata.append(metadata_vectors)
+                diagnostic_has_selected.append(has_selected)
             if args.deep_supervision:
                 if ds_outputs is None:
                     raise ValueError('deep supervision outputs are required when deep supervision is enabled.')
@@ -1756,10 +2100,13 @@ def validate(model, args, device, train_steps_per_epoch, deep_supervision_loss=N
     if diagnostic_latents:
         latent_values = torch.cat(diagnostic_latents, dim=0)[:diagnostic_max_samples]
         metadata_values = torch.cat(diagnostic_metadata, dim=0)[:diagnostic_max_samples]
+        selected_values = torch.cat(diagnostic_has_selected, dim=0)[:diagnostic_max_samples] if diagnostic_has_selected else None
         geology_diagnostics = compute_latent_geology_diagnostics(
             latent_values,
             metadata_values,
             neighbor_k=args.geology_diagnostic_neighbor_k,
+            neighbor_ks=args.geology_diagnostic_topk,
+            has_selected_geology=selected_values,
         )
     return total_loss / validation_steps, total_lpips_loss / validation_steps, last_snapshot, geology_diagnostics
 
@@ -1773,9 +2120,49 @@ def train(args):
         raise ValueError('--geology_diagnostic_max_samples must be at least 3.')
     if args.geology_diagnostic_neighbor_k < 1:
         raise ValueError('--geology_diagnostic_neighbor_k must be positive.')
+    if args.geology_huber_delta <= 0.0:
+        raise ValueError('--geology_huber_delta must be positive.')
+    if args.geology_background_threshold < 0.0:
+        raise ValueError('--geology_background_threshold must be non-negative.')
+    if not args.geology_diagnostic_topk:
+        raise ValueError('--geology_diagnostic_topk must contain at least one value.')
+    if any(int(v) <= 0 for v in args.geology_diagnostic_topk):
+        raise ValueError('--geology_diagnostic_topk values must be positive integers.')
+    if not 0.0 <= float(args.geology_batch_background_fraction) <= 1.0:
+        raise ValueError('--geology_batch_background_fraction must be in [0, 1].')
+    if not 0.0 <= float(args.geology_batch_hard_fraction) <= 1.0:
+        raise ValueError('--geology_batch_hard_fraction must be in [0, 1].')
+    if not 0.0 < float(args.geology_batch_hard_top_quantile) <= 1.0:
+        raise ValueError('--geology_batch_hard_top_quantile must be in (0, 1].')
+    if int(args.geology_batch_min_negative_strata) < 1:
+        raise ValueError('--geology_batch_min_negative_strata must be >= 1.')
+    if int(args.geology_strata_max_active_keys) < 1:
+        raise ValueError('--geology_strata_max_active_keys must be >= 1.')
 
     ds = build_dataset(args, args.data, augment=args.augment)
     args.patch_size_xyz = resolve_patch_size_xyz(args.patch_size, ds.patch_shape)
+    args.geology_diagnostic_topk = [int(v) for v in args.geology_diagnostic_topk]
+    if int(args.geology_diagnostic_neighbor_k) not in args.geology_diagnostic_topk:
+        args.geology_diagnostic_topk.insert(0, int(args.geology_diagnostic_neighbor_k))
+
+    geology_metadata_calibration = None
+    geology_background_key_indices = ()
+    if bool((args.geology_loss_weight > 0.0 or bool(getattr(args, 'geology_batch_sampler', False))) and len(args.geology_metadata_keys) > 0):
+        geology_metadata_calibration = fit_geology_metadata_calibration(
+            ds,
+            args.geology_metadata_keys,
+            strategy=str(args.geology_calibration_strategy),
+            eps=float(args.geology_calibration_eps),
+            clip=float(args.geology_calibration_clip),
+            background_keys=args.geology_background_keys,
+        )
+        geology_background_key_indices = resolve_background_key_indices(
+            args.geology_metadata_keys,
+            args.geology_background_keys,
+        )
+        calibration_path = Path(args.out_dir) / args.geology_calibration_filename
+        torch.save(geology_metadata_calibration, calibration_path)
+        print(f'Geology metadata calibration saved: {calibration_path}')
     if args.adaptive_sampling_by_mse and args.sampling_snapshot_interval <= 0:
         raise ValueError('--sampling_snapshot_interval must be a positive integer when adaptive sampling is enabled.')
     if args.sampling_improvement_window < 2:
@@ -1802,7 +2189,13 @@ def train(args):
             f"snapshot_file={adaptive_snapshot_path}",
         )
 
-    dl = build_train_dataloader(ds, args, sample_weights=adaptive_sample_weights)
+    dl = build_train_dataloader(
+        ds,
+        args,
+        sample_weights=adaptive_sample_weights,
+        geology_metadata_calibration=geology_metadata_calibration,
+        geology_background_key_indices=geology_background_key_indices,
+    )
 
     if args.number_batches is not None and args.number_batches <= 0:
         raise ValueError('--number_batches must be a positive integer when provided.')
@@ -1892,6 +2285,9 @@ def train(args):
                 f'invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}'
             )
         checkpoint_epoch = checkpoint.get('epoch', None)
+        if isinstance(checkpoint.get('geology_metadata_calibration', None), dict):
+            geology_metadata_calibration = checkpoint['geology_metadata_calibration']
+            print('Loaded geology metadata calibration from resume checkpoint.')
         if args.resume_epoch is not None:
             resume_completed_epochs = int(args.resume_epoch)
             print(f"Overriding resume epoch numbering with --resume_epoch={resume_completed_epochs}")
@@ -2140,6 +2536,11 @@ def train(args):
             epoch_idx = resume_completed_epochs + epoch_offset
             epoch_number = epoch_idx + 1
 
+            batch_sampler = getattr(dl, 'batch_sampler', None)
+            set_epoch_fn = getattr(batch_sampler, 'set_epoch', None)
+            if callable(set_epoch_fn):
+                set_epoch_fn(epoch_idx)
+
             kl_weight = get_kl_weight(epoch_idx, args)
             args.current_kl_weight = kl_weight
             gan_weight_for_epoch = current_gan_weight
@@ -2172,6 +2573,12 @@ def train(args):
                 deep_supervision_weights=args.deep_supervision_weights,
                 geology_metadata_keys=tuple(str(v) for v in args.geology_metadata_keys),
                 geology_loss_weight=float(args.geology_loss_weight),
+                geology_metadata_calibration=geology_metadata_calibration,
+                geology_background_threshold=float(args.geology_background_threshold),
+                geology_background_key_indices=geology_background_key_indices,
+                geology_loss_type=str(args.geology_loss_type),
+                geology_huber_delta=float(args.geology_huber_delta),
+                geology_offdiag_only=bool(args.geology_offdiag_only),
             )
             val_loss, val_lpips_loss, val_last_snapshot, geology_diagnostics = validate(
                 model,
@@ -2181,6 +2588,8 @@ def train(args):
                 deep_supervision_loss=deep_supervision_loss,
                 rec_loss_fn=rec_loss_fn,
                 lpips_loss_fn=lpips_loss_fn,
+                geology_metadata_calibration=geology_metadata_calibration,
+                geology_background_key_indices=geology_background_key_indices,
             )
             examples_this_epoch = samples_per_epoch
             cumulative_examples = epoch_number * samples_per_epoch
@@ -2204,10 +2613,24 @@ def train(args):
 
             improved = update_early_stopping(early_stopping, val_loss, args.early_stopping_min_delta)
             if improved:
-                torch.save(build_checkpoint_payload(model, epoch=epoch_number), best_ckpt_path)
+                torch.save(
+                    build_checkpoint_payload(
+                        model,
+                        epoch=epoch_number,
+                        geology_metadata_calibration=geology_metadata_calibration,
+                    ),
+                    best_ckpt_path,
+                )
 
             if args.save_epoch_checkpoints:
-                torch.save(build_checkpoint_payload(model, epoch=epoch_number), Path(args.out_dir)/f"vae_epoch{epoch_number}.pt")
+                torch.save(
+                    build_checkpoint_payload(
+                        model,
+                        epoch=epoch_number,
+                        geology_metadata_calibration=geology_metadata_calibration,
+                    ),
+                    Path(args.out_dir)/f"vae_epoch{epoch_number}.pt",
+                )
 
             current_lr = opt.param_groups[0]['lr']
             current_disc_lr = disc_opt.param_groups[0]['lr'] if disc_opt is not None else float('nan')
@@ -2222,6 +2645,13 @@ def train(args):
                 writer.add_scalar('validation/geology_latent_dissimilar_cosine', geology_diagnostics['dissimilar_latent_cosine'], epoch_number)
                 writer.add_scalar('validation/geology_latent_cosine_separation', geology_diagnostics['cosine_separation'], epoch_number)
                 writer.add_scalar('validation/geology_latent_neighbor_overlap', geology_diagnostics['neighbor_overlap'], epoch_number)
+                for k_value in args.geology_diagnostic_topk:
+                    metric_key = f'neighbor_overlap_at_{int(k_value)}'
+                    writer.add_scalar(
+                        f'validation/geology_latent_{metric_key}',
+                        float(geology_diagnostics.get(metric_key, 0.0)),
+                        epoch_number,
+                    )
             writer.add_scalar('train/lr', float(current_lr), epoch_number)
             writer.add_scalar('train/gan_weight', float(gan_weight_for_epoch), epoch_number)
             writer.add_scalar('train/kl_weight', float(kl_weight), epoch_number)
@@ -2230,6 +2660,18 @@ def train(args):
             writer.add_scalar('train/d_gan_lr', float(current_disc_lr), epoch_number)
             writer.add_scalar('train/encoder_lr', float(get_named_group_lr(opt, 'encoder', current_lr)), epoch_number)
             writer.add_scalar('train/decoder_lr', float(get_named_group_lr(opt, 'decoder', current_lr)), epoch_number)
+            batch_sampler = getattr(dl, 'batch_sampler', None)
+            get_sampler_stats_fn = getattr(batch_sampler, 'get_last_epoch_stats', None)
+            if callable(get_sampler_stats_fn):
+                sampler_stats_raw = get_sampler_stats_fn()
+                sampler_stats = sampler_stats_raw if isinstance(sampler_stats_raw, dict) else {}
+                writer.add_scalar('sampling/positive_pair_batch_rate', float(sampler_stats.get('positive_pair_batch_rate', 0.0)), epoch_number)
+                writer.add_scalar('sampling/negative_strata_batch_rate', float(sampler_stats.get('negative_strata_batch_rate', 0.0)), epoch_number)
+                writer.add_scalar('sampling/avg_unique_strata_per_batch', float(sampler_stats.get('avg_unique_strata_per_batch', 0.0)), epoch_number)
+                writer.add_scalar('sampling/fallback_positive_pair_count', float(sampler_stats.get('fallback_positive_pair_count', 0.0)), epoch_number)
+                writer.add_scalar('sampling/fallback_duplicate_fill_count', float(sampler_stats.get('fallback_duplicate_fill_count', 0.0)), epoch_number)
+                writer.add_scalar('sampling/background_fraction_achieved', float(sampler_stats.get('background_fraction_achieved', 0.0)), epoch_number)
+                writer.add_scalar('sampling/hard_fraction_achieved', float(sampler_stats.get('hard_fraction_achieved', 0.0)), epoch_number)
 
             if args.adaptive_sampling_by_mse and epoch_number % args.sampling_snapshot_interval == 0:
                 snapshot_recon = compute_full_dataset_recon_snapshot(
@@ -2258,7 +2700,13 @@ def train(args):
                     }
                 )
                 save_adaptive_sampling_snapshots(adaptive_snapshot_path, adaptive_snapshot_records)
-                dl = build_train_dataloader(ds, args, sample_weights=adaptive_sample_weights)
+                dl = build_train_dataloader(
+                    ds,
+                    args,
+                    sample_weights=adaptive_sample_weights,
+                    geology_metadata_calibration=geology_metadata_calibration,
+                    geology_background_key_indices=geology_background_key_indices,
+                )
 
                 writer.add_scalar('adaptive_sampling/recon_mean', float(np.mean(snapshot_recon)), epoch_number)
                 writer.add_scalar('adaptive_sampling/improvement_mean', float(np.mean(avg_improvement)), epoch_number)
@@ -2330,6 +2778,9 @@ def train(args):
                 f"{geology_diagnostics['pair_cosine_correlation']:.6f}" if geology_diagnostics is not None else '',
                 f"{geology_diagnostics['cosine_separation']:.6f}" if geology_diagnostics is not None else '',
                 f"{geology_diagnostics['neighbor_overlap']:.6f}" if geology_diagnostics is not None else '',
+                f"{geology_diagnostics.get('neighbor_overlap_at_5', 0.0):.6f}" if geology_diagnostics is not None else '',
+                f"{geology_diagnostics.get('neighbor_overlap_at_10', 0.0):.6f}" if geology_diagnostics is not None else '',
+                f"{geology_diagnostics.get('neighbor_overlap_at_20', 0.0):.6f}" if geology_diagnostics is not None else '',
                 'best' if improved else '',
             ])
             csv_file.flush()
@@ -2377,7 +2828,25 @@ def train(args):
                     f"similar_cos={geology_diagnostics['similar_latent_cosine']:.4f} "
                     f"dissimilar_cos={geology_diagnostics['dissimilar_latent_cosine']:.4f} "
                     f"gap={geology_diagnostics['cosine_separation']:.4f} "
-                    f"neighbor_overlap@{args.geology_diagnostic_neighbor_k}={geology_diagnostics['neighbor_overlap']:.4f}"
+                    f"neighbor_overlap@{args.geology_diagnostic_neighbor_k}={geology_diagnostics['neighbor_overlap']:.4f} "
+                    f"n@5={geology_diagnostics.get('neighbor_overlap_at_5', 0.0):.4f} "
+                    f"n@10={geology_diagnostics.get('neighbor_overlap_at_10', 0.0):.4f} "
+                    f"n@20={geology_diagnostics.get('neighbor_overlap_at_20', 0.0):.4f}"
+                )
+            batch_sampler = getattr(dl, 'batch_sampler', None)
+            get_sampler_stats_fn = getattr(batch_sampler, 'get_last_epoch_stats', None)
+            if callable(get_sampler_stats_fn):
+                sampler_stats_raw = get_sampler_stats_fn()
+                sampler_stats = sampler_stats_raw if isinstance(sampler_stats_raw, dict) else {}
+                print(
+                    "  Geology sampler: "
+                    f"pos_batch_rate={sampler_stats.get('positive_pair_batch_rate', 0.0):.3f} "
+                    f"neg_batch_rate={sampler_stats.get('negative_strata_batch_rate', 0.0):.3f} "
+                    f"unique_strata={sampler_stats.get('avg_unique_strata_per_batch', 0.0):.2f} "
+                    f"bg_frac={sampler_stats.get('background_fraction_achieved', 0.0):.3f} "
+                    f"hard_frac={sampler_stats.get('hard_fraction_achieved', 0.0):.3f} "
+                    f"fallback_pos={sampler_stats.get('fallback_positive_pair_count', 0.0):.0f} "
+                    f"fallback_dup={sampler_stats.get('fallback_duplicate_fill_count', 0.0):.0f}"
                 )
 
             if early_stopping.epochs_without_improvement >= args.early_stopping_patience:
@@ -2437,8 +2906,31 @@ if __name__ == '__main__':
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
     p.add_argument('--residual_encoder', action='store_true', help='Use the residual encoder variant while keeping the external latent contract unchanged.')
     p.add_argument('--geology_loss_weight', type=float, default=0.0, help='Weight for metadata-to-latent geology similarity loss. Set >0 to enable geology-aware latent shaping.')
+    p.add_argument('--geology_loss_type', type=str, default='mse', choices=['mse', 'huber'], help='Pairwise geology-similarity regression loss type for latent-vs-metadata geometry.')
+    p.add_argument('--geology_huber_delta', type=float, default=0.1, help='Huber delta for geology loss when --geology_loss_type huber.')
+    p.add_argument('--geology_offdiag_only', dest='geology_offdiag_only', action='store_true', help='Exclude similarity-matrix diagonal in geology loss (recommended).')
+    p.add_argument('--no_geology_offdiag_only', dest='geology_offdiag_only', action='store_false', help='Include similarity-matrix diagonal in geology loss.')
+    p.set_defaults(geology_offdiag_only=True)
+    p.add_argument('--geology_calibration_strategy', type=str, default='robust_log1p', choices=['none', 'robust_log1p'], help='Training-split metadata calibration applied before geology cosine targets.')
+    p.add_argument('--geology_calibration_eps', type=float, default=1e-6, help='Numerical epsilon for geology metadata calibration stability.')
+    p.add_argument('--geology_calibration_clip', type=float, default=6.0, help='Absolute clip applied after calibration standardization; <=0 disables clipping.')
+    p.add_argument('--geology_calibration_filename', type=str, default='geology_metadata_calibration.pt', help='Output calibration artifact filename under --out_dir.')
+    p.add_argument('--geology_background_threshold', type=float, default=1e-6, help='Raw metadata threshold used to classify selected geology vs neutral background.')
+    p.add_argument('--geology_background_keys', nargs='+', default=list(DEFAULT_BACKGROUND_METADATA_KEYS), help='Metadata keys used to decide has-selected-geology mask for pair filtering.')
     p.add_argument('--geology_diagnostic_max_samples', type=int, default=512, help='Maximum validation patches used for latent/geology cosine diagnostics each epoch.')
     p.add_argument('--geology_diagnostic_neighbor_k', type=int, default=5, help='Neighbor count for validation latent/geology top-k overlap.')
+    p.add_argument('--geology_diagnostic_topk', type=int, nargs='+', default=[5, 10, 20], help='Neighbor-overlap k values reported during latent geology diagnostics.')
+    p.add_argument('--geology_batch_sampler', action='store_true', help='Enable geology-aware constrained batch sampling (Phase 2).')
+    p.add_argument('--geology_strata_presence_threshold', type=float, default=1e-4, help='Presence threshold on calibrated metadata features for stratum assignment.')
+    p.add_argument('--geology_strata_max_active_keys', type=int, default=2, help='Maximum active geology feature keys retained in multi-label stratum signatures.')
+    p.add_argument('--geology_batch_background_fraction', type=float, default=0.20, help='Target fraction of neutral/background examples in each geology-aware batch.')
+    p.add_argument('--geology_batch_hard_fraction', type=float, default=0.20, help='Target fraction of reconstruction-hard examples in each geology-aware batch.')
+    p.add_argument('--geology_batch_hard_top_quantile', type=float, default=0.20, help='Top quantile of adaptive score weights considered hard examples.')
+    p.add_argument('--geology_batch_min_negative_strata', type=int, default=2, help='Minimum distinct non-anchor strata sampled as negatives per batch when available.')
+    p.add_argument('--geology_batch_require_positive_pair', dest='geology_batch_require_positive_pair', action='store_true', help='Require sampling a same-stratum positive pair in each geology-aware batch when feasible.')
+    p.add_argument('--no_geology_batch_require_positive_pair', dest='geology_batch_require_positive_pair', action='store_false', help='Disable required positive-pair constraint in geology-aware batches.')
+    p.set_defaults(geology_batch_require_positive_pair=True)
+    p.add_argument('--geology_batch_allow_duplicates', action='store_true', help='Allow duplicate dataset indices within a geology-aware batch if constraints are otherwise infeasible.')
     p.add_argument(
         '--geology_metadata_keys',
         nargs='+',
