@@ -59,22 +59,28 @@ class VaeLatentAdapter:
         self.patch_shape = tuple(int(v) for v in checkpoint["patch_shape"])
         self.latent_dim = int(checkpoint["latent_dim"])
         self.base_ch = int(checkpoint["base_ch"])
+        self.geology_projection = bool(checkpoint.get("geology_projection", False))
+        self.geology_proj_hidden = int(checkpoint.get("geology_proj_hidden", 128))
+        self.geology_proj_dim = int(checkpoint.get("geology_proj_dim", 64))
         self.model = VAE3D(
             in_ch=1,
             out_ch=1,
             base_ch=self.base_ch,
             latent_dim=self.latent_dim,
             patch_shape=self.patch_shape,
+            geology_projection=self.geology_projection,
+            geology_proj_hidden=self.geology_proj_hidden,
+            geology_proj_dim=self.geology_proj_dim,
         )
         state_dict = checkpoint["model_state_dict"]
         load_result = self.model.load_state_dict(state_dict, strict=False)
         invalid_missing = [
             k for k in load_result.missing_keys
-            if not k.startswith("decoder.aux_head_")
+            if not (k.startswith("decoder.aux_head_") or k.startswith("geology_head."))
         ]
         invalid_unexpected = [
             k for k in load_result.unexpected_keys
-            if not k.startswith("decoder.aux_head_")
+            if not (k.startswith("decoder.aux_head_") or k.startswith("geology_head."))
         ]
         if invalid_missing or invalid_unexpected:
             raise ValueError(
@@ -102,6 +108,32 @@ class VaeLatentAdapter:
                 f"expected cube shape ({self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}"
             )
         out = self.encode_batch(arr[None, ...])
+        return np.ascontiguousarray(out[0], dtype=np.float32)
+
+    @torch.inference_mode()
+    def encode_geo_batch(self, cubes: np.ndarray) -> np.ndarray:
+        """Return unit-norm geology embeddings (z_geo) for a batch of cubes.
+
+        Uses the trained projection head when present; otherwise falls back to
+        L2-normalized mu so callers always receive comparable unit-norm vectors.
+        """
+        arr = np.asarray(cubes, dtype=np.float32)
+        if arr.ndim != 4 or arr.shape[1:] != self.patch_shape:
+            raise ValueError(f"expected cubes shape (B,{self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}")
+
+        batch = torch.from_numpy(arr[:, None, :, :, :]).to(self.device)
+        mu, _ = self.model.encoder(batch)
+        z_geo = self.model.encode_geo(mu)
+        return z_geo.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    @torch.inference_mode()
+    def encode_geo_cube(self, cube: np.ndarray) -> np.ndarray:
+        arr = np.asarray(cube, dtype=np.float32)
+        if arr.shape != self.patch_shape:
+            raise ValueError(
+                f"expected cube shape ({self.patch_shape[0]},{self.patch_shape[1]},{self.patch_shape[2]}), got {arr.shape}"
+            )
+        out = self.encode_geo_batch(arr[None, ...])
         return np.ascontiguousarray(out[0], dtype=np.float32)
 
     @torch.inference_mode()

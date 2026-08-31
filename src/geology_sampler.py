@@ -180,10 +180,17 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
 
     def __iter__(self) -> Iterable[list[int]]:
         rng = np.random.default_rng(self.seed + self.epoch)
-        hard_threshold = float(np.quantile(self.sample_weights, 1.0 - self.hard_top_quantile))
-        hard_indices = self._indices[self.sample_weights >= hard_threshold]
+        hard_count = max(1, int(math.ceil(float(self.sample_weights.size) * self.hard_top_quantile)))
+        hard_order = np.argsort(-self.sample_weights, kind="stable")
+        hard_indices = self._indices[hard_order[:hard_count]]
+        is_hard_mask = np.zeros((self._indices.shape[0],), dtype=bool)
+        is_hard_mask[hard_indices] = True
 
         background_label = 0
+        is_background_mask = self.strata_labels == background_label
+        non_background_pool = self._indices[~is_background_mask]
+        non_hard_pool = self._indices[~is_hard_mask]
+        non_background_non_hard_pool = self._indices[(~is_background_mask) & (~is_hard_mask)]
         non_background_labels = [int(v) for v in self._label_ids.tolist() if int(v) != background_label]
         positive_candidate_labels = [
             label for label in non_background_labels
@@ -202,6 +209,8 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
             batch: list[int] = []
             used: set[int] = set()
             strata_in_batch: set[int] = set()
+            background_count = 0
+            hard_count_in_batch = 0
 
             target_background = int(round(self.batch_size * self.background_fraction))
             target_hard = int(round(self.batch_size * self.hard_fraction))
@@ -218,6 +227,10 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
                     batch.append(chosen)
                     used.add(chosen)
                     strata_in_batch.add(int(self.strata_labels[chosen]))
+                    if is_background_mask[chosen]:
+                        background_count += 1
+                    if is_hard_mask[chosen]:
+                        hard_count_in_batch += 1
                 if len(batch) >= 2:
                     batches_with_positive_pair += 1
                 else:
@@ -235,6 +248,10 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
                 batch.append(chosen)
                 used.add(chosen)
                 strata_in_batch.add(int(self.strata_labels[chosen]))
+                if is_background_mask[chosen]:
+                    background_count += 1
+                if is_hard_mask[chosen]:
+                    hard_count_in_batch += 1
 
             available_negative_labels = [
                 label for label in non_background_labels
@@ -250,6 +267,10 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
                 batch.append(chosen)
                 used.add(chosen)
                 strata_in_batch.add(int(self.strata_labels[chosen]))
+                if is_background_mask[chosen]:
+                    background_count += 1
+                if is_hard_mask[chosen]:
+                    hard_count_in_batch += 1
 
             if len([s for s in strata_in_batch if s != background_label]) >= self.min_negative_strata:
                 batches_with_negative_strata += 1
@@ -261,19 +282,67 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
                 batch.append(chosen)
                 used.add(chosen)
                 strata_in_batch.add(int(self.strata_labels[chosen]))
+                if is_background_mask[chosen]:
+                    background_count += 1
+                if is_hard_mask[chosen]:
+                    hard_count_in_batch += 1
                 target_hard -= 1
 
             while len(batch) < self.batch_size:
-                chosen = self._draw_from_pool(rng, self._indices, used)
+                preferred_pools: list[np.ndarray] = []
+                if background_count >= target_background and hard_count_in_batch >= target_hard:
+                    preferred_pools = [
+                        non_background_non_hard_pool,
+                        non_background_pool,
+                        non_hard_pool,
+                        self._indices,
+                    ]
+                elif background_count >= target_background:
+                    preferred_pools = [
+                        non_background_pool,
+                        non_background_non_hard_pool,
+                        non_hard_pool,
+                        self._indices,
+                    ]
+                elif hard_count_in_batch >= target_hard:
+                    preferred_pools = [
+                        non_hard_pool,
+                        non_background_non_hard_pool,
+                        non_background_pool,
+                        self._indices,
+                    ]
+                else:
+                    preferred_pools = [
+                        non_background_non_hard_pool,
+                        non_background_pool,
+                        non_hard_pool,
+                        self._indices,
+                    ]
+
+                chosen = None
+                chosen_pool = self._indices
+                for pool in preferred_pools:
+                    if pool.size <= 0:
+                        continue
+                    chosen_pool = pool
+                    chosen = self._draw_from_pool(rng, pool, used)
+                    if chosen is not None:
+                        break
+
                 if chosen is None:
                     if not self.allow_duplicates:
                         fallback_duplicate_fill_count += 1
-                        chosen = int(rng.choice(self._indices, p=self._sample_prob))
+                        fallback_weights = _normalize_weights(self._sample_prob[chosen_pool])
+                        chosen = int(rng.choice(chosen_pool, p=fallback_weights))
                     else:
                         break
                 batch.append(chosen)
                 used.add(chosen)
                 strata_in_batch.add(int(self.strata_labels[chosen]))
+                if is_background_mask[chosen]:
+                    background_count += 1
+                if is_hard_mask[chosen]:
+                    hard_count_in_batch += 1
 
             batch_arr = np.asarray(batch, dtype=np.int64)
             batch_labels = self.strata_labels[batch_arr]

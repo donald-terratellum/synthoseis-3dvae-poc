@@ -181,6 +181,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260826, help="Seed used when creating a new manifest.")
     parser.add_argument("--device", type=str, default="auto", choices=("auto", "cpu", "mps", "cuda"))
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for tokenizer latent extraction.")
+    parser.add_argument("--use_geo_embedding", action="store_true", help="Score the geology projection embedding (z_geo) instead of raw mu. Requires a checkpoint trained with --geology_projection.")
     parser.add_argument("--metadata_keys", nargs="+", default=list(DEFAULT_DERIVED_METADATA_KEYS))
     parser.add_argument("--background_keys", nargs="+", default=list(DEFAULT_BACKGROUND_METADATA_KEYS))
     parser.add_argument("--background_threshold", type=float, default=1e-6)
@@ -251,12 +252,22 @@ def main() -> None:
     adapter = VaeLatentAdapter(args.checkpoint, device=args.device)
     selected_patches = patches[indices]
 
+    use_geo_embedding = bool(args.use_geo_embedding)
+    if use_geo_embedding and not getattr(adapter, "geology_projection", False):
+        raise ValueError(
+            "--use_geo_embedding requires a checkpoint trained with --geology_projection "
+            "(no projection head found in the checkpoint)."
+        )
+
     latent_parts = []
     for start in range(0, selected_patches.shape[0], int(args.batch_size)):
         stop = min(start + int(args.batch_size), selected_patches.shape[0])
         batch = selected_patches[start:stop]
         prepped = np.stack([preprocess_for_token(batch[i]) for i in range(batch.shape[0])], axis=0).astype(np.float32)
-        latents = adapter.encode_batch(prepped)
+        if use_geo_embedding:
+            latents = adapter.encode_geo_batch(prepped)
+        else:
+            latents = adapter.encode_batch(prepped)
         latent_parts.append(latents)
     latent_matrix = np.concatenate(latent_parts, axis=0).astype(np.float32, copy=False)
 
@@ -327,6 +338,7 @@ def main() -> None:
         "manifest": str(args.manifest),
         "manifest_seed": int(manifest.get("seed", args.seed)),
         "benchmark_size": int(indices.shape[0]),
+        "embedding_source": "z_geo" if use_geo_embedding else "mu",
         "metadata_keys": list(metadata_keys),
         "background_keys": list(args.background_keys),
         "background_threshold": float(args.background_threshold),

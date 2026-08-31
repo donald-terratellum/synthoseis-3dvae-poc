@@ -719,6 +719,96 @@ def compute_geology_similarity_loss(
     return loss
 
 
+def compute_batch_strata_labels(
+    metadata_batch,
+    metadata_keys,
+    geology_metadata_calibration=None,
+    background_threshold=1e-6,
+    background_key_indices=(),
+    strata_presence_threshold=0.5,
+    strata_max_active_keys=2,
+):
+    """Derive per-sample multilabel strata labels for a collated batch.
+
+    Mirrors the dataset-level strata construction used by the geology-aware sampler so
+    the supervised-contrastive objective groups positives/negatives the same way. Label
+    0 denotes background (no active geology feature).
+    """
+    if not metadata_keys:
+        return None
+    metadata_vectors, _ = prepare_geology_metadata_vectors(
+        metadata_batch,
+        metadata_keys,
+        device='cpu',
+        dtype=torch.float32,
+        geology_metadata_calibration=geology_metadata_calibration,
+        background_threshold=float(background_threshold),
+        background_key_indices=tuple(background_key_indices),
+    )
+    strata = build_multilabel_strata(
+        metadata_vectors.detach().cpu().numpy(),
+        tuple(str(k) for k in metadata_keys),
+        threshold=float(strata_presence_threshold),
+        active_key_indices=tuple(background_key_indices),
+        max_active_keys_per_stratum=int(strata_max_active_keys),
+    )
+    return np.asarray(strata.labels, dtype=np.int64)
+
+
+def compute_supervised_contrastive_loss(
+    embeddings,
+    labels,
+    temperature=0.1,
+    ignore_label=0,
+):
+    """Supervised contrastive (SupCon) loss on unit-norm geology embeddings.
+
+    For each anchor, positives are other in-batch samples sharing its strata label.
+    Background samples (``ignore_label``) are excluded as anchors and positives so they
+    do not form an artificial cluster. Returns a zero scalar when no valid positive pair
+    exists in the batch.
+    """
+    if embeddings.ndim != 2:
+        raise ValueError('embeddings must be a 2D tensor of shape [batch, dim].')
+    device = embeddings.device
+    labels_t = torch.as_tensor(np.asarray(labels).reshape(-1), device=device, dtype=torch.long)
+    if int(labels_t.shape[0]) != int(embeddings.shape[0]):
+        raise ValueError('labels length must match embeddings batch size.')
+
+    temperature = max(float(temperature), 1e-6)
+    valid = labels_t != int(ignore_label)
+    if int(valid.sum().item()) < 2:
+        return embeddings.new_zeros(())
+
+    logits = (embeddings @ embeddings.transpose(0, 1)) / temperature
+    # Numerical stability: subtract row-wise max before exp.
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    batch = int(embeddings.shape[0])
+    self_mask = torch.eye(batch, dtype=torch.bool, device=device)
+    label_eq = labels_t.unsqueeze(0) == labels_t.unsqueeze(1)
+    valid_pair = valid.unsqueeze(0) & valid.unsqueeze(1)
+
+    positive_mask = label_eq & valid_pair & (~self_mask)
+    candidate_mask = valid_pair & (~self_mask)
+
+    anchors_with_pos = positive_mask.any(dim=1) & valid
+    if int(anchors_with_pos.sum().item()) < 1:
+        return embeddings.new_zeros(())
+
+    exp_logits = torch.exp(logits) * candidate_mask.to(logits.dtype)
+    denom = exp_logits.sum(dim=1)
+    log_prob = logits - torch.log(denom.clamp_min(1e-12)).unsqueeze(1)
+
+    pos_counts = positive_mask.sum(dim=1).clamp_min(1)
+    mean_log_prob_pos = (positive_mask.to(log_prob.dtype) * log_prob).sum(dim=1) / pos_counts
+
+    loss = -mean_log_prob_pos[anchors_with_pos].mean()
+    if not torch.isfinite(loss):
+        return embeddings.new_zeros(())
+    return loss
+
+
 def compute_latent_geology_diagnostics(
     latent_vectors,
     metadata_vectors,
@@ -962,6 +1052,23 @@ def get_named_group_lr(optimizer, group_name, fallback=float('nan')):
     return float(fallback)
 
 
+def apply_parameter_freezing(model, args):
+    """Freeze encoder and/or decoder parameters for two-phase geology training.
+
+    Returns a short human-readable summary of which submodules were frozen.
+    """
+    frozen = []
+    if bool(getattr(args, 'freeze_encoder', False)):
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        frozen.append('encoder')
+    if bool(getattr(args, 'freeze_decoder', False)):
+        for param in model.decoder.parameters():
+            param.requires_grad = False
+        frozen.append('decoder')
+    return frozen
+
+
 def build_optimizer(model, args):
     if args.encoder_lr_mult <= 0.0:
         raise ValueError('--encoder_lr_mult must be positive.')
@@ -970,27 +1077,33 @@ def build_optimizer(model, args):
 
     base_lr = float(args.learning_rate)
     if args.encoder_lr_mult == 1.0 and args.decoder_lr_mult == 1.0:
-        return torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        if not trainable:
+            raise ValueError('No trainable parameters remain after freezing; check --freeze_encoder/--freeze_decoder.')
+        return torch.optim.AdamW(trainable, lr=base_lr, weight_decay=args.weight_decay)
 
-    encoder_params = list(model.encoder.parameters())
-    decoder_params = list(model.decoder.parameters())
-    tracked_ids = {id(p) for p in encoder_params + decoder_params}
-    other_params = [p for p in model.parameters() if id(p) not in tracked_ids]
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    decoder_params = [p for p in model.decoder.parameters() if p.requires_grad]
+    tracked_ids = {id(p) for p in list(model.encoder.parameters()) + list(model.decoder.parameters())}
+    other_params = [p for p in model.parameters() if id(p) not in tracked_ids and p.requires_grad]
 
-    param_groups = [
-        {
+    param_groups = []
+    if encoder_params:
+        param_groups.append({
             'params': encoder_params,
             'lr': base_lr * float(args.encoder_lr_mult),
             'name': 'encoder',
-        },
-        {
+        })
+    if decoder_params:
+        param_groups.append({
             'params': decoder_params,
             'lr': base_lr * float(args.decoder_lr_mult),
             'name': 'decoder',
-        },
-    ]
+        })
     if other_params:
         param_groups.append({'params': other_params, 'lr': base_lr, 'name': 'other'})
+    if not param_groups:
+        raise ValueError('No trainable parameters remain after freezing; check --freeze_encoder/--freeze_decoder.')
     return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=args.weight_decay)
 
 
@@ -1094,6 +1207,9 @@ def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=Non
         'latent_dim': int(model.latent_dim),
         'base_ch': int(model.base_ch),
         'deep_supervision': bool(getattr(model, 'deep_supervision', False)),
+        'geology_projection': bool(getattr(model, 'geology_projection', False)),
+        'geology_proj_hidden': int(getattr(model, 'geology_proj_hidden', 128)),
+        'geology_proj_dim': int(getattr(model, 'geology_proj_dim', 64)),
     }
     if epoch is not None:
         payload['epoch'] = int(epoch)
@@ -1535,6 +1651,10 @@ def train_one_epoch(
     geology_loss_type='mse',
     geology_huber_delta=0.1,
     geology_offdiag_only=True,
+    geology_contrastive_weight=0.0,
+    geology_contrastive_temperature=0.1,
+    geology_strata_presence_threshold=1e-4,
+    geology_strata_max_active_keys=2,
 ):
     if steps_per_epoch is None:
         raise ValueError('steps_per_epoch must be provided for train_one_epoch.')
@@ -1549,6 +1669,7 @@ def train_one_epoch(
     total_g_gan_loss = 0.0
     total_d_gan_loss = 0.0
     total_d_gan_acc = 0.0
+    total_geology_contrastive_loss = 0.0
     batch_iter = itertools.cycle(dataloader)
 
     last_snapshot = None
@@ -1637,6 +1758,32 @@ def train_one_epoch(
             g_gan_loss_value = float(g_gan_loss.item())
             total_g_loss = total_g_loss + gan_weight * g_gan_loss
 
+        geology_contrastive_value = 0.0
+        if (
+            float(geology_contrastive_weight) > 0.0
+            and getattr(model, 'geology_head', None) is not None
+            and geology_metadata_batch is not None
+            and geology_metadata_keys
+        ):
+            strata_labels = compute_batch_strata_labels(
+                geology_metadata_batch,
+                geology_metadata_keys,
+                geology_metadata_calibration=geology_metadata_calibration,
+                background_threshold=geology_background_threshold,
+                background_key_indices=geology_background_key_indices,
+                strata_presence_threshold=geology_strata_presence_threshold,
+                strata_max_active_keys=geology_strata_max_active_keys,
+            )
+            if strata_labels is not None:
+                z_geo = model.encode_geo(mu)
+                contrastive_loss = compute_supervised_contrastive_loss(
+                    z_geo,
+                    strata_labels,
+                    temperature=geology_contrastive_temperature,
+                )
+                geology_contrastive_value = float(contrastive_loss.item())
+                total_g_loss = total_g_loss + float(geology_contrastive_weight) * contrastive_loss
+
         optimizer.zero_grad()
         total_g_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -1646,6 +1793,7 @@ def train_one_epoch(
         total_g_gan_loss += g_gan_loss_value
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
+        total_geology_contrastive_loss += geology_contrastive_value
         if deep_supervision:
             if deep_supervision_weights is None:
                 raise ValueError('deep_supervision_weights must be provided when deep supervision is enabled.')
@@ -1679,6 +1827,7 @@ def train_one_epoch(
         total_g_gan_loss / steps_per_epoch,
         total_d_gan_loss / steps_per_epoch,
         total_d_gan_acc / steps_per_epoch,
+        total_geology_contrastive_loss / steps_per_epoch,
         last_snapshot,
     )
 
@@ -2210,7 +2359,12 @@ def train(args):
         patch_shape=args.patch_size_xyz,
         deep_supervision=args.deep_supervision,
         residual_encoder=args.residual_encoder,
+        geology_projection=bool(args.geology_projection),
+        geology_proj_hidden=int(args.geology_proj_hidden),
+        geology_proj_dim=int(args.geology_proj_dim),
     )
+    if float(args.geology_contrastive_weight) > 0.0 and not bool(args.geology_projection):
+        raise ValueError('--geology_contrastive_weight > 0 requires --geology_projection to build the z_geo head.')
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
     resume_completed_epochs = 0
@@ -2327,7 +2481,7 @@ def train(args):
         f"enabled={args.deep_supervision}",
         f"weights={args.deep_supervision_weights}",
     )
-    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch', 'deep_supervision']
+    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch', 'deep_supervision', 'geology_projection', 'geology_proj_hidden', 'geology_proj_dim']
     print(f"Checkpoint schema keys={checkpoint_keys}")
     print("base_ch = base channel count for the VAE's convolution layers")
     print(
@@ -2441,6 +2595,9 @@ def train(args):
     ):
         raise ValueError('--gan_balance_disc_lr_min must be <= --gan_balance_disc_lr_max.')
 
+    frozen_submodules = apply_parameter_freezing(model, args)
+    if frozen_submodules:
+        print(f"Frozen submodules (no gradient updates): {', '.join(frozen_submodules)}")
     opt = build_optimizer(model, args)
     disc_opt = build_discriminator_optimizer(discriminator, args)
     scheduler = build_scheduler(opt, args)
@@ -2551,6 +2708,7 @@ def train(args):
                 g_gan_loss_epoch,
                 d_gan_loss_epoch,
                 d_gan_acc_epoch,
+                train_contrastive_loss,
                 train_last_snapshot,
             ) = train_one_epoch(
                 model,
@@ -2579,6 +2737,10 @@ def train(args):
                 geology_loss_type=str(args.geology_loss_type),
                 geology_huber_delta=float(args.geology_huber_delta),
                 geology_offdiag_only=bool(args.geology_offdiag_only),
+                geology_contrastive_weight=float(args.geology_contrastive_weight),
+                geology_contrastive_temperature=float(args.geology_contrastive_temperature),
+                geology_strata_presence_threshold=float(args.geology_strata_presence_threshold),
+                geology_strata_max_active_keys=int(args.geology_strata_max_active_keys),
             )
             val_loss, val_lpips_loss, val_last_snapshot, geology_diagnostics = validate(
                 model,
@@ -2637,6 +2799,7 @@ def train(args):
 
             writer.add_scalar('train/loss', float(train_loss), epoch_number)
             writer.add_scalar('train/lpips_loss', float(train_lpips_loss), epoch_number)
+            writer.add_scalar('train/geology_contrastive_loss', float(train_contrastive_loss), epoch_number)
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
             writer.add_scalar('validation/lpips_loss', float(val_lpips_loss), epoch_number)
             if geology_diagnostics is not None:
@@ -2905,6 +3068,13 @@ if __name__ == '__main__':
     p.add_argument('--kl_fixed', type=float, default=1e-3)
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
     p.add_argument('--residual_encoder', action='store_true', help='Use the residual encoder variant while keeping the external latent contract unchanged.')
+    p.add_argument('--geology_projection', action='store_true', help='Add an MLP projection head g(mu)->z_geo (unit-norm) for the contrastive geology embedding used in retrieval.')
+    p.add_argument('--geology_proj_hidden', type=int, default=128, help='Hidden width of the geology projection head.')
+    p.add_argument('--geology_proj_dim', type=int, default=64, help='Output dimension of the geology projection embedding z_geo.')
+    p.add_argument('--geology_contrastive_weight', type=float, default=0.0, help='Weight for the supervised-contrastive (SupCon) loss on z_geo. Requires --geology_projection.')
+    p.add_argument('--geology_contrastive_temperature', type=float, default=0.1, help='Temperature for the supervised-contrastive geology loss.')
+    p.add_argument('--freeze_encoder', action='store_true', help='Freeze encoder weights (Phase 1 head-only geology training).')
+    p.add_argument('--freeze_decoder', action='store_true', help='Freeze decoder weights (e.g. when only shaping the geology embedding).')
     p.add_argument('--geology_loss_weight', type=float, default=0.0, help='Weight for metadata-to-latent geology similarity loss. Set >0 to enable geology-aware latent shaping.')
     p.add_argument('--geology_loss_type', type=str, default='mse', choices=['mse', 'huber'], help='Pairwise geology-similarity regression loss type for latent-vs-metadata geometry.')
     p.add_argument('--geology_huber_delta', type=float, default=0.1, help='Huber delta for geology loss when --geology_loss_type huber.')

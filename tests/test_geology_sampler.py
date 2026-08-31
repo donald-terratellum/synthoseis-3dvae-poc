@@ -112,6 +112,58 @@ class GeologySamplerTests(unittest.TestCase):
         self.assertGreaterEqual(float(stats["positive_pair_batch_rate"]), 0.0)
         self.assertLessEqual(float(stats["positive_pair_batch_rate"]), 1.0)
 
+    def test_geology_batch_sampler_respects_quota_preferences_when_feasible(self):
+        sample_count = 120
+        labels = np.zeros((sample_count,), dtype=np.int64)
+        labels[40:80] = 1
+        labels[80:120] = 2
+
+        # Make hard examples concentrated in non-background strata.
+        sample_weights = np.linspace(0.1, 0.9, num=sample_count, dtype=np.float64)
+        sample_weights[80:120] += 0.5
+
+        sampler = GeologyAwareBatchSampler(
+            strata_labels=labels,
+            batch_size=20,
+            num_batches=200,
+            seed=42,
+            sample_weights=sample_weights,
+            background_fraction=0.10,
+            hard_fraction=0.20,
+            hard_top_quantile=0.20,
+            min_negative_strata=1,
+            require_positive_pair=False,
+            allow_duplicates=False,
+        )
+        sampler.set_epoch(0)
+        _ = [batch for batch in sampler]
+        stats = sampler.get_last_epoch_stats()
+
+        self.assertLessEqual(float(stats["background_fraction_achieved"]), 0.18)
+        self.assertLessEqual(float(stats["hard_fraction_achieved"]), 0.30)
+
+    def test_geology_batch_sampler_hard_pool_matches_top_quantile_count(self):
+        labels = np.asarray([0, 0, 1, 1, 2, 2, 3, 3, 4, 4], dtype=np.int64)
+        weights = np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=np.float64)
+
+        sampler = GeologyAwareBatchSampler(
+            strata_labels=labels,
+            batch_size=5,
+            num_batches=20,
+            seed=7,
+            sample_weights=weights,
+            hard_fraction=0.2,
+            hard_top_quantile=0.2,
+            require_positive_pair=False,
+            allow_duplicates=False,
+        )
+        sampler.set_epoch(0)
+        _ = [batch for batch in sampler]
+        stats = sampler.get_last_epoch_stats()
+
+        self.assertGreaterEqual(float(stats["hard_fraction_achieved"]), 0.15)
+        self.assertLessEqual(float(stats["hard_fraction_achieved"]), 0.40)
+
 
 if __name__ == "__main__":
     unittest.main()
