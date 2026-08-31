@@ -809,6 +809,44 @@ def compute_supervised_contrastive_loss(
     return loss
 
 
+def compute_uniformity_loss(
+    embeddings,
+    labels=None,
+    t=2.0,
+    ignore_label=0,
+):
+    """Hypersphere uniformity regularizer (Wang & Isola, 2020).
+
+    Encourages unit-norm embeddings to spread over the hypersphere, counteracting the
+    representational collapse where every embedding points in nearly the same direction.
+    Computes ``log E[exp(-t * ||z_i - z_j||^2)]`` over distinct sample pairs. When ``labels``
+    are provided, background samples (``ignore_label``) are excluded so they do not anchor the
+    spread. Returns a zero scalar when fewer than two valid samples exist.
+    """
+    if embeddings.ndim != 2:
+        raise ValueError('embeddings must be a 2D tensor of shape [batch, dim].')
+    if labels is not None:
+        device = embeddings.device
+        labels_t = torch.as_tensor(np.asarray(labels).reshape(-1), device=device, dtype=torch.long)
+        if int(labels_t.shape[0]) != int(embeddings.shape[0]):
+            raise ValueError('labels length must match embeddings batch size.')
+        embeddings = embeddings[labels_t != int(ignore_label)]
+    if int(embeddings.shape[0]) < 2:
+        return embeddings.new_zeros(())
+    # Pairwise squared Euclidean distances via the Gram matrix. Avoids torch.pdist,
+    # which is not implemented on the MPS backend.
+    n = int(embeddings.shape[0])
+    sq_norms = embeddings.pow(2).sum(dim=1)
+    gram = embeddings @ embeddings.transpose(0, 1)
+    sq_dist_mat = (sq_norms.unsqueeze(1) + sq_norms.unsqueeze(0) - 2.0 * gram).clamp_min(0.0)
+    iu = torch.triu_indices(n, n, offset=1, device=embeddings.device)
+    sq_dists = sq_dist_mat[iu[0], iu[1]]
+    loss = torch.logsumexp(-float(t) * sq_dists, dim=0) - math.log(float(sq_dists.shape[0]))
+    if not torch.isfinite(loss):
+        return embeddings.new_zeros(())
+    return loss
+
+
 def compute_latent_geology_diagnostics(
     latent_vectors,
     metadata_vectors,
@@ -1653,6 +1691,8 @@ def train_one_epoch(
     geology_offdiag_only=True,
     geology_contrastive_weight=0.0,
     geology_contrastive_temperature=0.1,
+    geology_uniformity_weight=0.0,
+    geology_uniformity_t=2.0,
     geology_strata_presence_threshold=1e-4,
     geology_strata_max_active_keys=2,
 ):
@@ -1677,6 +1717,7 @@ def train_one_epoch(
     total_d_gan_loss = 0.0
     total_d_gan_acc = 0.0
     total_geology_contrastive_loss = 0.0
+    total_geology_uniformity_loss = 0.0
     batch_iter = itertools.cycle(dataloader)
 
     last_snapshot = None
@@ -1766,8 +1807,9 @@ def train_one_epoch(
             total_g_loss = total_g_loss + gan_weight * g_gan_loss
 
         geology_contrastive_value = 0.0
+        geology_uniformity_value = 0.0
         if (
-            float(geology_contrastive_weight) > 0.0
+            (float(geology_contrastive_weight) > 0.0 or float(geology_uniformity_weight) > 0.0)
             and getattr(model, 'geology_head', None) is not None
             and geology_metadata_batch is not None
             and geology_metadata_keys
@@ -1783,13 +1825,22 @@ def train_one_epoch(
             )
             if strata_labels is not None:
                 z_geo = model.encode_geo(mu)
-                contrastive_loss = compute_supervised_contrastive_loss(
-                    z_geo,
-                    strata_labels,
-                    temperature=geology_contrastive_temperature,
-                )
-                geology_contrastive_value = float(contrastive_loss.item())
-                total_g_loss = total_g_loss + float(geology_contrastive_weight) * contrastive_loss
+                if float(geology_contrastive_weight) > 0.0:
+                    contrastive_loss = compute_supervised_contrastive_loss(
+                        z_geo,
+                        strata_labels,
+                        temperature=geology_contrastive_temperature,
+                    )
+                    geology_contrastive_value = float(contrastive_loss.item())
+                    total_g_loss = total_g_loss + float(geology_contrastive_weight) * contrastive_loss
+                if float(geology_uniformity_weight) > 0.0:
+                    uniformity_loss = compute_uniformity_loss(
+                        z_geo,
+                        strata_labels,
+                        t=geology_uniformity_t,
+                    )
+                    geology_uniformity_value = float(uniformity_loss.item())
+                    total_g_loss = total_g_loss + float(geology_uniformity_weight) * uniformity_loss
 
         optimizer.zero_grad()
         total_g_loss.backward()
@@ -1801,6 +1852,7 @@ def train_one_epoch(
         total_d_gan_loss += d_gan_loss_value
         total_d_gan_acc += d_gan_acc_value
         total_geology_contrastive_loss += geology_contrastive_value
+        total_geology_uniformity_loss += geology_uniformity_value
         if deep_supervision:
             if deep_supervision_weights is None:
                 raise ValueError('deep_supervision_weights must be provided when deep supervision is enabled.')
@@ -1835,6 +1887,7 @@ def train_one_epoch(
         total_d_gan_loss / steps_per_epoch,
         total_d_gan_acc / steps_per_epoch,
         total_geology_contrastive_loss / steps_per_epoch,
+        total_geology_uniformity_loss / steps_per_epoch,
         last_snapshot,
     )
 
@@ -2372,6 +2425,8 @@ def train(args):
     )
     if float(args.geology_contrastive_weight) > 0.0 and not bool(args.geology_projection):
         raise ValueError('--geology_contrastive_weight > 0 requires --geology_projection to build the z_geo head.')
+    if float(args.geology_uniformity_weight) > 0.0 and not bool(args.geology_projection):
+        raise ValueError('--geology_uniformity_weight > 0 requires --geology_projection to build the z_geo head.')
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
     resume_completed_epochs = 0
@@ -2724,6 +2779,7 @@ def train(args):
                 d_gan_loss_epoch,
                 d_gan_acc_epoch,
                 train_contrastive_loss,
+                train_uniformity_loss,
                 train_last_snapshot,
             ) = train_one_epoch(
                 model,
@@ -2754,6 +2810,8 @@ def train(args):
                 geology_offdiag_only=bool(args.geology_offdiag_only),
                 geology_contrastive_weight=float(args.geology_contrastive_weight),
                 geology_contrastive_temperature=float(args.geology_contrastive_temperature),
+                geology_uniformity_weight=float(args.geology_uniformity_weight),
+                geology_uniformity_t=float(args.geology_uniformity_t),
                 geology_strata_presence_threshold=float(args.geology_strata_presence_threshold),
                 geology_strata_max_active_keys=int(args.geology_strata_max_active_keys),
             )
@@ -2815,6 +2873,7 @@ def train(args):
             writer.add_scalar('train/loss', float(train_loss), epoch_number)
             writer.add_scalar('train/lpips_loss', float(train_lpips_loss), epoch_number)
             writer.add_scalar('train/geology_contrastive_loss', float(train_contrastive_loss), epoch_number)
+            writer.add_scalar('train/geology_uniformity_loss', float(train_uniformity_loss), epoch_number)
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
             writer.add_scalar('validation/lpips_loss', float(val_lpips_loss), epoch_number)
             if geology_diagnostics is not None:
@@ -3088,6 +3147,8 @@ if __name__ == '__main__':
     p.add_argument('--geology_proj_dim', type=int, default=64, help='Output dimension of the geology projection embedding z_geo.')
     p.add_argument('--geology_contrastive_weight', type=float, default=0.0, help='Weight for the supervised-contrastive (SupCon) loss on z_geo. Requires --geology_projection.')
     p.add_argument('--geology_contrastive_temperature', type=float, default=0.1, help='Temperature for the supervised-contrastive geology loss.')
+    p.add_argument('--geology_uniformity_weight', type=float, default=0.0, help='Weight for the hypersphere uniformity regularizer on z_geo (anti-collapse). Requires --geology_projection.')
+    p.add_argument('--geology_uniformity_t', type=float, default=2.0, help='Temperature t for the geology uniformity regularizer.')
     p.add_argument('--freeze_encoder', action='store_true', help='Freeze encoder weights (Phase 1 head-only geology training).')
     p.add_argument('--freeze_decoder', action='store_true', help='Freeze decoder weights (e.g. when only shaping the geology embedding).')
     p.add_argument('--geology_loss_weight', type=float, default=0.0, help='Weight for metadata-to-latent geology similarity loss. Set >0 to enable geology-aware latent shaping.')

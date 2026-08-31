@@ -94,6 +94,45 @@ class SupervisedContrastiveLossTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(raw.grad).all())
 
 
+class UniformityLossTests(unittest.TestCase):
+    def _unit(self, vectors):
+        t = torch.tensor(vectors, dtype=torch.float32)
+        return torch.nn.functional.normalize(t, dim=1)
+
+    def test_collapsed_embeddings_have_higher_loss_than_spread(self):
+        # Near-collapsed cone (all pointing the same way) vs. an evenly spread set.
+        collapsed = self._unit(
+            [[1.0, 0.02], [1.0, -0.02], [0.99, 0.03], [0.99, -0.03]]
+        )
+        spread = self._unit(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+        )
+        loss_collapsed = train_script.compute_uniformity_loss(collapsed, t=2.0)
+        loss_spread = train_script.compute_uniformity_loss(spread, t=2.0)
+        self.assertGreater(float(loss_collapsed), float(loss_spread))
+
+    def test_background_label_excluded(self):
+        embeddings = self._unit([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+        labels = np.asarray([0, 0, 0], dtype=np.int64)
+        # All background => fewer than two valid samples => zero loss.
+        loss = train_script.compute_uniformity_loss(embeddings, labels)
+        self.assertEqual(float(loss), 0.0)
+
+    def test_single_valid_sample_returns_zero(self):
+        embeddings = self._unit([[1.0, 0.0], [0.0, 1.0]])
+        labels = np.asarray([1, 0], dtype=np.int64)
+        loss = train_script.compute_uniformity_loss(embeddings, labels)
+        self.assertEqual(float(loss), 0.0)
+
+    def test_loss_is_differentiable_wrt_embeddings(self):
+        raw = torch.randn(6, 8, requires_grad=True)
+        embeddings = torch.nn.functional.normalize(raw, dim=1)
+        loss = train_script.compute_uniformity_loss(embeddings, t=2.0)
+        loss.backward()
+        self.assertIsNotNone(raw.grad)
+        self.assertTrue(torch.isfinite(raw.grad).all())
+
+
 class GeologyAdapterProjectionTests(unittest.TestCase):
     def test_adapter_loads_projection_checkpoint_and_encodes_unit_geo(self):
         patch_shape = (8, 8, 8)
