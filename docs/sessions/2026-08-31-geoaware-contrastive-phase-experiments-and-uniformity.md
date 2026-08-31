@@ -119,32 +119,55 @@ You may execute the following without further clarification. Read
 ```bash
 cd /Users/donaldpg/synthoseis-3dvae-poc
 .venv/bin/python scripts/evaluate_geology_benchmark.py \
+  --data data/synth_val_32-32-64.zarr \
+  --manifest docs/benchmarks/frozen_validation_manifest.json \
   --checkpoint checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt \
   --use_geo_embedding \
   --metadata_keys meta_fault_fraction meta_fault_intersection_fraction \
     meta_channel_fraction meta_channel_core_fraction meta_flat_spot_fraction \
     meta_onlap_fraction meta_onlap_variability \
-  --output docs/benchmarks/geoaware_v3_phase2_ep20_zgeo_verify.json
+  --out_json docs/benchmarks/geoaware_v3_phase2_ep20_zgeo_verify.json
 ```
+
+> Benchmark CLI note: required flags are `--data`, `--manifest`, `--checkpoint`, `--out_json`
+> (there is NO `--output` flag).
 
 - Then wire `z_geo` retrieval into the `seismic_tokenizer` app via
   `VaeLatentAdapter.encode_geo_batch` / `encode_geo_cube` (adapter already supports it).
 
-### Task A — Finish + evaluate Phase 2c (cheap, high-value)
+### Task A — Evaluate Phase 2c ✅ RESOLVED 2026-08-31 (uniformity does NOT help)
 
-Phase 2c was still training at session end (out_dir
-`checkpoints/geoaware_v3_phase2c_20260831`, log `/tmp/geoaware_v3_phase2c.log`, 30 epochs).
-When it finishes, benchmark its later epochs (20, 25, 30) with `--use_geo_embedding` and
-the 7 keys above. **Decision rule:** Phase 2c only supersedes the winner if a later epoch
-reaches `neighbor_overlap@5 ≥ 0.139` AND keeps `val_loss ≲ 0.13`. If it also holds
-`cosine_separation ≥ 0`, prefer it (better absolute contrast for cosine thresholds in the app).
+Phase 2c completed 30/30 (val_loss best 0.1249). Benchmarked `z_geo` epochs 14/20/25/30:
 
-### Task B — Low-uniformity sweep (the promising frontier)
+| metric | mu (base) | P2 e20 ★ | P2c e14 | P2c e20 | P2c e25 | P2c e30 |
+|---|---|---|---|---|---|---|
+| neighbor_overlap@5  | 0.077 | **0.139** | 0.085 | 0.081 | 0.085 | 0.089 |
+| neighbor_overlap@10 | 0.181 | **0.227** | 0.210 | 0.185 | 0.183 | 0.185 |
+| neighbor_overlap@20 | 0.397 | 0.402 | 0.408 | 0.397 | 0.394 | 0.397 |
+| cosine_separation   | −0.014 | −0.009 | +0.015 | +0.000 | −0.004 | −0.003 |
 
-Phase 2c showed tiny uniformity recovers positive separation. Sweep uniformity weight in
-{0.0, 0.02, 0.05} warm-started from Phase 2 epoch-20, longer (40 epochs), and pick the
-epoch that maximizes `neighbor_overlap@5` subject to `cosine_separation ≥ 0`. Template
-(fill in `WEIGHT`):
+**Conclusion:** Phase 2c never approached Phase 2's rank retrieval (best n@5 0.089 < 0.139),
+and the one upside — positive `cosine_separation` — peaked transiently at epoch 14 (+0.015)
+then decayed back to ≈0 by epochs 20/25/30. **Uniformity is not useful for the rank goal;
+keep its weight at 0.** Do NOT extend the uniformity recipe. The feature remains tested and
+harmless if absolute cosine thresholds are ever needed, but it is not a lever to pull here.
+
+### Task B — ❌ DROPPED: Low-uniformity sweep
+
+Superseded by the Task A finding above. A {0.0, 0.02, 0.05} uniformity sweep is not worth
+running: the 0.05 point (Phase 2c) already regressed on rank retrieval and lost its
+separation advantage under full training. If revisited later, treat as low priority.
+
+### Task C — ✅ ACTIVE: Extend the winning Phase 2 contrastive-only recipe ("Phase 2d")
+
+This is the recommended path to try to push past n@5 0.139. Continue Phase 2's exact
+contrastive-only recipe (NO uniformity) warm-started from `vae_epoch20.pt` for more epochs,
+re-benchmark each saved epoch, and keep the epoch with the highest `neighbor_overlap@5`
+(subject to `val_loss ≲ 0.13`).
+
+Phase 2's exact recipe (recovered): `geology_contrastive_weight 0.5`,
+`geology_contrastive_temperature 0.2`, `encoder_lr_mult 0.1`, sampler bg 0.05 / hard 0.30,
+no uniformity. The extended run (Phase 2d) launched 2026-08-31:
 
 ```bash
 cd /Users/donaldpg/synthoseis-3dvae-poc
@@ -159,20 +182,19 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/train.py \
     meta_onlap_fraction meta_onlap_variability \
   --geology_projection --geology_proj_hidden 128 --geology_proj_dim 64 \
   --geology_contrastive_weight 0.5 --geology_contrastive_temperature 0.2 \
-  --geology_uniformity_weight WEIGHT --geology_uniformity_t 2.0 \
   --geology_batch_sampler --geology_batch_background_fraction 0.05 \
-  --geology_batch_hard_fraction 0.30 --encoder_lr_mult 0.3 \
+  --geology_batch_hard_fraction 0.30 --encoder_lr_mult 0.1 \
   --augment --vertical_warp_prob 0.5 --mixup_augment_prob 0.0 \
   --early_stopping_patience 999 --save_epoch_checkpoints \
-  --out_dir checkpoints/geoaware_v3_uniformity_sweep_WEIGHT_20260901 \
-  2>&1 | tee /tmp/geoaware_v3_uniformity_sweep_WEIGHT.log
+  --out_dir checkpoints/geoaware_v3_phase2d_20260831 \
+  2>&1 | tee /tmp/geoaware_v3_phase2d.log
 ```
 
-### Task C — "Train fully" the winning recipe (if scaling up)
-
-The winner is already a full training. To extend it, continue Phase 2's contrastive-only
-recipe (no uniformity, or ≤0.02) from `vae_epoch20.pt` for more epochs and re-benchmark
-each epoch; keep the epoch with the highest `neighbor_overlap@5`.
+When it finishes, benchmark a spread of epochs (e.g. 10/20/30/40) with `--use_geo_embedding`
+and the 7 keys, using `--data data/synth_val_32-32-64.zarr` and
+`--manifest docs/benchmarks/frozen_validation_manifest.json` (NOTE the flags are `--data`,
+`--manifest`, and `--out_json` — NOT `--output`). Adopt a Phase 2d epoch only if it beats
+n@5 0.139. Otherwise Phase 2 epoch-20 remains the deliverable.
 
 ### Selection metric (authoritative)
 
