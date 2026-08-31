@@ -1662,6 +1662,13 @@ def train_one_epoch(
     if steps_per_epoch <= 0:
         raise ValueError('steps_per_epoch must be a positive integer.')
     model.train()
+    # Keep fully-frozen submodules in eval mode so their BatchNorm running stats
+    # do not drift while their weights are frozen (two-phase geology training).
+    for submodule in (getattr(model, 'encoder', None), getattr(model, 'decoder', None)):
+        if submodule is not None:
+            params = list(submodule.parameters())
+            if params and all(not p.requires_grad for p in params):
+                submodule.eval()
     if discriminator is not None:
         discriminator.train()
     total_loss = 0.0
@@ -2431,8 +2438,16 @@ def train(args):
             'decoder.aux_head_mid.bias',
         }
         allowed_ds_unexpected = allowed_ds_missing
-        invalid_missing = [k for k in missing_keys if k not in allowed_ds_missing]
-        invalid_unexpected = [k for k in unexpected_keys if k not in allowed_ds_unexpected]
+        # Newly added geology projection head is randomly initialized when warm-starting
+        # from a pre-head checkpoint; tolerate its missing/unexpected keys either way.
+        invalid_missing = [
+            k for k in missing_keys
+            if k not in allowed_ds_missing and not k.startswith('geology_head.')
+        ]
+        invalid_unexpected = [
+            k for k in unexpected_keys
+            if k not in allowed_ds_unexpected and not k.startswith('geology_head.')
+        ]
         if invalid_missing or invalid_unexpected:
             raise ValueError(
                 'Resume checkpoint model_state_dict is incompatible with current architecture. '
