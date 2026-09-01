@@ -71,6 +71,7 @@ class SearchExecutionSpec:
     batch_size: int = 32
     output_zarr_path: Optional[str] = None
     latent_mode: str = "pooled"
+    embedding_mode: str = "z_geo"
     similarity_mode: str = "cosine"
     model_path: Optional[str] = None
     device: str = "auto"
@@ -148,9 +149,10 @@ def _search_worker(
             if not spec.model_path:
                 raise ValueError("model_path is required for vae latent_mode")
             adapter = VaeLatentAdapter(checkpoint_path=spec.model_path, device=spec.device)
+            encode_fn = adapter.encode_geo_batch if spec.embedding_mode == "z_geo" else adapter.encode_batch
             latent_batch_fn = lambda cubes: adaptive_batch_map(
                 cubes,
-                adapter.encode_batch,
+                encode_fn,
                 initial_batch_size=spec.batch_size,
             ).astype(np.float32, copy=False)
         else:

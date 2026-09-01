@@ -51,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     build_token.add_argument("--model-path", type=Path, default=None, help="Optional model checkpoint path")
     build_token.add_argument("--device", type=str, default="auto", help="Inference device: auto|cpu|cuda|mps")
     build_token.add_argument("--latent-mode", type=str, choices=("vae", "pooled"), default="vae")
+    build_token.add_argument(
+        "--embedding-mode",
+        type=str,
+        choices=("mu", "z_geo"),
+        default="z_geo",
+        help="VAE embedding used for similarity: 'z_geo' (geology projection head) or 'mu' (raw latent mean)",
+    )
     build_token.add_argument("--x", type=int, required=True, help="Token center x index")
     build_token.add_argument("--y", type=int, required=True, help="Token center y index")
     build_token.add_argument("--z", type=int, required=True, help="Token center z index")
@@ -75,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
     search_volume.add_argument("--device", type=str, default="auto", help="Inference device: auto|cpu|cuda|mps")
     search_volume.add_argument("--latent-mode", type=str, choices=("vae", "pooled"), default="vae")
     search_volume.add_argument(
+        "--embedding-mode",
+        type=str,
+        choices=("mu", "z_geo"),
+        default="z_geo",
+        help="VAE embedding used for similarity: 'z_geo' (geology projection head) or 'mu' (raw latent mean)",
+    )
+    search_volume.add_argument(
         "--similarity-mode",
         type=str,
         choices=("cosine", "dot"),
@@ -90,6 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--source", type=Path, help="Optional source volume path to load at startup")
     ui.add_argument("--model-path", type=Path, default=None, help="Optional model checkpoint path for VAE latent mode")
     ui.add_argument("--latent-mode", type=str, choices=("vae", "pooled"), default="pooled")
+    ui.add_argument(
+        "--embedding-mode",
+        type=str,
+        choices=("mu", "z_geo"),
+        default="z_geo",
+        help="VAE embedding used for similarity: 'z_geo' (geology projection head) or 'mu' (raw latent mean)",
+    )
     ui.add_argument("--device", type=str, default="auto", help="Inference device: auto|cpu|cuda|mps")
     return parser
 
@@ -107,7 +128,11 @@ def cmd_build_token(args: argparse.Namespace) -> int:
     if args.latent_mode == "vae":
         model_path = args.model_path if args.model_path is not None else runtime.model_path
         adapter = VaeLatentAdapter(checkpoint_path=model_path, device=args.device)
-        token_latent = adapter.encode_cube(token_cube)
+        token_latent = (
+            adapter.encode_geo_cube(token_cube)
+            if args.embedding_mode == "z_geo"
+            else adapter.encode_cube(token_cube)
+        )
     else:
         model_path = None
         token_latent = cube_to_latent_128(token_cube)
@@ -141,8 +166,12 @@ def cmd_search_volume(args: argparse.Namespace) -> int:
     if args.latent_mode == "vae":
         model_path = args.model_path if args.model_path is not None else runtime.model_path
         adapter = VaeLatentAdapter(checkpoint_path=model_path, device=args.device)
-        token_latent = adapter.encode_cube(token_prep)
-        latent_batch_fn = adapter.encode_batch
+        if args.embedding_mode == "z_geo":
+            token_latent = adapter.encode_geo_cube(token_prep)
+            latent_batch_fn = adapter.encode_geo_batch
+        else:
+            token_latent = adapter.encode_cube(token_prep)
+            latent_batch_fn = adapter.encode_batch
     else:
         if patch_shape != (32, 32, 32):
             raise ValueError("latent_mode='pooled' currently requires patch_size 32 32 32")
@@ -202,6 +231,7 @@ def cmd_search_volume(args: argparse.Namespace) -> int:
                 "stride": int(args.stride),
                 "batch_size": int(args.batch_size),
                 "latent_mode": str(args.latent_mode),
+                "embedding_mode": str(args.embedding_mode),
                 "similarity_mode": str(args.similarity_mode),
                 "device": str(args.device),
                 "source_shape": list(source_volume.shape),
@@ -240,6 +270,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
     controller = TokenizerController(
         window,
         latent_mode=args.latent_mode,
+        embedding_mode=args.embedding_mode,
         model_path=str(args.model_path) if args.model_path is not None else None,
         device=args.device,
     )

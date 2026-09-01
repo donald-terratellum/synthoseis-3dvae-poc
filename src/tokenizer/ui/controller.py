@@ -21,6 +21,7 @@ class TokenizerController:
         window,
         patch_size: int = 32,
         latent_mode: str = "pooled",
+        embedding_mode: Optional[str] = None,
         model_path: Optional[str] = None,
         device: str = "auto",
         state_file: Optional[str | Path] = None,
@@ -30,6 +31,7 @@ class TokenizerController:
         self.latent_mode = latent_mode
         self.device = device
         runtime = RuntimeConfig()
+        self.embedding_mode = embedding_mode if embedding_mode is not None else runtime.embedding_mode
         self.model_path = model_path if model_path is not None else str(runtime.model_path)
         self._vae_adapter: Optional[VaeLatentAdapter] = None
         if self.latent_mode == "vae":
@@ -309,7 +311,12 @@ class TokenizerController:
             )
         try:
             if self.latent_mode == "vae":
-                token_latent = self._get_vae_adapter().encode_cube(token_cube)
+                adapter = self._get_vae_adapter()
+                token_latent = (
+                    adapter.encode_geo_cube(token_cube)
+                    if self.embedding_mode == "z_geo"
+                    else adapter.encode_cube(token_cube)
+                )
             else:
                 token_latent = cube_to_latent_128(token_cube)
         except Exception as exc:
@@ -326,6 +333,7 @@ class TokenizerController:
             batch_size=32,
             output_zarr_path=str(out_path),
             latent_mode=self.latent_mode,
+            embedding_mode=self.embedding_mode,
             similarity_mode=self.display_state.similarity_mode,
             model_path=self.model_path,
             device=self.device,

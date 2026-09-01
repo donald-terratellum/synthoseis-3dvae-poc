@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_MODEL_PATH = Path("checkpoints_gan_vwarp2/vae_final.pt")
+DEFAULT_MODEL_PATH = Path("checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt")
 DEFAULT_TEMP_ZARR_PATH = Path("/tmp/temp_seismic/input_seismic.zarr")
 
 
@@ -13,6 +13,7 @@ class RuntimeConfig:
     latent_dim: int = 128
     patch_size: int = 32
     stride: int = 16
+    embedding_mode: str = "z_geo"
 
     def validate(self) -> None:
         if self.latent_dim <= 0:
@@ -23,6 +24,8 @@ class RuntimeConfig:
             raise ValueError("stride must be > 0")
         if self.patch_size % self.stride != 0:
             raise ValueError("patch_size must be divisible by stride")
+        if self.embedding_mode not in ("mu", "z_geo"):
+            raise ValueError("embedding_mode must be 'mu' or 'z_geo'")
 
 
 @dataclass(frozen=True)
