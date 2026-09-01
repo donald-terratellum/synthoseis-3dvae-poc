@@ -196,6 +196,28 @@ and the 7 keys, using `--data data/synth_val_32-32-64.zarr` and
 `--manifest`, and `--out_json` — NOT `--output`). Adopt a Phase 2d epoch only if it beats
 n@5 0.139. Otherwise Phase 2 epoch-20 remains the deliverable.
 
+#### Task C — ✅ RESOLVED 2026-08-31 (extended training PLATEAUED; P2 e20 still wins)
+
+Phase 2d completed 40/40 (val_loss best 0.1244). Benchmarked `z_geo` epochs 10/20/30/40:
+
+| metric | mu (base) | P2 e20 ★ | P2d e10 | P2d e20 | P2d e30 | P2d e40 |
+|---|---|---|---|---|---|---|
+| neighbor_overlap@5  | 0.077 | **0.139** | 0.127 | 0.131 | 0.131 | 0.123 |
+| neighbor_overlap@10 | 0.181 | **0.227** | 0.214 | 0.212 | 0.219 | 0.212 |
+| neighbor_overlap@20 | 0.397 | 0.402 | 0.394 | 0.402 | 0.402 | 0.404 |
+| cosine_separation   | −0.014 | −0.009 | +0.007 | +0.006 | +0.006 | +0.004 |
+
+**Conclusion:** 20 extra epochs did not improve rank retrieval — Phase 2d topped out at
+n@5 0.131 (epochs 20/30) and epoch 40 mildly overfit (0.123). The recipe has **converged**;
+~0.13–0.14 n@5 is the ceiling for this architecture + data + sampling. Phase 2d did hold a
+small *positive* `cosine_separation` (+0.004…+0.007 vs P2's −0.009), confirming more
+contrastive training firms up absolute contrast slightly, but not the ranking metric.
+
+**Final deliverable (unchanged): `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`.**
+To exceed 0.139, a structural change is required (harder negative mining, more/diverse data,
+bigger projection head, richer geology labels) — not more epochs. See
+`docs/training/geoaware_improvement_plan.md`.
+
 ### Selection metric (authoritative)
 
 Rank by `diagnostics.neighbor_overlap_at_5` on the frozen 7-key manifest (tie-break by
