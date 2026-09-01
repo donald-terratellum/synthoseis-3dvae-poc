@@ -216,7 +216,7 @@ contrastive training firms up absolute contrast slightly, but not the ranking me
 **Final deliverable (unchanged): `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`.**
 To exceed 0.139, a structural change is required (harder negative mining, more/diverse data,
 bigger projection head, richer geology labels) — not more epochs. See
-`docs/training/geoaware_improvement_plan.md`.
+`docs/training/2026-09-01_geo-aware_improvement_plan.md`.
 
 ### Selection metric (authoritative)
 
