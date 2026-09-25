@@ -486,6 +486,31 @@ class InputAugmentationTests(unittest.TestCase):
             self.assertGreater(float(metadata['meta_flat_spot_fraction']), 0.0)
             self.assertGreater(float(metadata['meta_onlap_fraction']), 0.0)
             self.assertGreater(float(metadata['meta_channel_fraction']), 0.0)
+            self.assertGreaterEqual(float(metadata['meta_dip_range_deg']), 0.0)
+            for key in ('meta_dip_mean_class', 'meta_dip_range_class'):
+                cls = float(metadata[key])
+                self.assertEqual(cls, round(cls))
+                self.assertTrue(0 <= cls <= 5)
+
+    def test_dip_features_and_quantization_for_planar_and_mixed_structure(self):
+        shape = (16, 16, 16)
+        x = np.arange(shape[0], dtype=np.float32)[:, None, None]
+        z = np.arange(shape[2], dtype=np.float32)[None, None, :]
+        # Age = z + x gives a uniform 45-degree dip everywhere.
+        planar = np.broadcast_to(z + x, shape).astype(np.float32)
+        dip_mean, _, dip_range, _, _ = sample_patches_script._compute_dip_azimuth_features(planar)
+        self.assertAlmostEqual(dip_mean, 45.0, places=3)
+        self.assertAlmostEqual(dip_range, 0.0, places=3)
+        self.assertEqual(sample_patches_script.quantize(dip_mean, sample_patches_script.DIP_MEAN_CLASS_EDGES_DEG), 4.0)
+        self.assertEqual(sample_patches_script.quantize(dip_range, sample_patches_script.DIP_RANGE_CLASS_EDGES_DEG), 0.0)
+
+        # Flat in the top half and steep in the bottom half spreads the dip distribution.
+        mixed = np.broadcast_to(z, shape).astype(np.float32).copy()
+        mixed[:, :, 8:] += 3.0 * np.broadcast_to(x, (16, 16, 8))
+        _, _, mixed_range, _, _ = sample_patches_script._compute_dip_azimuth_features(mixed)
+        self.assertGreater(mixed_range, 45.0)
+        self.assertEqual(sample_patches_script.quantize(mixed_range, sample_patches_script.DIP_RANGE_CLASS_EDGES_DEG), 5.0)
+        self.assertEqual(sample_patches_script.quantize(10.0, (10.0, 20.0)), 1.0)
 
     def test_vae_supports_residual_encoder_variant(self):
         model = train_script.VAE3D(

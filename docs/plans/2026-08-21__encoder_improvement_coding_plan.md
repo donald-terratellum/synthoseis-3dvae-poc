@@ -10,7 +10,7 @@ The upstream pretrain repo in the remote environment showed a useful precedent: 
 
 ### Data source contract for this project
 
-The implementation work must be grounded in the synthetic seismic dataset located at `/Volumes/Crucial X9/fake_data`.
+The implementation work must be grounded in the synthetic seismic dataset located at `/Volumes/CrucialX9/fake_data`.
 
 - The primary training and validation source is synthetic seismic data, stored as Zarr arrays under folders matching the pattern:
   - `seismic__2026.*__synthoseis_run_*/model_data.zarr/`
@@ -35,7 +35,7 @@ The implementation work must be grounded in the synthetic seismic dataset locate
   17. `strat_closures`
   18. `closure_segments_id`
   19. `faults/faulted_channel_labels`
-- The repository should not treat the small amount of real seismic data under `/Volumes/Crucial X9/fake_data` as the primary training corpus. It is only useful for testing the full interactive workflow and for VAE training/validation in a semi-supervised reconstruction setting.
+- The repository should not treat the small amount of real seismic data under `/Volumes/CrucialX9/fake_data` as the primary training corpus. It is only useful for testing the full interactive workflow and for VAE training/validation in a semi-supervised reconstruction setting.
 - Synthetic data remains the main source for supervised or weakly supervised geology-aware training; real seismic data is a secondary, smoke-test and validation source.
 
 ## Goal
@@ -99,7 +99,7 @@ Acceptance criteria:
 
 1. Reproduce the current training baseline exactly as implemented in the repository.
 2. Use the current model in [src/model.py](src/model.py), training loop in [scripts/train.py](scripts/train.py), and dataset pipeline in [scripts/sample_patches.py](scripts/sample_patches.py).
-3. Use the synthetic seismic runs under `/Volumes/Crucial X9/fake_data` as the primary source, specifically the `seismic__2026.*__synthoseis_run_*/model_data.zarr/` folders and their retained geology/segmentation arrays.
+3. Use the synthetic seismic runs under `/Volumes/CrucialX9/fake_data` as the primary source, specifically the `seismic__2026.*__synthoseis_run_*/model_data.zarr/` folders and their retained geology/segmentation arrays.
 4. Run the model under the current heavy-augmentation regime used by the project and document the baseline results.
 4. Collect and save the following baseline artifacts:
    - checkpoint
@@ -202,7 +202,7 @@ Once the encoder is validated, retrain the model with a geology-aware objective 
    - feature-presence flags
    - primary geology label
    - provenance and normalization metadata
-2. Update the dataset loader and training loop to optionally return geology metadata while still supporting the existing synthetic-data discovery pattern under `/Volumes/Crucial X9/fake_data`.
+2. Update the dataset loader and training loop to optionally return geology metadata while still supporting the existing synthetic-data discovery pattern under `/Volumes/CrucialX9/fake_data`.
 3. Keep reconstruction as the backbone objective.
 4. Add a geology-aware auxiliary objective on top of reconstruction.
    - feature prediction head or patch-level geology supervision

@@ -17,9 +17,9 @@ This component covers:
 uv sync
 
 # Build training patches from canonical synthetic volumes.
-# Source pattern: /Volumes/Crucial X9/fake_data/seismic__2026.*__synthoseis_run_*/model_data.zarr
+# Source pattern: /Volumes/CrucialX9/fake_data/seismic__2026.*__synthoseis_run_*/model_data.zarr
 uv run python scripts/sample_patches.py \
-  --source '/Volumes/Crucial X9/fake_data' \
+  --source '/Volumes/CrucialX9/fake_data' \
   --patch_size 32 32 64 \
   --n_patches 120000 \
   --n_per_volume 600 \
@@ -29,7 +29,7 @@ uv run python scripts/sample_patches.py \
 
 # Build validation patches from the same synthetic source.
 uv run python scripts/sample_patches.py \
-  --source '/Volumes/Crucial X9/fake_data' \
+  --source '/Volumes/CrucialX9/fake_data' \
   --patch_size 32 32 64 \
   --n_patches 24000 \
   --n_per_volume 200 \
@@ -229,7 +229,7 @@ Recommended rerun sequence:
 
 ```bash
 uv run python scripts/sample_patches.py \
-  --source '/Volumes/Crucial X9/fake_data' \
+  --source '/Volumes/CrucialX9/fake_data' \
   --patch_size 32 32 64 \
   --n_patches 120000 \
   --n_per_volume 600 \
@@ -238,7 +238,7 @@ uv run python scripts/sample_patches.py \
   --out data/synth_train_32-32-64.zarr
 
 uv run python scripts/sample_patches.py \
-  --source '/Volumes/Crucial X9/fake_data' \
+  --source '/Volumes/CrucialX9/fake_data' \
   --patch_size 32 32 64 \
   --n_patches 24000 \
   --n_per_volume 200 \

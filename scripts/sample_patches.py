@@ -39,7 +39,18 @@ DERIVED_METADATA_KEYS = (
     "meta_channel_fraction",
     "meta_channel_core_fraction",
     "meta_structural_complexity",
+    "meta_dip_range_deg",
+    "meta_dip_mean_class",
+    "meta_dip_range_class",
 )
+
+# Edges chosen from observed patch distributions (dip mean p5-p95 ~10-56 deg, p90-p10 range p5-p95 ~7-30 deg).
+DIP_MEAN_CLASS_EDGES_DEG = (10.0, 20.0, 30.0, 40.0, 50.0)
+DIP_RANGE_CLASS_EDGES_DEG = (8.0, 12.0, 16.0, 24.0, 32.0)
+
+
+def quantize(value, edges):
+    return float(np.digitize(float(value), edges))
 
 
 def normalize_patch_size(values):
@@ -143,7 +154,9 @@ def _compute_dip_azimuth_features(structural_patch):
     azimuth_mean_deg = (float(np.degrees(azimuth_mean_rad)) + 360.0) % 360.0
     dip_mean_deg = float(np.nanmean(dip_deg))
     dip_std_deg = float(np.nanstd(dip_deg))
-    return dip_mean_deg, dip_std_deg, azimuth_mean_deg, azimuth_circular_variance
+    dip_p10_deg, dip_p90_deg = np.nanpercentile(dip_deg, [10.0, 90.0])
+    dip_range_deg = float(dip_p90_deg - dip_p10_deg)
+    return dip_mean_deg, dip_std_deg, dip_range_deg, azimuth_mean_deg, azimuth_circular_variance
 
 
 def compute_patch_derived_metadata(zvol, origin, patch_size, geoscore_key, dip_source_key="geologic_age_faulted"):
@@ -157,9 +170,12 @@ def compute_patch_derived_metadata(zvol, origin, patch_size, geoscore_key, dip_s
     structural_patch = _safe_extract_patch_by_key(zvol, dip_source_key, origin, patch_size)
     if structural_patch is not None and structural_patch.size > 0:
         structural_patch = np.nan_to_num(structural_patch, nan=0.0, posinf=0.0, neginf=0.0)
-        dip_mean_deg, dip_std_deg, azimuth_mean_deg, azimuth_circular_variance = _compute_dip_azimuth_features(structural_patch)
+        dip_mean_deg, dip_std_deg, dip_range_deg, azimuth_mean_deg, azimuth_circular_variance = _compute_dip_azimuth_features(structural_patch)
         metadata["meta_dip_mean_deg"] = dip_mean_deg
         metadata["meta_dip_std_deg"] = dip_std_deg
+        metadata["meta_dip_range_deg"] = dip_range_deg
+        metadata["meta_dip_mean_class"] = quantize(dip_mean_deg, DIP_MEAN_CLASS_EDGES_DEG)
+        metadata["meta_dip_range_class"] = quantize(dip_range_deg, DIP_RANGE_CLASS_EDGES_DEG)
         metadata["meta_azimuth_mean_deg"] = azimuth_mean_deg
         metadata["meta_azimuth_circular_variance"] = azimuth_circular_variance
 
@@ -478,6 +494,8 @@ def main():
     dst.attrs["scaling_std"] = float(scaling_std)
     dst.attrs["sampling_seed"] = sampling_seed
     dst.attrs["source_volumes"] = [str(vol) for vol in vols]
+    dst.attrs["dip_mean_class_edges_deg"] = list(DIP_MEAN_CLASS_EDGES_DEG)
+    dst.attrs["dip_range_class_edges_deg"] = list(DIP_RANGE_CLASS_EDGES_DEG)
     patches_dst = cast(Any, dst["patches"])
     provenance_arrays = {}
     for key in ("source_volume_index", "origin_x", "origin_y", "origin_z"):

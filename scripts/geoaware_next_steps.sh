@@ -7,7 +7,7 @@ cd /Users/donaldpg/synthoseis-3dvae-poc
 rm -rf data/synth_train_32-32-64.zarr data/synth_val_32-32-64.zarr
 
 uv run python scripts/sample_patches.py \
-  --source '/Volumes/Crucial X9/fake_data' \
+  --source '/Volumes/CrucialX9/fake_data' \
   --patch_size 32 32 64 \
   --n_patches 108000 \
   --n_per_volume 600 \
@@ -16,7 +16,7 @@ uv run python scripts/sample_patches.py \
   --out data/synth_train_32-32-64.zarr
 
 uv run python scripts/sample_patches.py \
-  --source '/Volumes/Crucial X9/fake_data/validation' \
+  --source '/Volumes/CrucialX9/fake_data/validation' \
   --patch_size 32 32 64 \
   --n_patches 5000 \
   --n_per_volume 200 \
