@@ -588,7 +588,7 @@ Parameter notes:
 
 - [x] WP0 alignment offset verified on ≥ 5 volumes (offset +1, 8 + 20 volumes).
 - [ ] Offset recorded in output attrs (WP2).
-- [ ] Sand/shale fix verified against a hand-built synthetic volume.
+- [x] Sand/shale fix verified against a hand-built synthetic volume (WP1).
 - [ ] Train and validation volumes are disjoint (assert in `sample_patches.py` when both
       output stores list their `source_volumes`; add a small check script or test).
 - [ ] Anchored patches contain their anchor class (tested).

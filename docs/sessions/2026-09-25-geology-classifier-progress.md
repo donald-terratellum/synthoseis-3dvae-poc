@@ -4,8 +4,7 @@ Living document. Add a section under **Work package log** as each WP is finished
 the **Status** table current.
 
 - Branch: `geology-classifier-2026-09-25` (from `encoder-improvement-2026-08-21`)
-- Plan (local, untracked because `docs/plans/` is in `.git/info/exclude`):
-  `docs/plans/2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md`
+- Plan: [2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md](../plans/2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md)
 - Parent plan: [2026-09-01_geo-aware_improvement_plan.md](../training/2026-09-01_geo-aware_improvement_plan.md)
 
 ---
