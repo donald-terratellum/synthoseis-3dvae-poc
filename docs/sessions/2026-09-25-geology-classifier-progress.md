@@ -45,8 +45,8 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 |---|---|---|---|---|
 | prep | Source path fix (`CrucialX9`), dip-range / dip-class metadata in `sample_patches.py` | Done | Suite OK | Done before WP0 |
 | WP0 | Label/seismic depth alignment | **Done** | 9 new; suite 112 OK | `label_z_offset = 1` |
-| WP1 | Sand/shale fix, water/closure metadata, seismic key default, `--exclude_dir` | Next | — | — |
-| WP2 | Class-anchored sampler | Not started | — | Uses `--label_z_offset 1` |
+| WP1 | Sand/shale fix, water/closure metadata, seismic key default, `--exclude_dir` | **Done** | 9 new; suite 121 OK | Train/val volume lists are disjoint (180 / 25) |
+| WP2 | Class-anchored sampler | Next | — | Uses `--label_z_offset 1` |
 | WP3 | Classifier decoder (patch mode) | Not started | — | — |
 | WP4 | Label-driven batch sampler | Not started | — | — |
 | WP5 | Evaluation additions | Not started | — | — |
@@ -63,9 +63,9 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 
 | Defect | Fix in |
 |---|---|
-| Sand/shale fraction maps lithology with `(x+1)/2`, so shale counts as 0.5 sand and water counts as shale (lithology: −1 water, 0 shale, 1 sand) | WP1 |
-| `rglob` over `fake_data` also picks up `fake_data/validation`, leaking validation volumes into training | WP1 (`--exclude_dir`) |
-| Default `--seismic_key` has a double underscore and matches no volume | WP1 |
+| Sand/shale fraction maps lithology with `(x+1)/2`, so shale counts as 0.5 sand and water counts as shale (lithology: −1 water, 0 shale, 1 sand) | WP1 (fixed) |
+| `rglob` over `fake_data` also picks up `fake_data/validation`, leaking validation volumes into training | WP1 (fixed: `--exclude_dir`) |
+| Default `--seismic_key` has a double underscore and matches no volume | WP1 (fixed) |
 | Labels are read at the seismic origin, one sample off | WP2 (`--label_z_offset`) |
 
 ---
@@ -96,6 +96,44 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 - JSON reports in `data/` (gitignored)
 
 **Decision:** proceed to WP1.
+
+### WP1 — Data fixes and metadata (done)
+
+**Goal:** fix the known metadata and data-split defects before building new samplers on
+top of them.
+
+**Changes** (in [scripts/sample_patches.py](../../scripts/sample_patches.py)):
+- **Sand/shale fractions.** They are now computed over rock voxels only (lithology ≥ 0).
+  A voxel counts as sand at lithology ≥ 0.5. Both fractions are 0 when a patch is all water.
+- **New metadata.** `meta_water_fraction`, and `meta_closure_fraction`
+  (`closure_segments_id > 0`).
+- **Seismic key.** The default `--seismic_key` is now `seismicCubes_cumsum_fullstack`.
+- **`--exclude_dir NAME`** (repeatable). It skips volumes under any folder with that name
+  below `--source`.
+- **Output attrs.** `exclude_dirs` and `sand_threshold` are recorded.
+- **Shell scripts.** The training-set sampling steps in `scripts/train_vae3d.sh` and
+  `scripts/geoaware_next_steps.sh` now pass `--exclude_dir validation`.
+
+**Result:**
+- Tests: a synthetic volume with a known water/shale/sand/closure layout gives exact
+  fractions. Excluded volumes are never listed. An end-to-end `main()` run with the default
+  seismic key writes patches only from non-excluded volumes.
+- Real data:
+  - Volume lists: 205 in total, 180 with `validation` excluded, and 25 in `validation/`.
+    The two sets are disjoint, and together they cover all 205.
+  - 200 patches from one volume: mean sand fraction 0.17 (sand present in 92% of patches),
+    water in 2% of patches, closure in 23%. Sand + shale = 1 on every patch that contains
+    rock.
+
+**Compatibility:**
+- The seven retrieval keys and the frozen manifest are unchanged, so the 0.139 baseline
+  still applies.
+- The training defaults in `scripts/train.py` are unchanged, so datasets built before WP1
+  still load.
+- Datasets built before WP1 keep the wrong sand/shale values. Regenerate them before using
+  sand/shale as targets.
+
+**Decision:** proceed to WP2.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

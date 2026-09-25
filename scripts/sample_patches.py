@@ -4,7 +4,7 @@
 
 Usage:
     python scripts/sample_patches.py --source /path/to/fake_data --out data/train.zarr --patch_size 32 32 32 --n_patches 5000 \
-        --seismic_key seismicCubes_cumsum__fullstack --geoscore_key geologic_score --n_per_volume 100
+        --seismic_key seismicCubes_cumsum_fullstack --geoscore_key geologic_score --n_per_volume 100 --exclude_dir validation
 """
 
 from pathlib import Path
@@ -42,7 +42,13 @@ DERIVED_METADATA_KEYS = (
     "meta_dip_range_deg",
     "meta_dip_mean_class",
     "meta_dip_range_class",
+    "meta_water_fraction",
+    "meta_closure_fraction",
 )
+
+DEFAULT_SEISMIC_KEY = "seismicCubes_cumsum_fullstack"
+# faulted_lithology: -1 water (above seabed), 0 shale, 1 sand; fractional at boundaries.
+DEFAULT_SAND_THRESHOLD = 0.5
 
 # Edges chosen from observed patch distributions (dip mean p5-p95 ~10-56 deg, p90-p10 range p5-p95 ~7-30 deg).
 DIP_MEAN_CLASS_EDGES_DEG = (10.0, 20.0, 30.0, 40.0, 50.0)
@@ -159,7 +165,26 @@ def _compute_dip_azimuth_features(structural_patch):
     return dip_mean_deg, dip_std_deg, dip_range_deg, azimuth_mean_deg, azimuth_circular_variance
 
 
-def compute_patch_derived_metadata(zvol, origin, patch_size, geoscore_key, dip_source_key="geologic_age_faulted"):
+def compute_lithology_fractions(lith_patch, sand_threshold=DEFAULT_SAND_THRESHOLD):
+    """Return (sand, shale, water) fractions; sand/shale are over rock voxels only."""
+    lith = np.asarray(lith_patch, dtype=np.float32)
+    rock = lith >= 0.0
+    water_fraction = float(np.mean(~rock))
+    n_rock = int(rock.sum())
+    if n_rock == 0:
+        return 0.0, 0.0, water_fraction
+    sand_fraction = float(np.count_nonzero(lith[rock] >= sand_threshold) / n_rock)
+    return sand_fraction, 1.0 - sand_fraction, water_fraction
+
+
+def compute_patch_derived_metadata(
+    zvol,
+    origin,
+    patch_size,
+    geoscore_key,
+    dip_source_key="geologic_age_faulted",
+    sand_threshold=DEFAULT_SAND_THRESHOLD,
+):
     metadata = {k: 0.0 for k in DERIVED_METADATA_KEYS}
 
     geoscore_patch = _safe_extract_patch_by_key(zvol, geoscore_key, origin, patch_size)
@@ -189,13 +214,18 @@ def compute_patch_derived_metadata(zvol, origin, patch_size, geoscore_key, dip_s
         fault_intersection_patch = np.nan_to_num(fault_intersection_patch, nan=0.0, posinf=0.0, neginf=0.0)
         metadata["meta_fault_intersection_fraction"] = float(np.mean(fault_intersection_patch > 0.0))
 
-    # faulted_lithology ranges [-1, 1] in synthetic data: map to [0, 1] for sandness.
     lith_patch = _safe_extract_patch_by_key(zvol, "faulted_lithology", origin, patch_size)
     if lith_patch is not None and lith_patch.size > 0:
         lith_patch = np.nan_to_num(lith_patch, nan=0.0, posinf=0.0, neginf=0.0)
-        sandness = np.clip((lith_patch + 1.0) * 0.5, 0.0, 1.0)
-        metadata["meta_sand_fraction"] = float(np.mean(sandness))
-        metadata["meta_shale_fraction"] = float(np.mean(1.0 - sandness))
+        sand, shale, water = compute_lithology_fractions(lith_patch, sand_threshold)
+        metadata["meta_sand_fraction"] = sand
+        metadata["meta_shale_fraction"] = shale
+        metadata["meta_water_fraction"] = water
+
+    closure_patch = _safe_extract_patch_by_key(zvol, "closure_segments_id", origin, patch_size)
+    if closure_patch is not None and closure_patch.size > 0:
+        closure_patch = np.nan_to_num(closure_patch, nan=0.0, posinf=0.0, neginf=0.0)
+        metadata["meta_closure_fraction"] = float(np.mean(closure_patch > 0.0))
 
     flat_spot_patch = _safe_extract_patch_by_key(zvol, "flat_spot", origin, patch_size)
     if flat_spot_patch is not None and flat_spot_patch.size > 0:
@@ -416,6 +446,20 @@ def has_temp_folder_sibling(volume_zarr_path):
     return temp_dir.exists() and temp_dir.is_dir()
 
 
+def list_source_volumes(source, exclude_dirs=()):
+    """Sorted model_data.zarr stores under source, skipping any under a folder named in exclude_dirs."""
+    src = Path(source)
+    excluded = set(exclude_dirs or ())
+    vols = []
+    for vol in sorted(src.rglob("model_data.zarr")):
+        if has_temp_folder_sibling(vol):
+            continue
+        if excluded and excluded.intersection(vol.relative_to(src).parts[:-1]):
+            continue
+        vols.append(vol)
+    return vols
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True, help="directory that contains model_data.zarr folders")
@@ -429,7 +473,14 @@ def main():
         default=None,
         help="Sampling seed. If omitted, generate a new seed from system entropy and record it in the output Zarr attrs.",
     )
-    p.add_argument("--seismic_key", type=str, default="seismicCubes_cumsum__fullstack")
+    p.add_argument("--seismic_key", type=str, default=DEFAULT_SEISMIC_KEY)
+    p.add_argument(
+        "--exclude_dir",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Skip source volumes under a folder with this name (repeatable), e.g. --exclude_dir validation.",
+    )
     p.add_argument("--geoscore_key", type=str, default="geologic_score")
     p.add_argument(
         "--scaling",
@@ -475,7 +526,7 @@ def main():
 
     written = 0
     metadata_arrays = {}
-    vols = sorted(vol for vol in src.rglob("model_data.zarr") if not has_temp_folder_sibling(vol))
+    vols = list_source_volumes(src, args.exclude_dir)
     if not vols:
         print("No model_data.zarr volumes found under", src)
         return
@@ -494,6 +545,8 @@ def main():
     dst.attrs["scaling_std"] = float(scaling_std)
     dst.attrs["sampling_seed"] = sampling_seed
     dst.attrs["source_volumes"] = [str(vol) for vol in vols]
+    dst.attrs["exclude_dirs"] = list(args.exclude_dir)
+    dst.attrs["sand_threshold"] = DEFAULT_SAND_THRESHOLD
     dst.attrs["dip_mean_class_edges_deg"] = list(DIP_MEAN_CLASS_EDGES_DEG)
     dst.attrs["dip_range_class_edges_deg"] = list(DIP_RANGE_CLASS_EDGES_DEG)
     patches_dst = cast(Any, dst["patches"])

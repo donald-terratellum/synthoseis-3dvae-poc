@@ -8,6 +8,7 @@ rm -rf data/synth_train_32-32-64.zarr data/synth_val_32-32-64.zarr
 
 uv run python scripts/sample_patches.py \
   --source '/Volumes/CrucialX9/fake_data' \
+  --exclude_dir validation \
   --patch_size 32 32 64 \
   --n_patches 108000 \
   --n_per_volume 600 \
