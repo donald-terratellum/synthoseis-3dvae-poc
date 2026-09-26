@@ -48,8 +48,8 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | WP2 | Class-anchored sampler | **Done** | 18 new; suite 139 OK | Weighted presence matches uniform on real data |
 | WP3 | Classifier decoder (patch mode) | **Done** | 18 new; suite 157 OK | Warm-start smoke run trains; tokenizer ignores head |
 | WP4 | Label-driven batch sampler | **Done** | 16 new; suite 173 OK | Quotas met in 100% of smoke batches |
-| WP5 | Evaluation additions | Next | — | — |
-| WP6 | Voxel mode | Not started | — | Alignment no longer blocks it |
+| WP5 | Evaluation additions | **Done** | 13 new; suite 186 OK | R0 reproduces n@5 0.139; 5 of 25 validation volumes have no labels |
+| WP6 | Voxel mode | Not started | — | Gated on WP3 improving n@5 (needs R2) |
 | WP7 | Suite script and docs | Not started | — | — |
 
 ## Benchmark results
@@ -57,6 +57,7 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | Run | Change vs current best | n@5 | n@10 | val_loss | Adopted |
 |---|---|---:|---:|---:|---|
 | baseline | Phase 2 epoch 20 (`z_geo`) | 0.139 | 0.227 | 0.128 | current |
+| R0 | Re-benchmark of baseline with the WP5 script (2026-09-25) | 0.1385 | 0.2269 | — | sanity OK |
 
 ## Known defects (from the plan) and where they are fixed
 
@@ -316,6 +317,77 @@ metadata calibration at natural prevalence.
   the six classes are also used when the sampler fills the rest of each batch.
 
 **Decision:** proceed to WP5.
+
+### WP5 — Evaluation additions (done)
+
+**Goal:** report classifier quality on natural-prevalence validation data, while keeping
+n@5 / n@10 on the frozen manifest as the primary metric.
+
+**Method:**
+- **Benchmark script** ([scripts/evaluate_geology_benchmark.py](../../scripts/evaluate_geology_benchmark.py)).
+  New optional flags:
+  - `--classifier_data`: a natural-prevalence zarr; class-anchored data is rejected;
+  - `--classifier_threshold_data`: the training split, used to tune per-class F1
+    thresholds (otherwise a fixed 0.5 is used);
+  - `--classifier_max_samples`;
+  - `--classifier_preprocess {tokenizer,extrema}`.
+
+  A new `classifier_metrics` block reports:
+  - per class: prevalence, AUROC, average precision (AP), threshold, and F1;
+  - macro averages of AUROC, AP, and F1;
+  - for dip-mean and dip-range: accuracy, majority-class rate, and a confusion matrix;
+  - `sanity_gate`: macro AUROC ≥ 0.75, and dip accuracy above the majority-class rate.
+
+  Without the new flags, the report is unchanged.
+- **Metrics** ([src/geology_classifier.py](../../src/geology_classifier.py)): numpy-only
+  AUROC, AP, best-F1 threshold, and confusion matrix.
+- **Tokenizer adapter.** `VaeLatentAdapter(..., load_classifier=True)` loads the classifier
+  head, and `classify_batch()` returns probabilities. By default the adapter still ignores
+  the head.
+- **Sampler fix** ([scripts/sample_patches.py](../../scripts/sample_patches.py)). The
+  `uniform` and `class_anchored` modes now skip volumes with no label arrays and list them in
+  `skipped_volumes_missing_labels`. The benchmark stops with a clear error if the evaluation
+  set has no positive labels.
+
+**Result:**
+- **Tests** ([tests/test_classifier_eval.py](../../tests/test_classifier_eval.py) and 1 new
+  sampler test):
+  - metric values on hand-computed examples, including ties and absent classes;
+  - perfect predictions pass the gate and uninformative ones fail it;
+  - adapter probabilities match the model;
+  - the existing report is byte-identical with or without classifier metrics;
+  - class-anchored evaluation data and data with no positive labels are rejected;
+  - volumes without labels are skipped.
+- **R0 sanity.** The current best checkpoint on the frozen manifest gives n@5 0.1385 and
+  n@10 0.2269, reproducing the baseline.
+- **Pipeline check on real data.** A 75-step smoke classifier trained on one volume,
+  evaluated on 600 uniform patches from the 20 labeled validation volumes:
+  - macro AUROC 0.45 with tokenizer preprocessing and 0.53 with `extrema` preprocessing;
+  - the gate correctly fails.
+
+  This model is essentially untrained, so these numbers only show that the pipeline runs.
+
+**Findings (important for R1–R3):**
+- **5 of the 25 validation volumes (runs 0570–0574) contain no label arrays**, only
+  seismic and `geologic_score`. All 180 training volumes have every label array.
+  - Uniform validation sampling from `fake_data/validation` now uses 20 volumes. At
+    `--n_per_volume 200` that gives 4,000 patches, not 5,000.
+  - These 5 volumes give zero metadata in `geoscore` mode (not changed). They may also be
+    in the frozen manifest's data.
+- **The tokenizer's input preprocessing differs from the training inputs.**
+  - Tokenizer: normalized by each patch's own standard deviation, then keep only trace
+    extremes.
+  - Training: dataset-wide scaling, then one of three transforms (keep extremes, sparse
+    keep, or decimate).
+  - On the smoke model's own training split, macro AUROC was 0.68 with training-style
+    inputs and 0.57 with tokenizer inputs (sand: 0.70 vs 0.34).
+  - This mismatch predates this work. It also affects `z_geo` retrieval, because n@5 is
+    measured through the tokenizer path.
+  - Report both variants in R2. Aligning the preprocessing is a separate follow-up and is
+    not part of this plan.
+
+**Decision:** proceed to WP7 (scripts and docs). WP6 (voxel mode) stays gated on WP3
+improving n@5, which requires the R1/R2 training runs on the full sampled dataset.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

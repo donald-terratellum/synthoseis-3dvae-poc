@@ -328,6 +328,20 @@ class TestMain(unittest.TestCase):
             self.assertEqual(lp.dtype, np.uint8)
             self.assertEqual(tuple(lp.chunks), (1, 7, 8, 8, 16))
 
+    def test_skips_volumes_without_labels_in_labeled_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src"
+            make_labeled_volume(root / "seismic__a" / "model_data.zarr", seed=0)
+            bare = zarr.open_group(str(root / "seismic__b" / "model_data.zarr"), mode="w")
+            bare.create_array(sp.DEFAULT_SEISMIC_KEY, data=np.ones(SEIS_SHAPE, dtype=np.float32))
+            out = Path(tmp) / "out.zarr"
+            _run_main(["--source", str(root), "--out", str(out), "--patch_size", "8", "8", "16",
+                       "--n_patches", "8", "--n_per_volume", "4", "--seed", "1", "--sampling_mode", "uniform"])
+            dst = zarr.open_group(str(out), mode="r")
+            self.assertEqual(dst.attrs["skipped_volumes_missing_labels"], [str(root / "seismic__b" / "model_data.zarr")])
+            self.assertEqual(dst.attrs["n_written"], 4)
+            self.assertTrue(np.all(np.asarray(dst["source_volume_index"])[:4] == 0))
+
     def test_disjoint_from(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_source(tmp)

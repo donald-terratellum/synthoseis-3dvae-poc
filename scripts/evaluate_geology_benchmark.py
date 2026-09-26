@@ -27,8 +27,79 @@ from scripts.train import (
     prepare_geology_metadata_vectors,
     resolve_background_key_indices,
 )
+from src.augmentations import keep_trace_extrema_only
+from src.geology_classifier import (
+    DIP_TARGET_KEYS,
+    PRESENCE_TARGET_KEYS,
+    best_f1_threshold,
+    evaluate_classifier_predictions,
+)
+from src.model import GEOLOGY_PRESENCE_CLASSES
 from src.tokenizer.core.model_adapter import VaeLatentAdapter
 from src.tokenizer.core.preprocess import preprocess_for_token
+
+
+def load_classifier_split(data_path: Path, max_samples: int, seed: int) -> tuple[np.ndarray, dict, dict]:
+    """Patches plus presence/dip targets for a random subset (at most max_samples) of a sampled zarr."""
+    root = zarr.open_group(str(data_path), mode="r")
+    missing = [k for k in ["patches", *PRESENCE_TARGET_KEYS.values(), *DIP_TARGET_KEYS.values()] if k not in root]
+    if missing:
+        raise KeyError(f"{data_path} is missing classifier arrays {missing}; regenerate it with scripts/sample_patches.py.")
+    n = int(root["patches"].shape[0])
+    idx = np.arange(n)
+    if n > int(max_samples):
+        idx = np.sort(np.random.default_rng(int(seed)).choice(n, size=int(max_samples), replace=False))
+    targets = {
+        "presence": np.stack([np.asarray(root[PRESENCE_TARGET_KEYS[c]][:])[idx] for c in GEOLOGY_PRESENCE_CLASSES], axis=1),
+        **{name: np.asarray(root[key][:])[idx] for name, key in DIP_TARGET_KEYS.items()},
+    }
+    return np.asarray(root["patches"].get_orthogonal_selection((idx,))), targets, dict(root.attrs)
+
+
+def predict_classifier(adapter: VaeLatentAdapter, patches: np.ndarray, batch_size: int, preprocess: str = "tokenizer") -> dict:
+    # 'tokenizer' matches retrieval (per-cube std + extrema); 'extrema' matches training inputs (stored scaling + extrema).
+    prep_fn = preprocess_for_token if preprocess == "tokenizer" else keep_trace_extrema_only
+    parts: dict[str, list] = {"presence": [], "dip_mean": [], "dip_range": []}
+    for start in range(0, patches.shape[0], int(batch_size)):
+        batch = patches[start:start + int(batch_size)]
+        prepped = np.stack([prep_fn(b) for b in batch], axis=0).astype(np.float32)
+        for key, value in adapter.classify_batch(prepped).items():
+            parts[key].append(value)
+    return {key: np.concatenate(values, axis=0) for key, values in parts.items()}
+
+
+def evaluate_classifier(args) -> dict:
+    eval_patches, eval_targets, eval_attrs = load_classifier_split(args.classifier_data, args.classifier_max_samples, args.seed)
+    sampling_mode = str(eval_attrs.get("sampling_mode", "geoscore"))
+    if sampling_mode == "class_anchored":
+        raise ValueError(
+            f"{args.classifier_data} was sampled with class_anchored mode; classifier metrics need a "
+            "natural-prevalence set (sample_patches.py --sampling_mode uniform)."
+        )
+    if not np.any(eval_targets["presence"]):
+        raise ValueError(
+            f"{args.classifier_data} has no positive presence labels; it was likely sampled from volumes "
+            "without label arrays (see the skipped_volumes_missing_labels attr)."
+        )
+    adapter = VaeLatentAdapter(args.checkpoint, device=args.device, load_classifier=True)
+    thresholds = None
+    threshold_source = "fixed_0.5"
+    if args.classifier_threshold_data is not None:
+        tr_patches, tr_targets, _ = load_classifier_split(args.classifier_threshold_data, args.classifier_max_samples, args.seed + 1)
+        tr_probs = predict_classifier(adapter, tr_patches, args.batch_size, args.classifier_preprocess)
+        thresholds = {
+            name: best_f1_threshold(tr_targets["presence"][:, i], tr_probs["presence"][:, i])
+            for i, name in enumerate(GEOLOGY_PRESENCE_CLASSES)
+        }
+        threshold_source = str(args.classifier_threshold_data)
+    report = evaluate_classifier_predictions(
+        predict_classifier(adapter, eval_patches, args.batch_size, args.classifier_preprocess), eval_targets, thresholds
+    )
+    report["data"] = str(args.classifier_data)
+    report["preprocess"] = str(args.classifier_preprocess)
+    report["sampling_mode"] = sampling_mode
+    report["threshold_source"] = threshold_source
+    return report
 
 
 def _load_or_create_manifest(
@@ -190,6 +261,10 @@ def main() -> None:
     parser.add_argument("--negative_threshold", type=float, default=0.20)
     parser.add_argument("--calibration_path", type=Path, default=None, help="Optional saved calibration artifact. If omitted, uses checkpoint calibration or fit-on-dataset fallback.")
     parser.add_argument("--bootstrap_samples", type=int, default=300)
+    parser.add_argument("--classifier_data", type=Path, default=None, help="Natural-prevalence sampled zarr (e.g. --sampling_mode uniform validation) for classifier-head metrics. Requires a checkpoint trained with --geology_classifier.")
+    parser.add_argument("--classifier_threshold_data", type=Path, default=None, help="Training-split zarr used to tune per-class presence thresholds for F1 (default: fixed 0.5).")
+    parser.add_argument("--classifier_max_samples", type=int, default=5000, help="Maximum patches read from each classifier dataset.")
+    parser.add_argument("--classifier_preprocess", choices=("tokenizer", "extrema"), default="tokenizer", help="Classifier input preprocessing: tokenizer (retrieval path) or extrema (training input path).")
     args = parser.parse_args()
 
     root = zarr.open(str(args.data), mode="r")
@@ -349,6 +424,17 @@ def main() -> None:
         "bootstrap": bootstrap,
         "cohort_metrics": {name: {k: v for k, v in payload.items() if k != "query_metrics"} for name, payload in cohort_metrics.items()},
     }
+    if args.classifier_data is not None:
+        report["classifier_metrics"] = evaluate_classifier(args)
+        cm = report["classifier_metrics"]
+        print(
+            "Classifier:",
+            f"macro_auroc={cm['macro_auroc']}",
+            f"macro_f1={cm['macro_f1']}",
+            f"dip_mean_acc={cm['dip_mean']['accuracy']:.3f} (majority {cm['dip_mean']['majority_rate']:.3f})",
+            f"dip_range_acc={cm['dip_range']['accuracy']:.3f} (majority {cm['dip_range']['majority_rate']:.3f})",
+            f"sanity_gate_passed={cm['sanity_gate']['passed']}",
+        )
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")

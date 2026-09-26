@@ -931,6 +931,7 @@ def main():
         lp_shape = (len(LABEL_CLASS_ORDER),) + tuple(patch_size)
         label_patches_dst = create("label_patches", (args.n_patches,) + lp_shape, "u1", (1,) + lp_shape)
     totals = {k: {c: 0 for c in LABEL_CLASS_ORDER} for k in ("anchored", "fallback", "object_cap_fallback")}
+    skipped_missing_labels = []
 
     for volume_index, vol in enumerate(vols):
         print("Scanning", vol)
@@ -966,6 +967,11 @@ def main():
                     )
                 ]
             else:
+                missing_labels = [key for key in LABEL_CLASS_SOURCES.values() if key not in z]
+                if missing_labels:
+                    print(f"Skipping {vol}: missing label arrays {missing_labels}")
+                    skipped_missing_labels.append(str(vol))
+                    continue
                 n_vol = min(args.n_per_volume, args.n_patches - written)
                 patch_items, vol_counts = sample_labeled_patches(
                     z,
@@ -1030,6 +1036,8 @@ def main():
         print("Anchored counts:", totals["anchored"])
         print("Fallback counts:", totals["fallback"], "object cap fallbacks:", totals["object_cap_fallback"])
     dst.attrs["n_written"] = int(written)
+    if args.sampling_mode != "geoscore":
+        dst.attrs["skipped_volumes_missing_labels"] = skipped_missing_labels
     print(f"Wrote {written} patches to {out}")
 
 
