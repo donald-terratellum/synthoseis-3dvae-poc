@@ -241,7 +241,7 @@ class TestDatasetAndGuards(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'd.zarr'
             self._write_dataset(path)
-            ds = train_script.ZarrPatchDataset(path, classifier_target_keys=classifier_target_keys())
+            ds = train_script.ZarrPatchDataset(path, label_target_keys=classifier_target_keys())
             self.assertTrue(ds.include_metadata)
             _, _, meta = ds[3]
             self.assertEqual(int(meta['label_presence_fault']), 1)
@@ -250,7 +250,7 @@ class TestDatasetAndGuards(unittest.TestCase):
             self.assertEqual(len(plain[0]), 2)
             # Metadata keys requested without a metadata loss must not be read when only the classifier is on.
             cls_only = train_script.ZarrPatchDataset(
-                path, geology_metadata_keys=('meta_missing_key',), classifier_target_keys=classifier_target_keys(),
+                path, geology_metadata_keys=('meta_missing_key',), label_target_keys=classifier_target_keys(),
             )
             self.assertNotIn('meta_missing_key', cls_only[0][2])
 
@@ -259,7 +259,7 @@ class TestDatasetAndGuards(unittest.TestCase):
             path = Path(tmp) / 'd.zarr'
             self._write_dataset(path, with_presence=False)
             with self.assertRaisesRegex(KeyError, 'label_presence_fault'):
-                train_script.ZarrPatchDataset(path, classifier_target_keys=classifier_target_keys())
+                train_script.ZarrPatchDataset(path, label_target_keys=classifier_target_keys())
 
     def test_weight_requires_flag(self):
         args = SimpleNamespace(geology_classifier_weight=0.1, geology_classifier=False)

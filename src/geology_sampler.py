@@ -72,6 +72,32 @@ def build_multilabel_strata(
     return StrataDescription(labels=labels, background_label=0, label_to_name=label_to_name)
 
 
+def presence_rarity_weights(presence: np.ndarray) -> np.ndarray:
+    """Inverse prevalence per class of an (N, C) 0/1 presence matrix; 0 for absent classes."""
+    prevalence = np.asarray(presence, dtype=np.float64).mean(axis=0)
+    return np.where(prevalence > 0.0, 1.0 / np.maximum(prevalence, 1e-12), 0.0)
+
+
+def build_presence_strata(
+    presence: np.ndarray,
+    class_names: Sequence[str],
+    rarity_weights: np.ndarray,
+    max_active_keys_per_stratum: int = 2,
+) -> StrataDescription:
+    """Strata from 0/1 presence labels; when more classes are present than allowed, keep the rarest."""
+    presence = np.asarray(presence, dtype=np.float64)
+    if presence.ndim != 2 or presence.shape[1] != len(class_names):
+        raise ValueError("presence must be 2D [num_examples, len(class_names)].")
+    scored = presence * np.asarray(rarity_weights, dtype=np.float64).reshape(1, -1)
+    return build_multilabel_strata(
+        scored,
+        class_names,
+        threshold=0.0,
+        active_key_indices=tuple(range(presence.shape[1])),
+        max_active_keys_per_stratum=max_active_keys_per_stratum,
+    )
+
+
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:
     arr = np.asarray(weights, dtype=np.float64)
     arr = np.where(np.isfinite(arr), arr, 0.0)
@@ -97,6 +123,8 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
         min_negative_strata: int = 2,
         require_positive_pair: bool = True,
         allow_duplicates: bool = False,
+        class_membership: Optional[dict[str, np.ndarray]] = None,
+        class_quota: Optional[dict[str, int]] = None,
     ):
         self.strata_labels = np.asarray(strata_labels, dtype=np.int64).reshape(-1)
         if self.strata_labels.size <= 0:
@@ -132,6 +160,23 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
             int(label): self._indices[self.strata_labels == label]
             for label in self._label_ids
         }
+
+        self.class_membership = {
+            str(name): np.asarray(mask, dtype=bool).reshape(-1)
+            for name, mask in (class_membership or {}).items()
+        }
+        for name, mask in self.class_membership.items():
+            if mask.shape[0] != self.strata_labels.shape[0]:
+                raise ValueError(f"class_membership['{name}'] must match strata_labels length.")
+        self.class_quota = {str(k): int(v) for k, v in (class_quota or {}).items()}
+        for name, quota in self.class_quota.items():
+            if name not in self.class_membership:
+                raise ValueError(f"class_quota class '{name}' has no class_membership mask.")
+            if quota < 0:
+                raise ValueError("class_quota values must be >= 0.")
+        if sum(self.class_quota.values()) > self.batch_size:
+            raise ValueError("sum of class_quota values must not exceed batch_size.")
+        self._class_members = {name: self._indices[mask] for name, mask in self.class_membership.items()}
 
         self._last_epoch_stats: dict[str, float] = {
             "positive_pair_batch_rate": 0.0,
@@ -204,6 +249,9 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
         sum_unique_strata = 0.0
         sum_background_fraction = 0.0
         sum_hard_fraction = 0.0
+        class_share_sums = {name: 0.0 for name in self.class_membership}
+        quota_fallbacks = {name: 0 for name in self.class_quota}
+        batches_meeting_quota = 0
 
         for _ in range(self.num_batches):
             batch: list[int] = []
@@ -217,9 +265,32 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
             target_background = min(target_background, self.batch_size)
             target_hard = min(target_hard, self.batch_size)
 
+            quota_met = True
+            for name, quota in self.class_quota.items():
+                mask = self.class_membership[name]
+                have = sum(1 for i in batch if mask[i])
+                while have < quota and len(batch) < self.batch_size:
+                    chosen = self._draw_from_pool(rng, self._class_members[name], used)
+                    if chosen is None:
+                        break
+                    batch.append(chosen)
+                    used.add(chosen)
+                    strata_in_batch.add(int(self.strata_labels[chosen]))
+                    if is_background_mask[chosen]:
+                        background_count += 1
+                    if is_hard_mask[chosen]:
+                        hard_count_in_batch += 1
+                    have += 1
+                if have < quota:
+                    quota_fallbacks[name] += quota - have
+                    quota_met = False
+            if quota_met:
+                batches_meeting_quota += 1
+
             positive_label = None
             if self.require_positive_pair and positive_candidate_labels:
                 positive_label = int(rng.choice(np.asarray(positive_candidate_labels, dtype=np.int64)))
+                n_before_pair = len(batch)
                 for _pair_pick in range(2):
                     chosen = self._draw_from_pool(rng, self._label_to_indices[positive_label], used)
                     if chosen is None:
@@ -231,7 +302,7 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
                         background_count += 1
                     if is_hard_mask[chosen]:
                         hard_count_in_batch += 1
-                if len(batch) >= 2:
+                if len(batch) - n_before_pair >= 2:
                     batches_with_positive_pair += 1
                 else:
                     fallback_positive_pair_count += 1
@@ -351,6 +422,8 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
             if hard_indices.size > 0:
                 hard_mask = np.isin(batch_arr, hard_indices)
                 sum_hard_fraction += float(np.mean(hard_mask))
+            for name, mask in self.class_membership.items():
+                class_share_sums[name] += float(np.mean(mask[batch_arr]))
 
             yield batch
 
@@ -364,3 +437,9 @@ class GeologyAwareBatchSampler(Sampler[list[int]]):
             "background_fraction_achieved": float(sum_background_fraction) / float(batch_count),
             "hard_fraction_achieved": float(sum_hard_fraction) / float(batch_count),
         }
+        for name, total in class_share_sums.items():
+            self._last_epoch_stats[f"class_share_{name}"] = float(total) / float(batch_count)
+        for name, count in quota_fallbacks.items():
+            self._last_epoch_stats[f"class_quota_fallback_{name}"] = float(count)
+        if self.class_quota:
+            self._last_epoch_stats["class_quota_met_batch_rate"] = float(batches_meeting_quota) / float(batch_count)

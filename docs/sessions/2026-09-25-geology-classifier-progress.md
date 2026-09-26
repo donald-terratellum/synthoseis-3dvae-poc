@@ -47,8 +47,8 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | WP1 | Sand/shale fix, water/closure metadata, seismic key default, `--exclude_dir` | **Done** | 9 new; suite 121 OK | Train/val volume lists are disjoint (180 / 25) |
 | WP2 | Class-anchored sampler | **Done** | 18 new; suite 139 OK | Weighted presence matches uniform on real data |
 | WP3 | Classifier decoder (patch mode) | **Done** | 18 new; suite 157 OK | Warm-start smoke run trains; tokenizer ignores head |
-| WP4 | Label-driven batch sampler | Next | — | — |
-| WP5 | Evaluation additions | Not started | — | — |
+| WP4 | Label-driven batch sampler | **Done** | 16 new; suite 173 OK | Quotas met in 100% of smoke batches |
+| WP5 | Evaluation additions | Next | — | — |
 | WP6 | Voxel mode | Not started | — | Alignment no longer blocks it |
 | WP7 | Suite script and docs | Not started | — | — |
 
@@ -264,6 +264,58 @@ that `z_geo` is projected from.
   guardrail still compares like with like. Classifier metrics on validation are WP5.
 
 **Decision:** proceed to WP4.
+
+### WP4 — Label-driven batch sampler (done)
+
+**Goal:** build training batches and contrastive (SupCon) positive pairs directly from the
+WP2 presence labels. Guarantee that rare classes appear in every batch, and fit the
+metadata calibration at natural prevalence.
+
+**Method:**
+- **`--geology_strata_source presence_labels`.** A patch's stratum is the set of rare classes
+  present in it. When more than `--geology_strata_max_active_keys` classes are present,
+  only the rarest are kept, so positive pairs share rare classes. The same rule builds the
+  sampler's strata and the per-batch SupCon labels. The default classes are the six rare
+  ones (`--geology_strata_classes`); sand is excluded because it appears in about 90% of
+  patches.
+- **`--geology_batch_class_quota CLASS=COUNT`.** Sets a minimum number of patches containing
+  each listed class in every batch. Quotas are filled before the positive-pair, background,
+  hard-example, and negative steps. A quota that cannot be met is counted as a fallback.
+- **Calibration weights.** The metadata calibration now uses the WP2 `inclusion_weight`
+  when the dataset has it, via weighted quantiles. This is on by default and can be turned
+  off with `--no_geology_calibration_inclusion_weight`. Unit weights take the original
+  code path exactly.
+- **Sampler stats.** New per-epoch stats, logged to TensorBoard and printed:
+  - `class_share_<class>`: the share of each batch containing the class;
+  - `class_quota_fallback_<class>`: quota shortfalls;
+  - `class_quota_met_batch_rate`: the share of batches that met every quota.
+- **Guards.** Presence strata and class quotas require `--geology_batch_sampler`. The sum
+  of the quotas must not exceed the batch size.
+
+**Result:**
+- **Tests** ([tests/test_label_batch_sampler.py](../../tests/test_label_batch_sampler.py)):
+  - presence strata match the expected signatures and keep the rarest classes;
+  - with no quota, the sampler returns exactly the pre-WP4 batches (golden hash);
+  - feasible quotas are met in every batch;
+  - infeasible quotas are reported as fallbacks;
+  - weighted calibration on a rebalanced dataset matches calibration on the
+    natural-prevalence dataset within 2%, while the unweighted fit is clearly off;
+  - SupCon produces a nonzero loss from presence strata.
+- **Smoke run.** Two epochs of 10 batches on 300 class-anchored patches from run_1204,
+  warm-started from Phase 2 epoch 20, with SupCon 0.5, classifier 0.1, and quotas
+  `fault_x=1 flat_spot=1 channel=1`:
+  - 100% of batches met the quotas, with no fallbacks;
+  - batch shares: fault_x 21%, channel 17–18%, flat_spot 28–33%, closure 51–53%;
+  - positive-pair rate 1.0, 7.4–8.0 unique strata per batch;
+  - classifier loss 3.72 → 3.45.
+
+**Notes:**
+- Per-batch unique segment-id stats are not logged. WP2 does not store segment ids per
+  patch; add that only if memorization becomes a concern.
+- The background share achieved (16–21%) is above the 5% target. Patches with none of
+  the six classes are also used when the sampler fills the rest of each batch.
+
+**Decision:** proceed to WP5.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

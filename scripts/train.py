@@ -45,7 +45,12 @@ from src.geology_classifier import (
     compute_geology_classifier_loss,
     compute_pos_weight,
 )
-from src.geology_sampler import GeologyAwareBatchSampler, build_multilabel_strata
+from src.geology_sampler import (
+    GeologyAwareBatchSampler,
+    build_multilabel_strata,
+    build_presence_strata,
+    presence_rarity_weights,
+)
 from src.model import GEOLOGY_PRESENCE_CLASSES, VAE3D
 from src.tokenizer.core.preprocess import preprocess_for_token
 
@@ -135,7 +140,7 @@ class ZarrPatchDataset(Dataset):
         mixup_augment_prob=0.10,
         include_metadata: bool = False,
         geology_metadata_keys: Optional[tuple[str, ...]] = None,
-        classifier_target_keys: Optional[tuple[str, ...]] = None,
+        label_target_keys: Optional[tuple[str, ...]] = None,
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
         self.data = cast(Any, z['patches'])
@@ -176,17 +181,17 @@ class ZarrPatchDataset(Dataset):
                     )
                 self._metadata_arrays[key] = z[key]
 
-        self.classifier_target_keys = tuple(str(key) for key in (classifier_target_keys or ()))
-        self._classifier_arrays = {}
-        for key in self.classifier_target_keys:
+        self.label_target_keys = tuple(str(key) for key in (label_target_keys or ()))
+        self._label_arrays = {}
+        for key in self.label_target_keys:
             if key not in z:
                 raise KeyError(
-                    f"Geology classifier target '{key}' was not found in dataset '{zarr_path}'. "
+                    f"Label target '{key}' was not found in dataset '{zarr_path}'. "
                     "Regenerate it with scripts/sample_patches.py (label_presence_* arrays are written by the "
                     "WP2 sampler in every --sampling_mode)."
                 )
-            self._classifier_arrays[key] = np.asarray(z[key][:])
-        if self._classifier_arrays:
+            self._label_arrays[key] = np.asarray(z[key][:])
+        if self._label_arrays:
             self.include_metadata = True
 
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
@@ -288,7 +293,7 @@ class ZarrPatchDataset(Dataset):
                 metadata[key] = value[0]
             else:
                 metadata[key] = value
-        for key, arr in self._classifier_arrays.items():
+        for key, arr in self._label_arrays.items():
             metadata[key] = arr[int(idx)]
         return metadata
 
@@ -563,6 +568,22 @@ def resolve_background_key_indices(metadata_keys, background_keys):
     return tuple(range(len(key_tuple)))
 
 
+def weighted_percentile(values, q, weights=None):
+    """Percentile q in [0, 100]; with weights, interpolates the weighted CDF (equals np.percentile for unit weights)."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if weights is None:
+        return float(np.percentile(values, q))
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    order = np.argsort(values, kind='stable')
+    v, w = values[order], weights[order]
+    cum = np.cumsum(w)
+    denom = cum[-1] - w[-1]
+    if denom <= 0.0:
+        return float(v[-1])
+    ranks = (cum - w) / denom
+    return float(np.interp(float(q) / 100.0, ranks, v))
+
+
 def fit_geology_metadata_calibration(
     dataset,
     metadata_keys,
@@ -570,6 +591,7 @@ def fit_geology_metadata_calibration(
     eps=1e-6,
     clip=6.0,
     background_keys=(),
+    sample_weights=None,
 ):
     key_tuple = tuple(str(v) for v in metadata_keys)
     if not key_tuple:
@@ -578,6 +600,12 @@ def fit_geology_metadata_calibration(
         raise ValueError("geology calibration strategy must be one of: 'none', 'robust_log1p'.")
     if not hasattr(dataset, '_metadata_arrays'):
         raise ValueError('dataset does not expose metadata arrays required for calibration fitting.')
+    if sample_weights is not None:
+        sample_weights = np.asarray(sample_weights, dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(sample_weights)) or np.any(sample_weights < 0.0) or sample_weights.sum() <= 0.0:
+            raise ValueError('calibration sample_weights must be finite, non-negative, and not all zero.')
+        if np.allclose(sample_weights, sample_weights[0]):
+            sample_weights = None
 
     columns = []
     for key in key_tuple:
@@ -596,16 +624,24 @@ def fit_geology_metadata_calibration(
         nonzero_scale = np.ones((raw_matrix.shape[1],), dtype=np.float64)
         for idx in range(raw_matrix.shape[1]):
             col = raw_matrix[:, idx]
-            positive = col[col > 0.0]
-            if positive.size > 0:
-                nonzero_scale[idx] = max(float(np.median(positive)), float(eps))
-            else:
+            positive_mask = col > 0.0
+            if not np.any(positive_mask):
                 nonzero_scale[idx] = 1.0
+            elif sample_weights is None:
+                nonzero_scale[idx] = max(float(np.median(col[positive_mask])), float(eps))
+            else:
+                nonzero_scale[idx] = max(weighted_percentile(col[positive_mask], 50.0, sample_weights[positive_mask]), float(eps))
 
         transformed = np.log1p(np.clip(raw_matrix, a_min=0.0, a_max=None) / nonzero_scale.reshape(1, -1))
-        center = np.median(transformed, axis=0)
-        q25 = np.percentile(transformed, 25.0, axis=0)
-        q75 = np.percentile(transformed, 75.0, axis=0)
+        if sample_weights is None:
+            center = np.median(transformed, axis=0)
+            q25 = np.percentile(transformed, 25.0, axis=0)
+            q75 = np.percentile(transformed, 75.0, axis=0)
+        else:
+            columns_t = [transformed[:, i] for i in range(transformed.shape[1])]
+            center = np.array([weighted_percentile(c, 50.0, sample_weights) for c in columns_t])
+            q25 = np.array([weighted_percentile(c, 25.0, sample_weights) for c in columns_t])
+            q75 = np.array([weighted_percentile(c, 75.0, sample_weights) for c in columns_t])
         scale = np.maximum(q75 - q25, float(eps))
 
     return {
@@ -1725,6 +1761,7 @@ def train_one_epoch(
     geology_classifier_loss='bce',
     geology_classifier_focal_gamma=2.0,
     geology_classifier_label_smoothing=0.05,
+    geology_presence_strata=None,
     epoch_stats=None,
 ):
     if steps_per_epoch is None:
@@ -1844,17 +1881,26 @@ def train_one_epoch(
             (float(geology_contrastive_weight) > 0.0 or float(geology_uniformity_weight) > 0.0)
             and getattr(model, 'geology_head', None) is not None
             and geology_metadata_batch is not None
-            and geology_metadata_keys
+            and (geology_metadata_keys or geology_presence_strata is not None)
         ):
-            strata_labels = compute_batch_strata_labels(
-                geology_metadata_batch,
-                geology_metadata_keys,
-                geology_metadata_calibration=geology_metadata_calibration,
-                background_threshold=geology_background_threshold,
-                background_key_indices=geology_background_key_indices,
-                strata_presence_threshold=geology_strata_presence_threshold,
-                strata_max_active_keys=geology_strata_max_active_keys,
-            )
+            if geology_presence_strata is not None:
+                strata_classes, rarity = geology_presence_strata
+                strata_labels = build_presence_strata(
+                    presence_matrix_from_labels(geology_metadata_batch, strata_classes),
+                    strata_classes,
+                    rarity,
+                    max_active_keys_per_stratum=int(geology_strata_max_active_keys),
+                ).labels
+            else:
+                strata_labels = compute_batch_strata_labels(
+                    geology_metadata_batch,
+                    geology_metadata_keys,
+                    geology_metadata_calibration=geology_metadata_calibration,
+                    background_threshold=geology_background_threshold,
+                    background_key_indices=geology_background_key_indices,
+                    strata_presence_threshold=geology_strata_presence_threshold,
+                    strata_max_active_keys=geology_strata_max_active_keys,
+                )
             if strata_labels is not None:
                 z_geo = model.encode_geo(mu)
                 if float(geology_contrastive_weight) > 0.0:
@@ -1973,6 +2019,32 @@ def discover_model_data_volumes(root_path):
     return discovered
 
 
+def parse_class_quota(items):
+    quota = {}
+    for item in items or ():
+        name, sep, value = str(item).partition('=')
+        if not sep or name not in GEOLOGY_PRESENCE_CLASSES:
+            raise ValueError(
+                f"--geology_batch_class_quota entries must be CLASS=COUNT with CLASS in {GEOLOGY_PRESENCE_CLASSES}; got {item!r}"
+            )
+        quota[name] = int(value)
+    return quota
+
+
+def resolve_label_target_keys(args):
+    """Per-patch label arrays the training dataset must load (classifier targets, presence strata, class quotas)."""
+    keys = []
+    if float(getattr(args, 'geology_classifier_weight', 0.0)) > 0.0:
+        keys.extend(classifier_target_keys(args.geology_classifier_classes))
+    if bool(getattr(args, 'geology_batch_sampler', False)):
+        classes = []
+        if getattr(args, 'geology_strata_source', 'metadata') == 'presence_labels':
+            classes.extend(args.geology_strata_classes)
+        classes.extend(parse_class_quota(getattr(args, 'geology_batch_class_quota', None)))
+        keys.extend(PRESENCE_TARGET_KEYS[c] for c in classes)
+    return tuple(dict.fromkeys(keys))
+
+
 def build_dataset(args, data_path, augment=False):
     geology_keys = tuple(str(v) for v in (args.geology_metadata_keys or ()))
     include_metadata = bool(
@@ -2004,10 +2076,42 @@ def build_dataset(args, data_path, augment=False):
         mixup_augment_prob=args.mixup_augment_prob,
         include_metadata=include_metadata,
         geology_metadata_keys=geology_keys,
-        classifier_target_keys=(
-            classifier_target_keys(args.geology_classifier_classes)
-            if float(getattr(args, 'geology_classifier_weight', 0.0)) > 0.0 else ()
-        ),
+        label_target_keys=resolve_label_target_keys(args),
+    )
+
+
+def presence_matrix_from_labels(label_arrays, class_names):
+    """(N, C) 0/1 matrix from label_presence_<class> arrays (dict of arrays or collated batch tensors)."""
+    columns = []
+    for name in class_names:
+        value = label_arrays[PRESENCE_TARGET_KEYS[name]]
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        columns.append((np.asarray(value).reshape(-1) > 0).astype(np.float64))
+    return np.stack(columns, axis=1)
+
+
+def build_metadata_strata(dataset, args, geology_metadata_calibration, geology_background_key_indices):
+    metadata_keys = tuple(str(v) for v in getattr(dataset, 'geology_metadata_keys', ()))
+    metadata_dict = {
+        key: np.asarray(dataset._metadata_arrays[key][:], dtype=np.float64)
+        for key in metadata_keys
+    }
+    metadata_vectors, _ = prepare_geology_metadata_vectors(
+        metadata_dict,
+        metadata_keys,
+        device='cpu',
+        dtype=torch.float32,
+        geology_metadata_calibration=geology_metadata_calibration,
+        background_threshold=float(args.geology_background_threshold),
+        background_key_indices=geology_background_key_indices,
+    )
+    return build_multilabel_strata(
+        metadata_vectors.detach().cpu().numpy(),
+        metadata_keys,
+        threshold=float(args.geology_strata_presence_threshold),
+        active_key_indices=geology_background_key_indices,
+        max_active_keys_per_stratum=int(args.geology_strata_max_active_keys),
     )
 
 
@@ -2017,33 +2121,30 @@ def build_train_dataloader(
     sample_weights=None,
     geology_metadata_calibration=None,
     geology_background_key_indices=(),
+    presence_strata=None,
 ):
     if bool(getattr(args, 'geology_batch_sampler', False)):
         if not getattr(dataset, 'include_metadata', False):
             raise ValueError('geology_batch_sampler requires metadata-enabled training dataset.')
 
-        metadata_keys = tuple(str(v) for v in getattr(dataset, 'geology_metadata_keys', ()))
-        metadata_dict = {
-            key: np.asarray(dataset._metadata_arrays[key][:], dtype=np.float64)
-            for key in metadata_keys
+        if presence_strata is not None:
+            strata_classes, rarity = presence_strata
+            strata = build_presence_strata(
+                presence_matrix_from_labels(dataset._label_arrays, strata_classes),
+                strata_classes,
+                rarity,
+                max_active_keys_per_stratum=int(args.geology_strata_max_active_keys),
+            )
+        else:
+            strata = build_metadata_strata(dataset, args, geology_metadata_calibration, geology_background_key_indices)
+        class_quota = parse_class_quota(getattr(args, 'geology_batch_class_quota', None))
+        membership_classes: list[str] = list(dict.fromkeys(
+            list(presence_strata[0] if presence_strata is not None else ()) + list(class_quota)
+        ))
+        class_membership: dict[str, np.ndarray] = {
+            name: np.asarray(dataset._label_arrays[PRESENCE_TARGET_KEYS[name]]) > 0
+            for name in membership_classes
         }
-        metadata_matrix = _metadata_batch_to_matrix(metadata_dict, metadata_keys)
-        metadata_vectors, _ = prepare_geology_metadata_vectors(
-            metadata_dict,
-            metadata_keys,
-            device='cpu',
-            dtype=torch.float32,
-            geology_metadata_calibration=geology_metadata_calibration,
-            background_threshold=float(args.geology_background_threshold),
-            background_key_indices=geology_background_key_indices,
-        )
-        strata = build_multilabel_strata(
-            metadata_vectors.detach().cpu().numpy(),
-            metadata_keys,
-            threshold=float(args.geology_strata_presence_threshold),
-            active_key_indices=geology_background_key_indices,
-            max_active_keys_per_stratum=int(args.geology_strata_max_active_keys),
-        )
 
         if args.number_batches is not None:
             num_batches = int(args.number_batches)
@@ -2062,6 +2163,8 @@ def build_train_dataloader(
             min_negative_strata=int(args.geology_batch_min_negative_strata),
             require_positive_pair=bool(args.geology_batch_require_positive_pair),
             allow_duplicates=bool(args.geology_batch_allow_duplicates),
+            class_membership=class_membership,
+            class_quota=class_quota,
         )
         return DataLoader(dataset, batch_sampler=sampler, num_workers=2)
 
@@ -2423,6 +2526,11 @@ def train(args):
         raise ValueError('--geology_batch_min_negative_strata must be >= 1.')
     if int(args.geology_strata_max_active_keys) < 1:
         raise ValueError('--geology_strata_max_active_keys must be >= 1.')
+    uses_presence_strata = args.geology_strata_source == 'presence_labels'
+    if (uses_presence_strata or args.geology_batch_class_quota) and not args.geology_batch_sampler:
+        raise ValueError('--geology_strata_source presence_labels and --geology_batch_class_quota require --geology_batch_sampler.')
+    if sum(parse_class_quota(args.geology_batch_class_quota).values()) > int(args.batch_size):
+        raise ValueError('--geology_batch_class_quota counts must not exceed --batch_size.')
 
     ds = build_dataset(args, args.data, augment=args.augment)
     args.patch_size_xyz = resolve_patch_size_xyz(args.patch_size, ds.patch_shape)
@@ -2433,6 +2541,12 @@ def train(args):
     geology_metadata_calibration = None
     geology_background_key_indices = ()
     if bool((args.geology_loss_weight > 0.0 or bool(getattr(args, 'geology_batch_sampler', False))) and len(args.geology_metadata_keys) > 0):
+        calibration_weights = None
+        if args.geology_calibration_inclusion_weight:
+            train_store = cast(Any, zarr.open(str(args.data), mode='r'))
+            if 'inclusion_weight' in train_store:
+                calibration_weights = np.asarray(train_store['inclusion_weight'][:], dtype=np.float64)
+                print('Geology calibration: weighting examples by inclusion_weight (natural prevalence).')
         geology_metadata_calibration = fit_geology_metadata_calibration(
             ds,
             args.geology_metadata_keys,
@@ -2440,6 +2554,7 @@ def train(args):
             eps=float(args.geology_calibration_eps),
             clip=float(args.geology_calibration_clip),
             background_keys=args.geology_background_keys,
+            sample_weights=calibration_weights,
         )
         geology_background_key_indices = resolve_background_key_indices(
             args.geology_metadata_keys,
@@ -2474,12 +2589,25 @@ def train(args):
             f"snapshot_file={adaptive_snapshot_path}",
         )
 
+    presence_strata = None
+    if uses_presence_strata:
+        strata_classes = tuple(args.geology_strata_classes)
+        rarity = presence_rarity_weights(presence_matrix_from_labels(ds._label_arrays, strata_classes))
+        presence_strata = (strata_classes, rarity)
+        print(
+            'Geology strata: source=presence_labels',
+            f"classes={list(strata_classes)}",
+            f"rarity={[round(float(v), 2) for v in rarity]}",
+            f"class_quota={parse_class_quota(args.geology_batch_class_quota)}",
+        )
+
     dl = build_train_dataloader(
         ds,
         args,
         sample_weights=adaptive_sample_weights,
         geology_metadata_calibration=geology_metadata_calibration,
         geology_background_key_indices=geology_background_key_indices,
+        presence_strata=presence_strata,
     )
 
     if args.number_batches is not None and args.number_batches <= 0:
@@ -2592,8 +2720,8 @@ def train(args):
         pos_weight = classifier.pos_weight.clone()
         for i, name in enumerate(GEOLOGY_PRESENCE_CLASSES):
             key = PRESENCE_TARGET_KEYS[name]
-            if key in ds._classifier_arrays:
-                pos_weight[i] = compute_pos_weight(ds._classifier_arrays[key][:, None])[0]
+            if key in ds._label_arrays:
+                pos_weight[i] = compute_pos_weight(ds._label_arrays[key][:, None])[0]
         classifier.pos_weight.copy_(pos_weight)
         print(
             'Geology classifier:',
@@ -2900,6 +3028,7 @@ def train(args):
                 geology_classifier_loss=str(args.geology_classifier_loss),
                 geology_classifier_focal_gamma=float(args.geology_classifier_focal_gamma),
                 geology_classifier_label_smoothing=float(args.geology_classifier_label_smoothing),
+                geology_presence_strata=presence_strata,
                 epoch_stats=train_epoch_stats,
             )
             val_loss, val_lpips_loss, val_last_snapshot, geology_diagnostics = validate(
@@ -2999,6 +3128,9 @@ def train(args):
                 writer.add_scalar('sampling/fallback_duplicate_fill_count', float(sampler_stats.get('fallback_duplicate_fill_count', 0.0)), epoch_number)
                 writer.add_scalar('sampling/background_fraction_achieved', float(sampler_stats.get('background_fraction_achieved', 0.0)), epoch_number)
                 writer.add_scalar('sampling/hard_fraction_achieved', float(sampler_stats.get('hard_fraction_achieved', 0.0)), epoch_number)
+                for stat_key, stat_value in sampler_stats.items():
+                    if stat_key.startswith('class_'):
+                        writer.add_scalar(f'sampling/{stat_key}', float(stat_value), epoch_number)
 
             if args.adaptive_sampling_by_mse and epoch_number % args.sampling_snapshot_interval == 0:
                 snapshot_recon = compute_full_dataset_recon_snapshot(
@@ -3033,6 +3165,7 @@ def train(args):
                     sample_weights=adaptive_sample_weights,
                     geology_metadata_calibration=geology_metadata_calibration,
                     geology_background_key_indices=geology_background_key_indices,
+                    presence_strata=presence_strata,
                 )
 
                 writer.add_scalar('adaptive_sampling/recon_mean', float(np.mean(snapshot_recon)), epoch_number)
@@ -3175,6 +3308,9 @@ def train(args):
                     f"fallback_pos={sampler_stats.get('fallback_positive_pair_count', 0.0):.0f} "
                     f"fallback_dup={sampler_stats.get('fallback_duplicate_fill_count', 0.0):.0f}"
                 )
+                class_stats = {k: v for k, v in sampler_stats.items() if k.startswith('class_')}
+                if class_stats:
+                    print('  sampler class stats: ' + ' '.join(f"{k[len('class_'):]}={v:.3f}" for k, v in class_stats.items()))
 
             if early_stopping.epochs_without_improvement >= args.early_stopping_patience:
                 print(
@@ -3265,6 +3401,12 @@ if __name__ == '__main__':
     p.add_argument('--geology_diagnostic_neighbor_k', type=int, default=5, help='Neighbor count for validation latent/geology top-k overlap.')
     p.add_argument('--geology_diagnostic_topk', type=int, nargs='+', default=[5, 10, 20], help='Neighbor-overlap k values reported during latent geology diagnostics.')
     p.add_argument('--geology_batch_sampler', action='store_true', help='Enable geology-aware constrained batch sampling (Phase 2).')
+    p.add_argument('--geology_strata_source', type=str, default='metadata', choices=['metadata', 'presence_labels'], help='Build sampler and SupCon strata from thresholded calibrated metadata (default) or from label_presence_* arrays.')
+    p.add_argument('--geology_strata_classes', nargs='+', default=['fault', 'fault_x', 'channel', 'closure', 'onlap', 'flat_spot'], choices=list(GEOLOGY_PRESENCE_CLASSES), help='Presence classes used for strata with --geology_strata_source presence_labels.')
+    p.add_argument('--geology_batch_class_quota', nargs='+', default=None, metavar='CLASS=COUNT', help='Minimum samples per batch containing each listed presence class (e.g. fault_x=1 flat_spot=1), filled before the other batch constraints.')
+    p.add_argument('--geology_calibration_inclusion_weight', dest='geology_calibration_inclusion_weight', action='store_true', help='Weight metadata calibration by the dataset inclusion_weight array when present (default).')
+    p.add_argument('--no_geology_calibration_inclusion_weight', dest='geology_calibration_inclusion_weight', action='store_false', help='Fit metadata calibration without inclusion weights.')
+    p.set_defaults(geology_calibration_inclusion_weight=True)
     p.add_argument('--geology_strata_presence_threshold', type=float, default=1e-4, help='Presence threshold on calibrated metadata features for stratum assignment.')
     p.add_argument('--geology_strata_max_active_keys', type=int, default=2, help='Maximum active geology feature keys retained in multi-label stratum signatures.')
     p.add_argument('--geology_batch_background_fraction', type=float, default=0.20, help='Target fraction of neutral/background examples in each geology-aware batch.')
