@@ -54,7 +54,7 @@ Measured on the source data (`/Volumes/CrucialX9/fake_data`, 205 volumes) on 202
 
 Label arrays have depth **1510**; seismic (`seismicCubes_cumsum_fullstack`) has depth **1499**.
 Alignment **verified in WP0**: `seismic[z] ↔ label[z + 1]` (`--label_z_offset 1`); the 10 pad samples
-are at the bottom. See [WP0 session](../sessions/2026-09-25-wp0-label-seismic-alignment.md).
+are at the bottom. See the [progress log](../sessions/2026-09-25-geology-classifier-progress.md).
 
 ### 2.2 Class imbalance per 32×32×64 patch (6 volumes, 1,800 patches per sampler)
 
@@ -587,11 +587,10 @@ Parameter notes:
 **Correctness**
 
 - [x] WP0 alignment offset verified on ≥ 5 volumes (offset +1, 8 + 20 volumes).
-- [ ] Offset recorded in output attrs (WP2).
+- [x] Offset recorded in output attrs (WP2).
 - [x] Sand/shale fix verified against a hand-built synthetic volume (WP1).
-- [ ] Train and validation volumes are disjoint (assert in `sample_patches.py` when both
-      output stores list their `source_volumes`; add a small check script or test).
-- [ ] Anchored patches contain their anchor class (tested).
+- [x] Train and validation volumes are disjoint (`--disjoint_from` in `sample_patches.py`, WP2).
+- [x] Anchored patches contain their anchor class (tested).
 
 **Backward compatibility**
 
@@ -610,9 +609,9 @@ Parameter notes:
 
 **Operational**
 
-- [ ] Anchor index built chunk by chunk; peak memory per volume measured on one real volume.
-- [ ] Sampling runtime measured for one real volume and reported before a full run.
-- [ ] Output attrs record every sampling parameter, the seed, and the label class order.
+- [x] Anchor index built chunk by chunk; peak memory per volume measured on one real volume (1.8 GB).
+- [x] Sampling runtime measured for one real volume and reported before a full run (51 s / 600 patches).
+- [x] Output attrs record every sampling parameter, the seed, and the label class order.
 - [ ] Suite script uses `set -euo pipefail` and fails fast on missing inputs.
 - [ ] Tests run with: `.venv/bin/python -m unittest discover -s tests`.
 

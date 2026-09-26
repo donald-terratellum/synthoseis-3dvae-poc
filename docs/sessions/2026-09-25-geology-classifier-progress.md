@@ -45,8 +45,8 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | prep | Source path fix (`CrucialX9`), dip-range / dip-class metadata in `sample_patches.py` | Done | Suite OK | Done before WP0 |
 | WP0 | Label/seismic depth alignment | **Done** | 9 new; suite 112 OK | `label_z_offset = 1` |
 | WP1 | Sand/shale fix, water/closure metadata, seismic key default, `--exclude_dir` | **Done** | 9 new; suite 121 OK | Train/val volume lists are disjoint (180 / 25) |
-| WP2 | Class-anchored sampler | Next | — | Uses `--label_z_offset 1` |
-| WP3 | Classifier decoder (patch mode) | Not started | — | — |
+| WP2 | Class-anchored sampler | **Done** | 18 new; suite 139 OK | Weighted presence matches uniform on real data |
+| WP3 | Classifier decoder (patch mode) | Next | — | — |
 | WP4 | Label-driven batch sampler | Not started | — | — |
 | WP5 | Evaluation additions | Not started | — | — |
 | WP6 | Voxel mode | Not started | — | Alignment no longer blocks it |
@@ -65,7 +65,7 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | Sand/shale fraction maps lithology with `(x+1)/2`, so shale counts as 0.5 sand and water counts as shale (lithology: −1 water, 0 shale, 1 sand) | WP1 (fixed) |
 | `rglob` over `fake_data` also picks up `fake_data/validation`, leaking validation volumes into training | WP1 (fixed: `--exclude_dir`) |
 | Default `--seismic_key` has a double underscore and matches no volume | WP1 (fixed) |
-| Labels are read at the seismic origin, one sample off | WP2 (`--label_z_offset`) |
+| Labels are read at the seismic origin, one sample off | WP2 (fixed when `--label_z_offset 1` is passed; the default of 0 keeps the old behavior) |
 
 ---
 
@@ -81,9 +81,13 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
   derivative) with lithology boundaries for offsets −15…+15.
 
 **Result:** `seismic[z]` matches `label[z + 1]`.
-- The labels carry 10 padding samples at the bottom.
+- The labels carry 10 padding samples at the bottom. `Geomodels.py` allocates
+  `cube_shape[2] + pad_samples`, and `Seismic.py` trims the elastic properties with
+  `[:, :, :nz]`.
 - The reflectivity (and therefore the seismic) has one sample fewer than the 1500-sample
-  rock property model.
+  rock property model. `rfc[k]` is the interface between samples `k` and `k+1`, and the
+  cumulative sum carries each step to the layer below. Synthoseis's own QC overlays use
+  offset 0, so they are one sample off.
 - On real data, the mean correlation peak is at +1 on both 8 and 20 volumes (sub-sample
   estimates +0.86 to +1.21). 17 of 20 volumes are within ±1. The outliers have two
   correlation peaks, most likely from regular layer spacing.
@@ -91,7 +95,6 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 **Artifacts:**
 - [scripts/verify_label_alignment.py](../../scripts/verify_label_alignment.py)
 - [tests/test_label_alignment.py](../../tests/test_label_alignment.py)
-- Details: [2026-09-25-wp0-label-seismic-alignment.md](2026-09-25-wp0-label-seismic-alignment.md)
 - JSON reports in `data/` (gitignored)
 
 **Decision:** proceed to WP1.
@@ -133,6 +136,71 @@ top of them.
   sand/shale as targets.
 
 **Decision:** proceed to WP2.
+
+### WP2 — Class-anchored sampler (done)
+
+**Goal:** make rare geology classes common in training patches, and record per-patch class
+labels for the classifier (WP3) and the batch sampler (WP4).
+
+**Method** (in [scripts/sample_patches.py](../../scripts/sample_patches.py)):
+- **`--sampling_mode {geoscore,class_anchored,uniform}`.** The default, `geoscore`, keeps the
+  old behavior.
+- **Anchor index.** For each volume, the sampler reads each label array chunk by chunk,
+  finds the voxels of each class, and keeps a random sample of their coordinates (capped per
+  class).
+- **Placing patches.** Each patch slot is assigned to a class according to the quotas. The
+  patch is then placed so that a random voxel of that class falls at a random position
+  inside it. If a volume has no voxels of a class, that slot becomes a uniform (background)
+  patch, and the fallback is counted.
+- **`--max_patches_per_object`.** Limits how many patches can come from one object. Faults
+  and closures are counted per segment id. Other classes have no ids, so they are counted
+  per coarse, patch-sized region.
+- **New per-patch arrays:**
+  - `label_presence_<class>` for 7 classes: 1 if the patch has at least 32 voxels of the
+    class;
+  - `anchor_class`: the class the patch was anchored on;
+  - `inclusion_weight`: a weight that undoes the oversampling of rare classes;
+  - optional `label_patches` (`--store_label_patches`), for voxel mode.
+- **Attrs.** All sampling parameters, the class order, and the anchored and fallback counts
+  are recorded.
+- **`--label_z_offset`.** Applies to label and metadata reads. The default is 0 for
+  backward compatibility; pass 1 for synthoseis data.
+- **`--disjoint_from OTHER.zarr`.** Fails if any source volume overlaps another output
+  store (train/validation check).
+
+**Result:**
+- **Tests.** Covered by the unit tests:
+  - `geoscore` output matches the pre-WP2 code exactly (golden hashes);
+  - anchored patches always contain their class;
+  - achieved shares are within ±3 percentage points of the quotas;
+  - fallback counts are correct when a class is absent;
+  - the per-object cap is honored;
+  - weights are finite and positive;
+  - label patch shapes and dtypes are correct;
+  - the index reads one chunk at a time;
+  - `--disjoint_from` rejects overlapping volumes.
+- **Real volume (run_1204, 600 patches).** Class-anchored sampling takes 51 s and 1.8 GB
+  peak memory; uniform sampling takes 46 s. That is about 2.5 h for 180 volumes.
+
+  | Class | Uniform | Anchored | Anchored, weighted |
+  |---|---:|---:|---:|
+  | fault | 0.088 | 0.308 | 0.097 |
+  | fault_x | 0.003 | 0.147 | 0.009 |
+  | channel | 0.020 | 0.132 | 0.021 |
+  | closure | 0.117 | 0.413 | 0.103 |
+  | onlap | 0.107 | 0.235 | 0.109 |
+  | flat_spot | 0.052 | 0.317 | 0.057 |
+  | none of the six | 0.733 | 0.250 | — |
+
+  - Every anchored patch contains its anchor class.
+  - All 600 origins are unique.
+  - The weighted presence rates recover the uniform rates, so the weights work.
+- **Tuning note.** This volume has only 4 fault ids, so the default cap of 8 per object
+  moved 48 of the 75 fault slots to background. For 600 patches per volume, consider
+  `--max_patches_per_object 24`, or accept a lower fault share (faults are already 31% of
+  patches through other anchors).
+
+**Decision:** proceed to WP3.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

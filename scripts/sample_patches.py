@@ -49,6 +49,23 @@ DERIVED_METADATA_KEYS = (
 DEFAULT_SEISMIC_KEY = "seismicCubes_cumsum_fullstack"
 # faulted_lithology: -1 water (above seabed), 0 shale, 1 sand; fractional at boundaries.
 DEFAULT_SAND_THRESHOLD = 0.5
+DEFAULT_ONLAP_THRESHOLD = 0.5
+
+LABEL_CLASS_ORDER = ("fault", "fault_x", "channel", "closure", "onlap", "sand", "flat_spot")
+LABEL_CLASS_SOURCES = {
+    "fault": "fault_segments_id",
+    "fault_x": "fault_intersection_segments",
+    "channel": "faults/faulted_channel_labels",
+    "closure": "closure_segments_id",
+    "onlap": "onlap_segments",
+    "sand": "faulted_lithology",
+    "flat_spot": "flat_spot",
+}
+# Classes whose source array holds distinct object ids; others use a coarse spatial cell as object key.
+OBJECT_ID_CLASSES = ("fault", "closure")
+DEFAULT_CLASS_QUOTAS = {c: 0.125 for c in ("fault", "fault_x", "channel", "closure", "onlap", "flat_spot")}
+DEFAULT_BACKGROUND_FRACTION = 0.25
+BACKGROUND = "background"
 
 # Edges chosen from observed patch distributions (dip mean p5-p95 ~10-56 deg, p90-p10 range p5-p95 ~7-30 deg).
 DIP_MEAN_CLASS_EDGES_DEG = (10.0, 20.0, 30.0, 40.0, 50.0)
@@ -184,8 +201,11 @@ def compute_patch_derived_metadata(
     geoscore_key,
     dip_source_key="geologic_age_faulted",
     sand_threshold=DEFAULT_SAND_THRESHOLD,
+    label_z_offset=0,
 ):
     metadata = {k: 0.0 for k in DERIVED_METADATA_KEYS}
+    # All metadata sources (including geologic_score) live in label depth space.
+    origin = (origin[0], origin[1], origin[2] + int(label_z_offset))
 
     geoscore_patch = _safe_extract_patch_by_key(zvol, geoscore_key, origin, patch_size)
     if geoscore_patch is not None and geoscore_patch.size > 0:
@@ -270,6 +290,8 @@ def sample_patches_from_model(
     allow_overlap=True,
     return_metadata=False,
     return_origin=False,
+    label_z_offset=0,
+    sand_threshold=DEFAULT_SAND_THRESHOLD,
 ):
     # zvol: root group for a model_data.zarr (zarr.core.Array or Group)
     # seismic_key: key in zvol pointing to seismic array
@@ -307,6 +329,8 @@ def sample_patches_from_model(
                     (i, j, k),
                     patch_size,
                     geoscore_key=geoscore_key,
+                    label_z_offset=label_z_offset,
+                    sand_threshold=sand_threshold,
                 )
                 if return_origin:
                     patches.append((patch, metadata, (i, j, k)))
@@ -317,6 +341,290 @@ def sample_patches_from_model(
             else:
                 patches.append(patch)
     return patches
+
+
+def class_mask(name, values, onlap_threshold=DEFAULT_ONLAP_THRESHOLD, sand_threshold=DEFAULT_SAND_THRESHOLD):
+    v = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if name == "onlap":
+        return v >= onlap_threshold
+    if name == "sand":
+        return v >= sand_threshold
+    return v > 0.0
+
+
+def parse_class_quotas(items):
+    quotas = {}
+    for item in items:
+        name, sep, value = item.partition("=")
+        if not sep or name not in LABEL_CLASS_ORDER:
+            raise ValueError(f"--class_quotas entries must be CLASS=FRACTION with CLASS in {LABEL_CLASS_ORDER}; got {item!r}")
+        quotas[name] = float(value)
+        if quotas[name] < 0:
+            raise ValueError(f"Quota for {name} must be >= 0")
+    return quotas
+
+
+def normalize_shares(class_quotas, background_fraction):
+    """Slot shares per class plus background, normalized to sum to 1."""
+    shares = {c: float(class_quotas.get(c, 0.0)) for c in LABEL_CLASS_ORDER}
+    shares[BACKGROUND] = float(background_fraction)
+    total = sum(shares.values())
+    if total <= 0:
+        raise ValueError("class quotas plus background fraction must be > 0")
+    return {k: v / total for k, v in shares.items()}
+
+
+def allocate_slots(n, shares, rng):
+    """Largest-remainder allocation of n slots to shares, returned in random order."""
+    names = list(shares)
+    exact = np.array([shares[k] * n for k in names])
+    counts = np.floor(exact).astype(int)
+    for i in np.argsort(-(exact - counts), kind="stable")[: n - counts.sum()]:
+        counts[i] += 1
+    slots = [name for name, c in zip(names, counts) for _ in range(int(c))]
+    return [slots[i] for i in rng.permutation(len(slots))]
+
+
+def build_anchor_index(
+    zvol,
+    seismic_shape,
+    label_z_offset=0,
+    max_coords=200000,
+    rng=None,
+    onlap_threshold=DEFAULT_ONLAP_THRESHOLD,
+    sand_threshold=DEFAULT_SAND_THRESHOLD,
+    classes=LABEL_CLASS_ORDER,
+):
+    """Reservoir-sampled class voxel coordinates (in seismic index space), read chunk by chunk.
+
+    Returns {class: {"coords": (n, 3) int32, "ids": (n,) int64, "count": total class voxels,
+    "valid_voxels": voxels in the seismic-covered label region}}.
+    """
+    rng = rng or np.random.default_rng(0)
+    sx, sy, sz = (int(v) for v in seismic_shape)
+    off = int(label_z_offset)
+    index = {}
+    for name in classes:
+        key = LABEL_CLASS_SOURCES[name]
+        entry = {"coords": np.zeros((0, 3), np.int32), "ids": np.zeros(0, np.int64), "count": 0, "valid_voxels": 0}
+        index[name] = entry
+        if key not in zvol:
+            continue
+        arr = zvol[key]
+        region = (min(sx, arr.shape[0]), min(sy, arr.shape[1]), (max(0, off), min(arr.shape[2], off + sz)))
+        z_lo, z_hi = region[2]
+        if z_hi <= z_lo:
+            continue
+        entry["valid_voxels"] = int(region[0] * region[1] * (z_hi - z_lo))
+        chunks = getattr(arr, "chunks", None) or arr.shape
+        keys = np.zeros(0)
+        for slc in iter_chunk_slices(arr.shape, chunks):
+            xs = slice(slc[0].start, min(slc[0].stop, region[0]))
+            ys = slice(slc[1].start, min(slc[1].stop, region[1]))
+            zs = slice(max(slc[2].start, z_lo), min(slc[2].stop, z_hi))
+            if xs.stop <= xs.start or ys.stop <= ys.start or zs.stop <= zs.start:
+                continue
+            block = np.asarray(arr[xs, ys, zs])
+            mask = class_mask(name, block, onlap_threshold, sand_threshold)
+            nz = np.nonzero(mask)
+            n_new = int(nz[0].size)
+            if n_new == 0:
+                continue
+            entry["count"] += n_new
+            coords = np.stack([nz[0] + xs.start, nz[1] + ys.start, nz[2] + zs.start - off], axis=1).astype(np.int32)
+            ids = np.rint(np.nan_to_num(block[nz].astype(np.float64))).astype(np.int64)
+            new_keys = rng.random(n_new)
+            keys = np.concatenate([keys, new_keys])
+            entry["coords"] = np.concatenate([entry["coords"], coords])
+            entry["ids"] = np.concatenate([entry["ids"], ids])
+            if keys.size > max_coords:
+                keep = np.argpartition(keys, max_coords - 1)[:max_coords]
+                keys, entry["coords"], entry["ids"] = keys[keep], entry["coords"][keep], entry["ids"][keep]
+    return index
+
+
+def _origin_from_anchor(anchor, seismic_shape, patch_size, anchor_jitter, rng):
+    a = np.asarray(anchor, dtype=np.int64)
+    p = np.asarray(patch_size, dtype=np.int64)
+    if anchor_jitter == "center":
+        o = a - p // 2
+    else:
+        o = a - rng.integers(0, p)
+    return tuple(int(v) for v in np.clip(o, 0, np.asarray(seismic_shape) - p))
+
+
+def _uniform_origin(seismic_shape, patch_size, rng):
+    return tuple(int(rng.integers(0, s - p + 1)) for s, p in zip(seismic_shape, patch_size))
+
+
+def sample_anchored_origins(
+    index,
+    seismic_shape,
+    patch_size,
+    n,
+    shares,
+    rng,
+    anchor_jitter="uniform",
+    max_patches_per_object=8,
+    max_redraws=20,
+):
+    """Return (origins, anchor_class_indices, stats); class index -1 means background."""
+    stats = {
+        "anchored": {c: 0 for c in LABEL_CLASS_ORDER},
+        "fallback": {c: 0 for c in LABEL_CLASS_ORDER},
+        "object_cap_fallback": {c: 0 for c in LABEL_CLASS_ORDER},
+    }
+    object_counts = {}
+    origins, anchor_classes = [], []
+    for slot in allocate_slots(n, shares, rng):
+        origin = None
+        if slot != BACKGROUND:
+            coords = index.get(slot, {}).get("coords", np.zeros((0, 3)))
+            if len(coords) == 0:
+                stats["fallback"][slot] += 1
+            else:
+                ids = index[slot]["ids"]
+                for _ in range(max_redraws):
+                    i = int(rng.integers(len(coords)))
+                    if slot in OBJECT_ID_CLASSES:
+                        obj = (slot, int(ids[i]))
+                    else:
+                        obj = (slot,) + tuple(int(c) // int(p) for c, p in zip(coords[i], patch_size))
+                    if max_patches_per_object and object_counts.get(obj, 0) >= max_patches_per_object:
+                        continue
+                    object_counts[obj] = object_counts.get(obj, 0) + 1
+                    origin = _origin_from_anchor(coords[i], seismic_shape, patch_size, anchor_jitter, rng)
+                    break
+                if origin is None:
+                    stats["object_cap_fallback"][slot] += 1
+        if origin is None:
+            origins.append(_uniform_origin(seismic_shape, patch_size, rng))
+            anchor_classes.append(-1)
+        else:
+            origins.append(origin)
+            anchor_classes.append(LABEL_CLASS_ORDER.index(slot))
+            stats["anchored"][slot] += 1
+    return origins, anchor_classes, stats
+
+
+def compute_label_presence(
+    zvol,
+    origin,
+    patch_size,
+    label_z_offset=0,
+    presence_min_voxels=32,
+    onlap_threshold=DEFAULT_ONLAP_THRESHOLD,
+    sand_threshold=DEFAULT_SAND_THRESHOLD,
+    return_masks=False,
+):
+    """Per-class voxel counts and presence flags for the label window matching a seismic patch."""
+    i, j, k = origin
+    px, py, pz = patch_size
+    k += int(label_z_offset)
+    counts = {}
+    masks = np.zeros((len(LABEL_CLASS_ORDER), px, py, pz), dtype=np.uint8) if return_masks else None
+    for ci, name in enumerate(LABEL_CLASS_ORDER):
+        key = LABEL_CLASS_SOURCES[name]
+        counts[name] = 0
+        if key not in zvol:
+            continue
+        block = np.asarray(zvol[key][i:i + px, j:j + py, k:k + pz])
+        if block.shape != (px, py, pz):
+            continue
+        mask = class_mask(name, block, onlap_threshold, sand_threshold)
+        counts[name] = int(mask.sum())
+        if masks is not None:
+            masks[ci] = mask
+    presence = {name: int(counts[name] >= presence_min_voxels) for name in LABEL_CLASS_ORDER}
+    return counts, presence, masks
+
+
+def compute_inclusion_weight(counts, realized_shares, densities, patch_voxels):
+    """Importance weight p_uniform(origin) / q_mixture(origin) for a class-anchored patch.
+
+    With uniform jitter, a class-c anchored draw lands on an origin with probability roughly
+    proportional to the class-c voxel count in that patch, normalized by the class density.
+    """
+    denom = realized_shares.get(BACKGROUND, 0.0)
+    for name in LABEL_CLASS_ORDER:
+        s = realized_shares.get(name, 0.0)
+        rho = densities.get(name, 0.0)
+        if s > 0 and rho > 0:
+            denom += s * counts.get(name, 0) / (rho * patch_voxels)
+    return float(1.0 / denom) if denom > 0 else 1.0
+
+
+def sample_labeled_patches(
+    zvol,
+    seismic_key,
+    patch_size,
+    n,
+    rng,
+    sampling_mode="class_anchored",
+    shares=None,
+    anchor_jitter="uniform",
+    max_patches_per_object=8,
+    anchor_index_max_coords=200000,
+    presence_min_voxels=32,
+    onlap_threshold=DEFAULT_ONLAP_THRESHOLD,
+    sand_threshold=DEFAULT_SAND_THRESHOLD,
+    label_z_offset=0,
+    store_label_patches=False,
+    geoscore_key="geologic_score",
+):
+    """Sample patches with 'class_anchored' or 'uniform' origins; returns (items, stats)."""
+    if seismic_key not in zvol:
+        return [], None
+    seismic = np.asarray(zvol[seismic_key])
+    if seismic.ndim != 3 or any(s < p for s, p in zip(seismic.shape, patch_size)):
+        return [], None
+    shape = seismic.shape
+    stats = None
+    densities = {}
+    if sampling_mode == "uniform":
+        origins = [_uniform_origin(shape, patch_size, rng) for _ in range(n)]
+        anchors = [-1] * n
+    elif sampling_mode == "class_anchored":
+        shares = shares or normalize_shares(DEFAULT_CLASS_QUOTAS, DEFAULT_BACKGROUND_FRACTION)
+        index = build_anchor_index(
+            zvol, shape, label_z_offset, anchor_index_max_coords, rng, onlap_threshold, sand_threshold
+        )
+        densities = {c: (e["count"] / e["valid_voxels"] if e["valid_voxels"] else 0.0) for c, e in index.items()}
+        origins, anchors, stats = sample_anchored_origins(
+            index, shape, patch_size, n, shares, rng, anchor_jitter, max_patches_per_object
+        )
+    else:
+        raise ValueError(f"Unsupported sampling_mode: {sampling_mode}")
+
+    realized = {BACKGROUND: anchors.count(-1) / max(n, 1)}
+    for ci, name in enumerate(LABEL_CLASS_ORDER):
+        realized[name] = anchors.count(ci) / max(n, 1)
+    patch_voxels = int(np.prod(patch_size))
+    sx, sy, sz = patch_size
+    items = []
+    for (i, j, k), anchor in zip(origins, anchors):
+        counts, presence, masks = compute_label_presence(
+            zvol, (i, j, k), patch_size, label_z_offset, presence_min_voxels,
+            onlap_threshold, sand_threshold, return_masks=store_label_patches,
+        )
+        weight = (
+            compute_inclusion_weight(counts, realized, densities, patch_voxels)
+            if sampling_mode == "class_anchored" else 1.0
+        )
+        items.append({
+            "patch": seismic[i:i + sx, j:j + sy, k:k + sz],
+            "metadata": compute_patch_derived_metadata(
+                zvol, (i, j, k), patch_size, geoscore_key,
+                sand_threshold=sand_threshold, label_z_offset=label_z_offset,
+            ),
+            "origin": (i, j, k),
+            "anchor_class": anchor,
+            "inclusion_weight": weight,
+            "counts": counts,
+            "presence": presence,
+            "label_patch": masks,
+        })
+    return items, stats
 
 
 def iter_chunk_slices(shape, chunks):
@@ -505,31 +813,79 @@ def main():
     p.set_defaults(derive_dataset_stats=True)
     p.add_argument("--allow_overlap", dest="allow_overlap", action="store_true", help="Allow overlapping/duplicate patch centers (default).")
     p.add_argument("--no_overlap", dest="allow_overlap", action="store_false", help="Disallow overlapping by sampling unique candidate centers.")
+    p.add_argument(
+        "--sampling_mode",
+        choices=["geoscore", "class_anchored", "uniform"],
+        default="geoscore",
+        help="geoscore: legacy geologic_score-weighted origins; class_anchored: origins anchored on label classes; uniform: natural prevalence.",
+    )
+    p.add_argument(
+        "--class_quotas",
+        nargs="+",
+        default=None,
+        metavar="CLASS=FRACTION",
+        help=f"Share of anchors per class (classes: {', '.join(LABEL_CLASS_ORDER)}). Default: 0.125 for each class except sand.",
+    )
+    p.add_argument("--background_fraction", type=float, default=DEFAULT_BACKGROUND_FRACTION, help="Share of uniform (non-anchored) patches.")
+    p.add_argument("--anchor_jitter", choices=["uniform", "center"], default="uniform", help="Where the anchor voxel lands in the patch.")
+    p.add_argument("--max_patches_per_object", type=int, default=8, help="Cap per object (segment id, or coarse cell for classes without ids); 0 disables.")
+    p.add_argument("--anchor_index_max_coords", type=int, default=200000, help="Reservoir cap on stored anchor coordinates per class per volume.")
+    p.add_argument("--presence_min_voxels", type=int, default=32, help="Minimum class voxels for label_presence_<class> = 1.")
+    p.add_argument("--onlap_threshold", type=float, default=DEFAULT_ONLAP_THRESHOLD)
+    p.add_argument("--sand_threshold", type=float, default=DEFAULT_SAND_THRESHOLD)
+    p.add_argument("--store_label_patches", action="store_true", help="Also store (N, 7, X, Y, Z) uint8 label patches (voxel mode).")
+    p.add_argument(
+        "--label_z_offset",
+        type=int,
+        default=0,
+        help="Label depth offset: seismic[z] matches label[z + offset]. Synthoseis data: 1 (verified in WP0).",
+    )
+    p.add_argument(
+        "--disjoint_from",
+        action="append",
+        default=[],
+        metavar="ZARR",
+        help="Fail if any source volume is listed in this existing output store's source_volumes (repeatable).",
+    )
     args = p.parse_args()
     patch_size = normalize_patch_size(args.patch_size)
     sampling_seed = int(args.seed) if args.seed is not None else secrets.randbits(32)
     random.seed(sampling_seed)
     np.random.seed(sampling_seed)
+    label_rng = np.random.default_rng(sampling_seed)
     print(f"Sampling seed: {sampling_seed}")
+
+    class_quotas = parse_class_quotas(args.class_quotas) if args.class_quotas else dict(DEFAULT_CLASS_QUOTAS)
+    shares = normalize_shares(class_quotas, args.background_fraction)
 
     src = Path(args.source)
     out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
 
-    # create destination zarr
-    dst = cast(Any, zarr.open(str(out), mode="w"))
-    # zarr 2.x uses create_dataset on groups, zarr 3.x uses create_array
-    if hasattr(dst, 'create_dataset'):
-        dst.create_dataset("patches", shape=(args.n_patches, patch_size[0], patch_size[1], patch_size[2]), dtype="f4", chunks=(1, patch_size[0], patch_size[1], patch_size[2]))
-    else:
-        dst.create_array("patches", shape=(args.n_patches, patch_size[0], patch_size[1], patch_size[2]), dtype="f4", chunks=(1, patch_size[0], patch_size[1], patch_size[2]))
-
-    written = 0
-    metadata_arrays = {}
     vols = list_source_volumes(src, args.exclude_dir)
     if not vols:
         print("No model_data.zarr volumes found under", src)
         return
+    for other in args.disjoint_from:
+        other_vols = set(cast(list, zarr.open_group(str(other), mode="r").attrs.get("source_volumes", [])))
+        overlap = sorted(other_vols.intersection(str(v) for v in vols))
+        if overlap:
+            raise SystemExit(f"{len(overlap)} source volumes overlap with {other}, e.g. {overlap[0]}")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # create destination zarr
+    dst = cast(Any, zarr.open(str(out), mode="w"))
+
+    def create(name, shape, dtype, chunks):
+        # zarr 2.x uses create_dataset on groups, zarr 3.x uses create_array
+        if hasattr(dst, 'create_dataset'):
+            return dst.create_dataset(name, shape=shape, dtype=dtype, chunks=chunks)
+        return dst.create_array(name, shape=shape, dtype=dtype, chunks=chunks)
+
+    create("patches", (args.n_patches, patch_size[0], patch_size[1], patch_size[2]), "f4", (1, patch_size[0], patch_size[1], patch_size[2]))
+
+    written = 0
+    metadata_arrays = {}
 
     scaling_mean = 0.0 if args.dataset_mean is None else float(args.dataset_mean)
     scaling_std = 1.0 if args.dataset_std is None else float(args.dataset_std)
@@ -546,16 +902,34 @@ def main():
     dst.attrs["sampling_seed"] = sampling_seed
     dst.attrs["source_volumes"] = [str(vol) for vol in vols]
     dst.attrs["exclude_dirs"] = list(args.exclude_dir)
-    dst.attrs["sand_threshold"] = DEFAULT_SAND_THRESHOLD
+    dst.attrs["sand_threshold"] = float(args.sand_threshold)
     dst.attrs["dip_mean_class_edges_deg"] = list(DIP_MEAN_CLASS_EDGES_DEG)
     dst.attrs["dip_range_class_edges_deg"] = list(DIP_RANGE_CLASS_EDGES_DEG)
+    dst.attrs["sampling_mode"] = args.sampling_mode
+    dst.attrs["label_z_offset"] = int(args.label_z_offset)
+    dst.attrs["label_class_order"] = list(LABEL_CLASS_ORDER)
+    dst.attrs["label_class_sources"] = dict(LABEL_CLASS_SOURCES)
+    dst.attrs["presence_min_voxels"] = int(args.presence_min_voxels)
+    dst.attrs["onlap_threshold"] = float(args.onlap_threshold)
+    if args.sampling_mode == "class_anchored":
+        dst.attrs["class_quotas"] = {c: shares[c] for c in LABEL_CLASS_ORDER}
+        dst.attrs["background_fraction"] = shares[BACKGROUND]
+        dst.attrs["anchor_jitter"] = args.anchor_jitter
+        dst.attrs["max_patches_per_object"] = int(args.max_patches_per_object)
+        dst.attrs["anchor_index_max_coords"] = int(args.anchor_index_max_coords)
     patches_dst = cast(Any, dst["patches"])
+    vec_chunks = (min(args.n_patches, 2048),)
     provenance_arrays = {}
     for key in ("source_volume_index", "origin_x", "origin_y", "origin_z"):
-        if hasattr(dst, 'create_dataset'):
-            provenance_arrays[key] = dst.create_dataset(key, shape=(args.n_patches,), dtype="i4", chunks=(min(args.n_patches, 2048),))
-        else:
-            provenance_arrays[key] = dst.create_array(key, shape=(args.n_patches,), dtype="i4", chunks=(min(args.n_patches, 2048),))
+        provenance_arrays[key] = create(key, (args.n_patches,), "i4", vec_chunks)
+    presence_arrays = {c: create(f"label_presence_{c}", (args.n_patches,), "u1", vec_chunks) for c in LABEL_CLASS_ORDER}
+    anchor_class_dst = create("anchor_class", (args.n_patches,), "i1", vec_chunks)
+    inclusion_weight_dst = create("inclusion_weight", (args.n_patches,), "f4", vec_chunks)
+    label_patches_dst = None
+    if args.store_label_patches:
+        lp_shape = (len(LABEL_CLASS_ORDER),) + tuple(patch_size)
+        label_patches_dst = create("label_patches", (args.n_patches,) + lp_shape, "u1", (1,) + lp_shape)
+    totals = {k: {c: 0 for c in LABEL_CLASS_ORDER} for k in ("anchored", "fallback", "object_cap_fallback")}
 
     for volume_index, vol in enumerate(vols):
         print("Scanning", vol)
@@ -573,27 +947,56 @@ def main():
                         f"min={vol_stats['min']:.6f}",
                         f"max={vol_stats['max']:.6f}",
                     )
-            patch_items = sample_patches_from_model(
-                z,
-                args.seismic_key,
-                args.geoscore_key,
-                patch_size,
-                n_patches_per_vol=args.n_per_volume,
-                allow_overlap=args.allow_overlap,
-                return_metadata=True,
-                return_origin=True,
-            )
-            for pch, metadata, origin in patch_items:
+            if args.sampling_mode == "geoscore":
+                patch_items = [
+                    {"patch": pch, "metadata": metadata, "origin": origin, "anchor_class": -1,
+                     "inclusion_weight": 1.0, "presence": None, "label_patch": None}
+                    for pch, metadata, origin in sample_patches_from_model(
+                        z,
+                        args.seismic_key,
+                        args.geoscore_key,
+                        patch_size,
+                        n_patches_per_vol=args.n_per_volume,
+                        allow_overlap=args.allow_overlap,
+                        return_metadata=True,
+                        return_origin=True,
+                        label_z_offset=args.label_z_offset,
+                        sand_threshold=args.sand_threshold,
+                    )
+                ]
+            else:
+                n_vol = min(args.n_per_volume, args.n_patches - written)
+                patch_items, vol_counts = sample_labeled_patches(
+                    z,
+                    args.seismic_key,
+                    patch_size,
+                    n_vol,
+                    label_rng,
+                    sampling_mode=args.sampling_mode,
+                    shares=shares,
+                    anchor_jitter=args.anchor_jitter,
+                    max_patches_per_object=args.max_patches_per_object,
+                    anchor_index_max_coords=args.anchor_index_max_coords,
+                    presence_min_voxels=args.presence_min_voxels,
+                    onlap_threshold=args.onlap_threshold,
+                    sand_threshold=args.sand_threshold,
+                    label_z_offset=args.label_z_offset,
+                    store_label_patches=args.store_label_patches,
+                    geoscore_key=args.geoscore_key,
+                )
+                if vol_counts:
+                    for kind, per_class in vol_counts.items():
+                        for c, v in per_class.items():
+                            totals[kind][c] += int(v)
+            for item in patch_items:
                 if written >= args.n_patches:
                     break
+                pch, metadata, origin = item["patch"], item["metadata"], item["origin"]
                 pch = apply_scaling(pch.astype("f4"), args.scaling, scaling_mean, scaling_std)
                 patches_dst[written] = pch.astype("f4")
                 if not metadata_arrays:
                     for key in DERIVED_METADATA_KEYS:
-                        if hasattr(dst, 'create_dataset'):
-                            metadata_arrays[key] = dst.create_dataset(key, shape=(args.n_patches,), dtype="f4", chunks=(min(args.n_patches, 2048),))
-                        else:
-                            metadata_arrays[key] = dst.create_array(key, shape=(args.n_patches,), dtype="f4", chunks=(min(args.n_patches, 2048),))
+                        metadata_arrays[key] = create(key, (args.n_patches,), "f4", vec_chunks)
                     dst.attrs["derived_metadata_keys"] = list(DERIVED_METADATA_KEYS)
                 for key in DERIVED_METADATA_KEYS:
                     metadata_arrays[key][written] = np.float32(metadata.get(key, 0.0))
@@ -601,11 +1004,31 @@ def main():
                 provenance_arrays["origin_x"][written] = np.int32(origin[0])
                 provenance_arrays["origin_y"][written] = np.int32(origin[1])
                 provenance_arrays["origin_z"][written] = np.int32(origin[2])
+                presence = item["presence"]
+                label_patch = item["label_patch"]
+                if presence is None:
+                    _, presence, label_patch = compute_label_presence(
+                        z, origin, patch_size, args.label_z_offset, args.presence_min_voxels,
+                        args.onlap_threshold, args.sand_threshold, return_masks=args.store_label_patches,
+                    )
+                for c in LABEL_CLASS_ORDER:
+                    presence_arrays[c][written] = np.uint8(presence[c])
+                anchor_class_dst[written] = np.int8(item["anchor_class"])
+                inclusion_weight_dst[written] = np.float32(item["inclusion_weight"])
+                if label_patches_dst is not None:
+                    label_patches_dst[written] = label_patch
                 written += 1
             if written >= args.n_patches:
                 break
         except Exception as e:
             print("Failed to read", vol, e)
+    if args.sampling_mode == "class_anchored":
+        dst.attrs["anchored_counts"] = totals["anchored"]
+        dst.attrs["fallback_counts"] = totals["fallback"]
+        dst.attrs["object_cap_fallback_counts"] = totals["object_cap_fallback"]
+        print("Anchored counts:", totals["anchored"])
+        print("Fallback counts:", totals["fallback"], "object cap fallbacks:", totals["object_cap_fallback"])
+    dst.attrs["n_written"] = int(written)
     print(f"Wrote {written} patches to {out}")
 
 
