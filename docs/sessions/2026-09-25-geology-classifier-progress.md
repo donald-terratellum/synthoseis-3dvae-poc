@@ -50,7 +50,7 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | WP4 | Label-driven batch sampler | **Done** | 16 new; suite 173 OK | Quotas met in 100% of smoke batches |
 | WP5 | Evaluation additions | **Done** | 13 new; suite 186 OK | R0 reproduces n@5 0.139; 5 of 25 validation volumes have no labels |
 | WP6 | Voxel mode | Not started | — | Gated on WP3 improving n@5 (needs R2) |
-| WP7 | Suite script and docs | Not started | — | — |
+| WP7 | Suite script and docs | **Done** | 4 new; suite 190 OK | `scripts/geoaware_classifier_suite.sh` |
 
 ## Benchmark results
 
@@ -388,6 +388,57 @@ n@5 / n@10 on the frozen manifest as the primary metric.
 
 **Decision:** proceed to WP7 (scripts and docs). WP6 (voxel mode) stays gated on WP3
 improving n@5, which requires the R1/R2 training runs on the full sampled dataset.
+
+### WP7 — Suite script and docs (done)
+
+**Method:**
+- [scripts/geoaware_classifier_suite.sh](../../scripts/geoaware_classifier_suite.sh)
+  implements plan Section 8 in three stages (`sample | train | benchmark | all`), with
+  `set -euo pipefail`.
+  - **sample:** class-anchored training data (validation excluded, `--label_z_offset 1`,
+    `--max_patches_per_object 24`), plus 4,000 uniform validation patches from the 20
+    labeled validation volumes (`--disjoint_from` the training store).
+  - **train:** the R3 settings, i.e. the Phase 2 recipe plus the classifier (focal loss,
+    weight 0.1), presence strata, and quotas `fault_x=1 flat_spot=1 channel=1`.
+  - **benchmark:** the frozen manifest plus classifier metrics, for each epoch in
+    `BENCH_EPOCHS`.
+  - Settings can be overridden with environment variables. `PRINT_COMMANDS=1` prints the
+    commands without running them.
+  - The script fails fast on missing inputs, and refuses to overwrite outputs unless
+    `OVERWRITE=1` is set.
+- [docs/training/README.md](../training/README.md) has a new section with tables of every
+  new flag for `sample_patches.py`, `train.py`, and `evaluate_geology_benchmark.py`, plus
+  the suite usage. The legacy quick-start now notes that its validation set overlaps the
+  training volumes.
+
+**Result:** [tests/test_classifier_suite_script.py](../../tests/test_classifier_suite_script.py) checks:
+- the bash syntax;
+- that every flag the suite passes exists in the target script's `--help`;
+- that an unknown stage exits with code 2;
+- that missing inputs fail fast.
+
+**Decision:** implementation of WP0–WP5 and WP7 is complete. Next are the experiment runs.
+
+---
+
+## Next steps (experiments)
+
+1. **Sample.** Run `scripts/geoaware_classifier_suite.sh sample`. Expect about 2.5 h for
+   the training set (51 s per volume × 180) plus the validation set. Check the attrs
+   (`anchored_counts`, `fallback_counts`, `skipped_volumes_missing_labels`) before training.
+2. **One primary variable per run (plan Section 7).** The suite's `train` stage uses the R3
+   settings. For clean attribution, run R1 and R2 first by editing a copy of the train
+   command:
+   - **R1** = anchored data only: drop the `--geology_classifier*`,
+     `--geology_strata_source`, and `--geology_batch_class_quota` flags.
+   - **R2** = R1 + classifier: keep the `--geology_classifier*` flags.
+   - **R3** = R2 + presence strata and quotas: the suite as written.
+3. **Benchmark** epochs 10/20/30/40, and add the rows to the results table. Adopt a run
+   only if n@5 > 0.139 and `val_loss` regresses by no more than 2% on the same validation
+   set.
+4. **Classifier checks.** Check `classifier_metrics.sanity_gate`, and compare
+   `--classifier_preprocess tokenizer` with `extrema` (see the WP5 findings).
+5. **WP6 (voxel mode)** only if R2 or R3 improves n@5.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

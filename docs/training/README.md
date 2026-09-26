@@ -28,6 +28,9 @@ uv run python scripts/sample_patches.py \
   --out data/synth_train_32-32-64.zarr
 
 # Build validation patches from the same synthetic source.
+# Note: this legacy example overlaps the training volumes. For held-out validation, use
+# --source '/Volumes/CrucialX9/fake_data/validation' and add --exclude_dir validation to the
+# training command (see "Geology classifier and class-anchored sampling" below).
 uv run python scripts/sample_patches.py \
   --source '/Volumes/CrucialX9/fake_data' \
   --patch_size 32 32 64 \
@@ -278,11 +281,100 @@ uv run python scripts/train.py \
 
 If that run is stable and validation keeps improving, resume from the best checkpoint and expand the metadata keys to include the channel, flat-spot, onlap, and lithology-derived features.
 
+## Geology classifier and class-anchored sampling (2026-09-25)
+
+Plan: [2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md](../plans/2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md).
+Progress and findings: [2026-09-25-geology-classifier-progress.md](../sessions/2026-09-25-geology-classifier-progress.md).
+
+Run the full suite (sample, train, benchmark) with:
+
+```bash
+scripts/geoaware_classifier_suite.sh all          # or: sample | train | benchmark
+PRINT_COMMANDS=1 scripts/geoaware_classifier_suite.sh all   # print commands only
+```
+
+The script fails fast on missing inputs. It will not overwrite existing outputs unless
+`OVERWRITE=1` is set. It never writes to `data/synth_val_32-32-64.zarr` or the frozen
+manifest.
+
+All new flags default to the previous behavior.
+
+### scripts/sample_patches.py
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--exclude_dir NAME` (repeatable) | none | Skip volumes under a folder with this name; use `validation` for training sets |
+| `--sampling_mode {geoscore,class_anchored,uniform}` | `geoscore` | Legacy geoscore-weighted, class-anchored, or natural-prevalence origins |
+| `--class_quotas CLASS=FRACTION ...` | 0.125 for each class except sand | Share of anchored patches per class (fault, fault_x, channel, closure, onlap, sand, flat_spot) |
+| `--background_fraction` | 0.25 | Share of uniform (non-anchored) patches |
+| `--anchor_jitter {uniform,center}` | `uniform` | Where the anchor voxel lands inside the patch |
+| `--max_patches_per_object` | 24 | Upper limit per fault or closure segment id, or per coarse cell for other classes; 0 disables |
+| `--anchor_index_max_coords` | 200000 | Reservoir cap on stored anchor coordinates per class per volume |
+| `--presence_min_voxels` | 32 | Minimum class voxels for `label_presence_<class> = 1` |
+| `--onlap_threshold` / `--sand_threshold` | 0.5 / 0.5 | Class rules for onlap and sand |
+| `--label_z_offset` | 0 | Use **1** for synthoseis data: `seismic[z]` matches `label[z + 1]` |
+| `--store_label_patches` | off | Also write `(N, 7, X, Y, Z)` uint8 label patches |
+| `--disjoint_from ZARR` (repeatable) | none | Fail if any source volume also appears in that store's `source_volumes` |
+
+New per-patch arrays:
+- `label_presence_<class>`: 7 arrays, uint8;
+- `anchor_class`: int8, −1 means background;
+- `inclusion_weight`: undoes the oversampling of rare classes;
+- `meta_water_fraction` and `meta_closure_fraction`;
+- `meta_sand_fraction` and `meta_shale_fraction` are now computed over rock only.
+
+The `uniform` and `class_anchored` modes skip volumes with no label arrays (5 of the 25
+validation volumes) and list them in the `skipped_volumes_missing_labels` attr.
+
+### scripts/train.py
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--geology_classifier` | off | Build the patch-level classifier head on `mu` |
+| `--geology_classifier_mode {patch}` | `patch` | Voxel mode is planned (WP6) |
+| `--geology_classifier_hidden` | 256 | Hidden width of the classifier |
+| `--geology_classifier_weight` | 0.0 | Loss weight; > 0 requires `--geology_classifier` and `label_presence_*` arrays |
+| `--geology_classifier_loss {bce,focal}` | `bce` | Presence loss, weighted by `pos_weight` = clip(n_neg / n_pos, 1, 50) |
+| `--geology_classifier_focal_gamma` | 2.0 | Focal gamma |
+| `--geology_classifier_label_smoothing` | 0.05 | For the dip-class cross-entropy terms |
+| `--geology_classifier_classes ...` | all 9 targets | Targets included in the loss |
+| `--geology_strata_source {metadata,presence_labels}` | `metadata` | Build sampler and SupCon strata from presence labels (keeps the rarest classes) |
+| `--geology_strata_classes ...` | six classes, no sand | Classes used for presence strata |
+| `--geology_batch_class_quota CLASS=COUNT ...` | none | Minimum patches per batch containing each listed class |
+| `--no_geology_calibration_inclusion_weight` | weighting on | Turn off `inclusion_weight` weighting of the metadata calibration |
+
+Checkpoints store `geology_classifier`, `geology_classifier_mode`, and
+`geology_classifier_hidden`. Warm-starting from a checkpoint without the classifier works.
+The tokenizer ignores the classifier weights.
+
+### scripts/evaluate_geology_benchmark.py
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--classifier_data ZARR` | none | Natural-prevalence set (`--sampling_mode uniform`); adds `classifier_metrics` to the report |
+| `--classifier_threshold_data ZARR` | none | Training split used to tune per-class F1 thresholds (default: fixed 0.5) |
+| `--classifier_max_samples` | 5000 | Maximum patches read from each classifier dataset |
+| `--classifier_preprocess {tokenizer,extrema}` | `tokenizer` | Retrieval-path or training-path input preprocessing |
+
+`classifier_metrics` includes per-class AUROC, average precision, and F1. It also has macro
+averages, dip-class accuracy against the majority-class rate, confusion matrices, and
+`sanity_gate` (macro AUROC ≥ 0.75, and dip accuracy above the majority rate). n@5 / n@10
+on the frozen manifest remain the primary metric.
+
+### scripts/verify_label_alignment.py
+
+This script measures the label/seismic depth offset by cross-correlating on real volumes.
+The verified result is +1.
+
 ## Main files
 
 - scripts/train.py
 - scripts/sample_patches.py
+- scripts/evaluate_geology_benchmark.py
+- scripts/geoaware_classifier_suite.sh
 - src/model.py
+- src/geology_classifier.py
+- src/geology_sampler.py
 - src/augmentations.py
 
 ## Notes
