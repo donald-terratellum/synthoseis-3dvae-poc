@@ -286,16 +286,33 @@ If that run is stable and validation keeps improving, resume from the best check
 Plan: [2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md](../plans/2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md).
 Progress and findings: [2026-09-25-geology-classifier-progress.md](../sessions/2026-09-25-geology-classifier-progress.md).
 
-Run the full suite (sample, train, benchmark) with:
+Run all experiments with one script. It samples the data, trains R1-ctrl, R1, R2, and R3,
+benchmarks them, and prints a summary:
 
 ```bash
-scripts/geoaware_classifier_suite.sh all          # or: sample | train | benchmark
-PRINT_COMMANDS=1 scripts/geoaware_classifier_suite.sh all   # print commands only
+mkdir -p logs
+nohup caffeinate -i scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
+scripts/geoaware_classifier_suite.sh summary                  # results table at any time
+RUNS="r1ctrl r1" scripts/geoaware_classifier_suite.sh train  # subset of runs
+PRINT_COMMANDS=1 scripts/geoaware_classifier_suite.sh all     # print commands only
 ```
 
-The script fails fast on missing inputs. It will not overwrite existing outputs unless
-`OVERWRITE=1` is set. It never writes to `data/synth_val_32-32-64.zarr` or the frozen
-manifest.
+The runs, one primary variable each, all warm-started from Phase 2 epoch 20:
+
+| Run | Training data | Adds |
+|---|---|---|
+| `r1ctrl` | geoscore sampling, validation volumes excluded | nothing; this is the leak-free baseline |
+| `r1` | class-anchored | anchored data |
+| `r2` | class-anchored | + classifier decoder (focal, weight 0.1) |
+| `r3` | class-anchored | + presence-label strata and quotas `fault_x=1 flat_spot=1 channel=1` |
+
+Compare r1, r2, and r3 against `r1ctrl`, not 0.139. The old training set included the
+validation volumes.
+
+The script can be re-run safely. It skips finished items: sampled stores that have the
+`n_written` attr, runs whose last epoch checkpoint exists, and existing benchmark reports.
+`OVERWRITE=1` redoes them. It stops at once on missing inputs. Per-step logs go to
+`logs/`. It never writes to `data/synth_val_32-32-64.zarr` or the frozen manifest.
 
 All new flags default to the previous behavior.
 

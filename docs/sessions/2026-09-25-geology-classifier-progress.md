@@ -423,19 +423,28 @@ improving n@5, which requires the R1/R2 training runs on the full sampled datase
 
 ## Next steps (experiments)
 
-1. **Sample.** Run `scripts/geoaware_classifier_suite.sh sample`. Expect about 2.5 h for
-   the training set (51 s per volume × 180) plus the validation set. Check the attrs
-   (`anchored_counts`, `fallback_counts`, `skipped_volumes_missing_labels`) before training.
-2. **One primary variable per run (plan Section 7).** The suite's `train` stage uses the R3
-   settings. For clean attribution, run R1 and R2 first by editing a copy of the train
-   command:
-   - **R1** = anchored data only: drop the `--geology_classifier*`,
-     `--geology_strata_source`, and `--geology_batch_class_quota` flags.
-   - **R2** = R1 + classifier: keep the `--geology_classifier*` flags.
-   - **R3** = R2 + presence strata and quotas: the suite as written.
-3. **Benchmark** epochs 10/20/30/40, and add the rows to the results table. Adopt a run
-   only if n@5 > 0.139 and `val_loss` regresses by no more than 2% on the same validation
-   set.
+Everything below is automated by one script:
+
+```bash
+nohup caffeinate -i scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
+```
+
+1. **Sample** three stores:
+   - class-anchored training data;
+   - leak-free geoscore control data;
+   - uniform validation data.
+
+   Expect about 2.5 h each for the two training stores. Check the attrs
+   (`anchored_counts`, `fallback_counts`, `skipped_volumes_missing_labels`) in
+   `logs/sample_*.log` before trusting the training results.
+2. **Train** `r1ctrl`, `r1`, `r2`, and `r3`, one primary variable each (plan Section 7).
+   **Leakage found:** the old training set
+   (`data/synth_train_32-32-64.zarr`) used all 205 volumes, including the 25 validation
+   volumes that the frozen benchmark is drawn from. So the 0.139 baseline is optimistic.
+   `r1ctrl` repeats the Phase 2 recipe on leak-free geoscore data and is the fair baseline.
+3. **Benchmark** epochs 10/20/30/40 (`summary` prints the table), and add the rows to the
+   results table. Adopt a run only if n@5 beats `r1ctrl` and `val_loss` regresses by no
+   more than 2% relative to `r1ctrl` on the same validation set.
 4. **Classifier checks.** Check `classifier_metrics.sanity_gate`, and compare
    `--classifier_preprocess tokenizer` with `extrema` (see the WP5 findings).
 5. **WP6 (voxel mode)** only if R2 or R3 improves n@5.
