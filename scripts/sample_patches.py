@@ -65,7 +65,7 @@ LABEL_CLASS_SOURCES = {
 OBJECT_ID_CLASSES = ("fault", "closure")
 DEFAULT_CLASS_QUOTAS = {c: 0.125 for c in ("fault", "fault_x", "channel", "closure", "onlap", "flat_spot")}
 DEFAULT_BACKGROUND_FRACTION = 0.25
-DEFAULT_MAX_PATCHES_PER_OBJECT = 16
+DEFAULT_MAX_PATCHES_PER_OBJECT = 24
 BACKGROUND = "background"
 
 # Edges chosen from observed patch distributions (dip mean p5-p95 ~10-56 deg, p90-p10 range p5-p95 ~7-30 deg).

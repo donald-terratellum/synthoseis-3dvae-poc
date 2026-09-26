@@ -196,9 +196,9 @@ labels for the classifier (WP3) and the batch sampler (WP4).
   - All 600 origins are unique.
   - The weighted presence rates recover the uniform rates, so the weights work.
 - **Tuning note.** This volume has only 4 fault ids, so the original cap of 8 per object
-  moved 48 of the 75 fault slots to background. The default is now **16**. For 600 patches
-  per volume, consider `--max_patches_per_object 24` or more, or accept a lower fault share
-  (faults are already 31% of patches through other anchors).
+  moved 48 of the 75 fault slots to background. The default is now **24**; it is an upper
+  limit, so it should be generous. Raise it further or accept a lower fault share (faults
+  are already 31% of patches through other anchors).
 
 **Decision:** proceed to WP3.
 
