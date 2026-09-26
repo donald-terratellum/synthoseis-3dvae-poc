@@ -65,6 +65,7 @@ LABEL_CLASS_SOURCES = {
 OBJECT_ID_CLASSES = ("fault", "closure")
 DEFAULT_CLASS_QUOTAS = {c: 0.125 for c in ("fault", "fault_x", "channel", "closure", "onlap", "flat_spot")}
 DEFAULT_BACKGROUND_FRACTION = 0.25
+DEFAULT_MAX_PATCHES_PER_OBJECT = 16
 BACKGROUND = "background"
 
 # Edges chosen from observed patch distributions (dip mean p5-p95 ~10-56 deg, p90-p10 range p5-p95 ~7-30 deg).
@@ -465,7 +466,7 @@ def sample_anchored_origins(
     shares,
     rng,
     anchor_jitter="uniform",
-    max_patches_per_object=8,
+    max_patches_per_object=DEFAULT_MAX_PATCHES_PER_OBJECT,
     max_redraws=20,
 ):
     """Return (origins, anchor_class_indices, stats); class index -1 means background."""
@@ -563,7 +564,7 @@ def sample_labeled_patches(
     sampling_mode="class_anchored",
     shares=None,
     anchor_jitter="uniform",
-    max_patches_per_object=8,
+    max_patches_per_object=DEFAULT_MAX_PATCHES_PER_OBJECT,
     anchor_index_max_coords=200000,
     presence_min_voxels=32,
     onlap_threshold=DEFAULT_ONLAP_THRESHOLD,
@@ -828,7 +829,7 @@ def main():
     )
     p.add_argument("--background_fraction", type=float, default=DEFAULT_BACKGROUND_FRACTION, help="Share of uniform (non-anchored) patches.")
     p.add_argument("--anchor_jitter", choices=["uniform", "center"], default="uniform", help="Where the anchor voxel lands in the patch.")
-    p.add_argument("--max_patches_per_object", type=int, default=8, help="Cap per object (segment id, or coarse cell for classes without ids); 0 disables.")
+    p.add_argument("--max_patches_per_object", type=int, default=DEFAULT_MAX_PATCHES_PER_OBJECT, help="Cap per object (segment id, or coarse cell for classes without ids); 0 disables.")
     p.add_argument("--anchor_index_max_coords", type=int, default=200000, help="Reservoir cap on stored anchor coordinates per class per volume.")
     p.add_argument("--presence_min_voxels", type=int, default=32, help="Minimum class voxels for label_presence_<class> = 1.")
     p.add_argument("--onlap_threshold", type=float, default=DEFAULT_ONLAP_THRESHOLD)

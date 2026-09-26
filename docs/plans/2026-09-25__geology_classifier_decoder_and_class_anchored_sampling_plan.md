@@ -175,7 +175,7 @@ L_cls = mean_c BCE_or_focal(presence_c) + CE(dip_mean_class) + CE(dip_range_clas
 | `--class_quotas fault=0.125 fault_x=0.125 ...` | 1/8 each rare class | Share of anchors per class |
 | `--background_fraction` | `0.25` | Share of uniform (non-anchored) patches |
 | `--anchor_jitter {uniform,center}` | `uniform` | Where the anchor voxel lands in the patch |
-| `--max_patches_per_object` | `8` | Cap per distinct segment id (faults, closures, intersections) to limit memorization |
+| `--max_patches_per_object` | `16` | Cap per distinct segment id (faults, closures, intersections) to limit memorization |
 | `--anchor_index_max_coords` | `200000` | Reservoir-sample cap on stored coordinates per class per volume |
 | `--presence_min_voxels` | `32` | Minimum voxels for `label_presence_<class> = 1` |
 | `--onlap_threshold` | `0.5` | Threshold on `onlap_segments` |
@@ -417,7 +417,7 @@ uv run python scripts/sample_patches.py \
   --sampling_mode class_anchored \
   --class_quotas fault=0.10 fault_x=0.10 flat_spot=0.10 channel=0.10 closure=0.10 onlap=0.10 sand=0.05 \
   --background_fraction 0.25 \
-  --max_patches_per_object 8 \
+  --max_patches_per_object 16 \
   --presence_min_voxels 32 \
   --label_z_offset <from WP0> \
   --seed 20260925 \
