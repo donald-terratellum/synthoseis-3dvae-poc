@@ -46,8 +46,8 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | WP0 | Label/seismic depth alignment | **Done** | 9 new; suite 112 OK | `label_z_offset = 1` |
 | WP1 | Sand/shale fix, water/closure metadata, seismic key default, `--exclude_dir` | **Done** | 9 new; suite 121 OK | Train/val volume lists are disjoint (180 / 25) |
 | WP2 | Class-anchored sampler | **Done** | 18 new; suite 139 OK | Weighted presence matches uniform on real data |
-| WP3 | Classifier decoder (patch mode) | Next | — | — |
-| WP4 | Label-driven batch sampler | Not started | — | — |
+| WP3 | Classifier decoder (patch mode) | **Done** | 18 new; suite 157 OK | Warm-start smoke run trains; tokenizer ignores head |
+| WP4 | Label-driven batch sampler | Next | — | — |
 | WP5 | Evaluation additions | Not started | — | — |
 | WP6 | Voxel mode | Not started | — | Alignment no longer blocks it |
 | WP7 | Suite script and docs | Not started | — | — |
@@ -201,6 +201,69 @@ labels for the classifier (WP3) and the batch sampler (WP4).
   are already 31% of patches through other anchors).
 
 **Decision:** proceed to WP3.
+
+### WP3 — Classifier decoder, patch mode (done)
+
+**Goal:** give the encoder a direct supervised geology signal through `mu`, the same tensor
+that `z_geo` is projected from.
+
+**Method:**
+- **Model** ([src/model.py](../../src/model.py)). A new `GeologyClassifierDecoder` sits on
+  `mu`: a shared hidden layer (Linear → LayerNorm → GELU → Dropout), then three outputs:
+  - presence logits for 7 classes;
+  - 6 dip-mean classes;
+  - 6 dip-range classes.
+
+  `VAE3D` builds it only with `geology_classifier=True` and exposes it as
+  `model.classify(mu)`. `forward()` is unchanged. `pos_weight` is stored with the model
+  weights, so it is saved in every checkpoint.
+- **Loss** ([src/geology_classifier.py](../../src/geology_classifier.py)). Presence uses BCE
+  or focal BCE weighted by `pos_weight`, averaged over the selected classes. `pos_weight` is
+  clip(n_neg / n_pos, 1, 50) per class, computed from the training split. Each selected dip
+  target adds a cross-entropy term with label smoothing.
+- **Training** ([scripts/train.py](../../scripts/train.py)):
+  - New flags: `--geology_classifier`, `--geology_classifier_mode` (currently `patch`
+    only), `--geology_classifier_hidden`, `--geology_classifier_weight`,
+    `--geology_classifier_loss {bce,focal}`, `--geology_classifier_focal_gamma`,
+    `--geology_classifier_label_smoothing`, `--geology_classifier_classes`.
+  - The training dataset loads `label_presence_*` and the dip-class arrays only when the
+    classifier weight is > 0, and fails with a clear message if they are missing.
+  - A classifier weight > 0 requires `--geology_classifier`.
+  - Checkpoints now store the classifier settings.
+  - Warm-starting and resuming tolerate missing or unexpected classifier weights.
+  - The epoch loss goes to TensorBoard as `train/geology_classifier_loss`.
+- **Tokenizer** ([src/tokenizer/core/model_adapter.py](../../src/tokenizer/core/model_adapter.py)).
+  The adapter ignores the classifier weights when loading a checkpoint.
+
+**Result:**
+- **Tests** ([tests/test_geology_classifier.py](../../tests/test_geology_classifier.py)):
+  - output shapes are correct and all logits are finite;
+  - `pos_weight` matches hand-computed values on known counts;
+  - focal loss equals BCE at gamma 0;
+  - the loss falls by more than half in 50 steps on a separable batch;
+  - with the classifier off, one epoch reproduces the pre-WP3 loss and weights exactly;
+  - a classifier weight of 0 is a no-op;
+  - classifier gradients reach the encoder;
+  - a warm start from a checkpoint without the classifier reports only classifier weights
+    as missing, and a resume restores every weight exactly;
+  - the tokenizer gives identical `z_geo` with and without the classifier weights;
+  - missing presence arrays fail with a clear error.
+- **Smoke run.** Two epochs of 10 batches, warm-started from the Phase 2 epoch-20
+  checkpoint on 240 class-anchored patches, with focal loss at weight 0.1:
+  - the classifier loss fell from 3.78 to 3.33;
+  - `pos_weight` = [2.87, 1.0, 5.86, 1.0, 3.44, 1.0, 1.86];
+  - the checkpoint loads in the tokenizer and returns unit-norm `z_geo`.
+- **Bug found and fixed.** With only the classifier enabled, the dataset tried to read
+  metadata keys it had never loaded. It now reads only the arrays it loaded, and a test
+  covers this case.
+
+**Notes:**
+- `pos_weight` is 1 for a class with no positives. Fault intersections were absent from the
+  smoke volume; the full 180-volume training split will have positives.
+- The validation loss (`val_loss`) is still reconstruction only, so the 2% reconstruction
+  guardrail still compares like with like. Classifier metrics on validation are WP5.
+
+**Decision:** proceed to WP4.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

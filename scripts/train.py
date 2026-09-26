@@ -38,8 +38,15 @@ from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
 from src.deep_supervision import DeepSupervisionLoss
+from src.geology_classifier import (
+    ALL_CLASSIFIER_TARGETS,
+    PRESENCE_TARGET_KEYS,
+    classifier_target_keys,
+    compute_geology_classifier_loss,
+    compute_pos_weight,
+)
 from src.geology_sampler import GeologyAwareBatchSampler, build_multilabel_strata
-from src.model import VAE3D
+from src.model import GEOLOGY_PRESENCE_CLASSES, VAE3D
 from src.tokenizer.core.preprocess import preprocess_for_token
 
 try:
@@ -128,6 +135,7 @@ class ZarrPatchDataset(Dataset):
         mixup_augment_prob=0.10,
         include_metadata: bool = False,
         geology_metadata_keys: Optional[tuple[str, ...]] = None,
+        classifier_target_keys: Optional[tuple[str, ...]] = None,
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
         self.data = cast(Any, z['patches'])
@@ -167,6 +175,19 @@ class ZarrPatchDataset(Dataset):
                         "scripts/sample_patches.py after updating the derived metadata schema."
                     )
                 self._metadata_arrays[key] = z[key]
+
+        self.classifier_target_keys = tuple(str(key) for key in (classifier_target_keys or ()))
+        self._classifier_arrays = {}
+        for key in self.classifier_target_keys:
+            if key not in z:
+                raise KeyError(
+                    f"Geology classifier target '{key}' was not found in dataset '{zarr_path}'. "
+                    "Regenerate it with scripts/sample_patches.py (label_presence_* arrays are written by the "
+                    "WP2 sampler in every --sampling_mode)."
+                )
+            self._classifier_arrays[key] = np.asarray(z[key][:])
+        if self._classifier_arrays:
+            self.include_metadata = True
 
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
             raise ValueError("--input_scaling must be one of: none, divide_by_std, zscore")
@@ -257,8 +278,7 @@ class ZarrPatchDataset(Dataset):
             return {}
 
         metadata = {}
-        for key in self.geology_metadata_keys:
-            arr = self._metadata_arrays[key]
+        for key, arr in self._metadata_arrays.items():
             value = np.asarray(arr)
             if value.ndim == 0:
                 metadata[key] = float(value)
@@ -268,6 +288,8 @@ class ZarrPatchDataset(Dataset):
                 metadata[key] = value[0]
             else:
                 metadata[key] = value
+        for key, arr in self._classifier_arrays.items():
+            metadata[key] = arr[int(idx)]
         return metadata
 
     def __getitem__(self, idx):
@@ -1248,6 +1270,9 @@ def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=Non
         'geology_projection': bool(getattr(model, 'geology_projection', False)),
         'geology_proj_hidden': int(getattr(model, 'geology_proj_hidden', 128)),
         'geology_proj_dim': int(getattr(model, 'geology_proj_dim', 64)),
+        'geology_classifier': bool(getattr(model, 'geology_classifier_enabled', False)),
+        'geology_classifier_mode': str(getattr(model, 'geology_classifier_mode', 'patch')),
+        'geology_classifier_hidden': int(getattr(model, 'geology_classifier_hidden', 256)),
     }
     if epoch is not None:
         payload['epoch'] = int(epoch)
@@ -1695,6 +1720,12 @@ def train_one_epoch(
     geology_uniformity_t=2.0,
     geology_strata_presence_threshold=1e-4,
     geology_strata_max_active_keys=2,
+    geology_classifier_weight=0.0,
+    geology_classifier_targets=ALL_CLASSIFIER_TARGETS,
+    geology_classifier_loss='bce',
+    geology_classifier_focal_gamma=2.0,
+    geology_classifier_label_smoothing=0.05,
+    epoch_stats=None,
 ):
     if steps_per_epoch is None:
         raise ValueError('steps_per_epoch must be provided for train_one_epoch.')
@@ -1718,6 +1749,7 @@ def train_one_epoch(
     total_d_gan_acc = 0.0
     total_geology_contrastive_loss = 0.0
     total_geology_uniformity_loss = 0.0
+    total_geology_classifier_loss = 0.0
     batch_iter = itertools.cycle(dataloader)
 
     last_snapshot = None
@@ -1842,6 +1874,20 @@ def train_one_epoch(
                     geology_uniformity_value = float(uniformity_loss.item())
                     total_g_loss = total_g_loss + float(geology_uniformity_weight) * uniformity_loss
 
+        classifier = getattr(model, 'geology_classifier', None)
+        if float(geology_classifier_weight) > 0.0 and classifier is not None and geology_metadata_batch is not None:
+            classifier_loss, _ = compute_geology_classifier_loss(
+                model.classify(mu),
+                geology_metadata_batch,
+                targets=geology_classifier_targets,
+                loss_type=geology_classifier_loss,
+                focal_gamma=geology_classifier_focal_gamma,
+                label_smoothing=geology_classifier_label_smoothing,
+                pos_weight=classifier.pos_weight,
+            )
+            total_geology_classifier_loss += float(classifier_loss.item())
+            total_g_loss = total_g_loss + float(geology_classifier_weight) * classifier_loss
+
         optimizer.zero_grad()
         total_g_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -1880,6 +1926,8 @@ def train_one_epoch(
             per_example_mse=per_example_mse,
         )
 
+    if epoch_stats is not None:
+        epoch_stats['geology_classifier_loss'] = total_geology_classifier_loss / steps_per_epoch
     return (
         total_loss / steps_per_epoch,
         total_lpips_loss / steps_per_epoch,
@@ -1956,6 +2004,10 @@ def build_dataset(args, data_path, augment=False):
         mixup_augment_prob=args.mixup_augment_prob,
         include_metadata=include_metadata,
         geology_metadata_keys=geology_keys,
+        classifier_target_keys=(
+            classifier_target_keys(args.geology_classifier_classes)
+            if float(getattr(args, 'geology_classifier_weight', 0.0)) > 0.0 else ()
+        ),
     )
 
 
@@ -2320,7 +2372,31 @@ def validate(
     return total_loss / validation_steps, total_lpips_loss / validation_steps, last_snapshot, geology_diagnostics
 
 
+RESUME_TOLERATED_KEYS = {
+    'decoder.aux_head_coarse.weight',
+    'decoder.aux_head_coarse.bias',
+    'decoder.aux_head_mid.weight',
+    'decoder.aux_head_mid.bias',
+}
+# Optional heads are randomly initialized when warm-starting from a checkpoint without them.
+RESUME_TOLERATED_PREFIXES = ('geology_head.', 'geology_classifier.')
+
+
+def resume_state_dict_incompatibilities(missing_keys, unexpected_keys):
+    """Return (invalid_missing, invalid_unexpected) after removing keys of optional heads."""
+    def invalid(keys):
+        return [
+            k for k in keys
+            if k not in RESUME_TOLERATED_KEYS and not k.startswith(RESUME_TOLERATED_PREFIXES)
+        ]
+    return invalid(missing_keys), invalid(unexpected_keys)
+
+
 def train(args):
+    if args.geology_classifier_weight < 0.0:
+        raise ValueError('--geology_classifier_weight must be non-negative.')
+    if args.geology_classifier_weight > 0.0 and not args.geology_classifier:
+        raise ValueError('--geology_classifier_weight > 0 requires --geology_classifier to build the classifier head.')
     if args.geology_loss_weight < 0.0:
         raise ValueError('--geology_loss_weight must be non-negative.')
     if args.geology_loss_weight > 0.0 and not args.geology_metadata_keys:
@@ -2422,6 +2498,9 @@ def train(args):
         geology_projection=bool(args.geology_projection),
         geology_proj_hidden=int(args.geology_proj_hidden),
         geology_proj_dim=int(args.geology_proj_dim),
+        geology_classifier=bool(args.geology_classifier),
+        geology_classifier_mode=str(args.geology_classifier_mode),
+        geology_classifier_hidden=int(args.geology_classifier_hidden),
     )
     if float(args.geology_contrastive_weight) > 0.0 and not bool(args.geology_projection):
         raise ValueError('--geology_contrastive_weight > 0 requires --geology_projection to build the z_geo head.')
@@ -2484,25 +2563,10 @@ def train(args):
 
         state_dict = checkpoint['model_state_dict']
         load_result = model.load_state_dict(state_dict, strict=False)
-        missing_keys = list(load_result.missing_keys)
-        unexpected_keys = list(load_result.unexpected_keys)
-        allowed_ds_missing = {
-            'decoder.aux_head_coarse.weight',
-            'decoder.aux_head_coarse.bias',
-            'decoder.aux_head_mid.weight',
-            'decoder.aux_head_mid.bias',
-        }
-        allowed_ds_unexpected = allowed_ds_missing
-        # Newly added geology projection head is randomly initialized when warm-starting
-        # from a pre-head checkpoint; tolerate its missing/unexpected keys either way.
-        invalid_missing = [
-            k for k in missing_keys
-            if k not in allowed_ds_missing and not k.startswith('geology_head.')
-        ]
-        invalid_unexpected = [
-            k for k in unexpected_keys
-            if k not in allowed_ds_unexpected and not k.startswith('geology_head.')
-        ]
+        invalid_missing, invalid_unexpected = resume_state_dict_incompatibilities(
+            load_result.missing_keys,
+            load_result.unexpected_keys,
+        )
         if invalid_missing or invalid_unexpected:
             raise ValueError(
                 'Resume checkpoint model_state_dict is incompatible with current architecture. '
@@ -2523,6 +2587,22 @@ def train(args):
         print(f"Resuming epoch numbering from {resume_completed_epochs + 1}")
 
     print(f"Using device: {device}")
+    if float(args.geology_classifier_weight) > 0.0:
+        classifier = cast(Any, model.geology_classifier)
+        pos_weight = classifier.pos_weight.clone()
+        for i, name in enumerate(GEOLOGY_PRESENCE_CLASSES):
+            key = PRESENCE_TARGET_KEYS[name]
+            if key in ds._classifier_arrays:
+                pos_weight[i] = compute_pos_weight(ds._classifier_arrays[key][:, None])[0]
+        classifier.pos_weight.copy_(pos_weight)
+        print(
+            'Geology classifier:',
+            f"mode={args.geology_classifier_mode}",
+            f"weight={args.geology_classifier_weight}",
+            f"loss={args.geology_classifier_loss}",
+            f"targets={list(args.geology_classifier_classes)}",
+            f"pos_weight={[round(float(v), 2) for v in classifier.pos_weight]}",
+        )
     print(f"Training seed: {args.seed}")
     print(f"Batch size (B): {args.batch_size}, batches/epoch: {steps_per_epoch}, examples/epoch: {samples_per_epoch}")
     print(
@@ -2551,7 +2631,7 @@ def train(args):
         f"enabled={args.deep_supervision}",
         f"weights={args.deep_supervision_weights}",
     )
-    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch', 'deep_supervision', 'geology_projection', 'geology_proj_hidden', 'geology_proj_dim']
+    checkpoint_keys = ['model_state_dict', 'patch_shape', 'latent_dim', 'base_ch', 'deep_supervision', 'geology_projection', 'geology_proj_hidden', 'geology_proj_dim', 'geology_classifier', 'geology_classifier_mode', 'geology_classifier_hidden']
     print(f"Checkpoint schema keys={checkpoint_keys}")
     print("base_ch = base channel count for the VAE's convolution layers")
     print(
@@ -2771,6 +2851,7 @@ def train(args):
             kl_weight = get_kl_weight(epoch_idx, args)
             args.current_kl_weight = kl_weight
             gan_weight_for_epoch = current_gan_weight
+            train_epoch_stats = {}
 
             (
                 train_loss,
@@ -2814,6 +2895,12 @@ def train(args):
                 geology_uniformity_t=float(args.geology_uniformity_t),
                 geology_strata_presence_threshold=float(args.geology_strata_presence_threshold),
                 geology_strata_max_active_keys=int(args.geology_strata_max_active_keys),
+                geology_classifier_weight=float(args.geology_classifier_weight),
+                geology_classifier_targets=tuple(args.geology_classifier_classes),
+                geology_classifier_loss=str(args.geology_classifier_loss),
+                geology_classifier_focal_gamma=float(args.geology_classifier_focal_gamma),
+                geology_classifier_label_smoothing=float(args.geology_classifier_label_smoothing),
+                epoch_stats=train_epoch_stats,
             )
             val_loss, val_lpips_loss, val_last_snapshot, geology_diagnostics = validate(
                 model,
@@ -2874,6 +2961,9 @@ def train(args):
             writer.add_scalar('train/lpips_loss', float(train_lpips_loss), epoch_number)
             writer.add_scalar('train/geology_contrastive_loss', float(train_contrastive_loss), epoch_number)
             writer.add_scalar('train/geology_uniformity_loss', float(train_uniformity_loss), epoch_number)
+            if float(args.geology_classifier_weight) > 0.0:
+                writer.add_scalar('train/geology_classifier_loss', float(train_epoch_stats.get('geology_classifier_loss', 0.0)), epoch_number)
+                print(f"  geology_classifier_loss={train_epoch_stats.get('geology_classifier_loss', 0.0):.4f}")
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
             writer.add_scalar('validation/lpips_loss', float(val_lpips_loss), epoch_number)
             if geology_diagnostics is not None:
@@ -3149,6 +3239,14 @@ if __name__ == '__main__':
     p.add_argument('--geology_contrastive_temperature', type=float, default=0.1, help='Temperature for the supervised-contrastive geology loss.')
     p.add_argument('--geology_uniformity_weight', type=float, default=0.0, help='Weight for the hypersphere uniformity regularizer on z_geo (anti-collapse). Requires --geology_projection.')
     p.add_argument('--geology_uniformity_t', type=float, default=2.0, help='Temperature t for the geology uniformity regularizer.')
+    p.add_argument('--geology_classifier', action='store_true', help='Add a multi-task geology classifier decoder on mu (presence of 7 classes + dip-mean/dip-range classes).')
+    p.add_argument('--geology_classifier_mode', type=str, default='patch', choices=['patch'], help='Classifier head type; voxel mode is planned (WP6).')
+    p.add_argument('--geology_classifier_hidden', type=int, default=256, help='Hidden width of the geology classifier trunk.')
+    p.add_argument('--geology_classifier_weight', type=float, default=0.0, help='Weight for the geology classifier loss. Requires --geology_classifier and label_presence_* arrays in the training data.')
+    p.add_argument('--geology_classifier_loss', type=str, default='bce', choices=['bce', 'focal'], help='Presence loss: BCE with pos_weight, or focal BCE with pos_weight.')
+    p.add_argument('--geology_classifier_focal_gamma', type=float, default=2.0, help='Focal loss gamma for --geology_classifier_loss focal.')
+    p.add_argument('--geology_classifier_label_smoothing', type=float, default=0.05, help='Label smoothing for the dip-class cross-entropy terms.')
+    p.add_argument('--geology_classifier_classes', nargs='+', default=list(ALL_CLASSIFIER_TARGETS), choices=list(ALL_CLASSIFIER_TARGETS), help='Classifier targets included in the loss.')
     p.add_argument('--freeze_encoder', action='store_true', help='Freeze encoder weights (Phase 1 head-only geology training).')
     p.add_argument('--freeze_decoder', action='store_true', help='Freeze decoder weights (e.g. when only shaping the geology embedding).')
     p.add_argument('--geology_loss_weight', type=float, default=0.0, help='Weight for metadata-to-latent geology similarity loss. Set >0 to enable geology-aware latent shaping.')

@@ -148,8 +148,42 @@ class GeologyProjectionHead(nn.Module):
         return F.normalize(z, p=2, dim=-1, eps=1e-8)
 
 
+GEOLOGY_PRESENCE_CLASSES = ("fault", "fault_x", "channel", "closure", "onlap", "sand", "flat_spot")
+GEOLOGY_DIP_CLASSES = 6
+
+
+class GeologyClassifierDecoder(nn.Module):
+    """Patch-level multi-task classifier on ``mu``: class presence logits plus dip-mean/dip-range classes."""
+
+    pos_weight: torch.Tensor
+
+    def __init__(self, latent_dim=128, hidden=256, dropout=0.1, n_presence=len(GEOLOGY_PRESENCE_CLASSES), n_dip_classes=GEOLOGY_DIP_CLASSES):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.hidden = int(hidden)
+        self.trunk = nn.Sequential(
+            nn.Linear(self.latent_dim, self.hidden),
+            nn.LayerNorm(self.hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        self.presence = nn.Linear(self.hidden, int(n_presence))
+        self.dip_mean = nn.Linear(self.hidden, int(n_dip_classes))
+        self.dip_range = nn.Linear(self.hidden, int(n_dip_classes))
+        # clip(n_neg / n_pos, 1, 50) from the training split; saved with the state dict.
+        self.register_buffer("pos_weight", torch.ones(int(n_presence)))
+
+    def forward(self, mu):
+        h = self.trunk(mu)
+        return {
+            "presence": self.presence(h),
+            "dip_mean": self.dip_mean(h),
+            "dip_range": self.dip_range(h),
+        }
+
+
 class VAE3D(nn.Module):
-    def __init__(self, in_ch=1, out_ch=1, base_ch=16, latent_dim=128, patch_shape=(32, 32, 32), deep_supervision=False, residual_encoder=False, geology_projection=False, geology_proj_hidden=128, geology_proj_dim=64):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=16, latent_dim=128, patch_shape=(32, 32, 32), deep_supervision=False, residual_encoder=False, geology_projection=False, geology_proj_hidden=128, geology_proj_dim=64, geology_classifier=False, geology_classifier_mode='patch', geology_classifier_hidden=256):
         super().__init__()
         self.base_ch = int(base_ch)
         self.latent_dim = int(latent_dim)
@@ -181,6 +215,24 @@ class VAE3D(nn.Module):
             )
         else:
             self.geology_head = None
+        self.geology_classifier_enabled = bool(geology_classifier)
+        self.geology_classifier_mode = str(geology_classifier_mode)
+        self.geology_classifier_hidden = int(geology_classifier_hidden)
+        if self.geology_classifier_enabled:
+            if self.geology_classifier_mode != 'patch':
+                raise ValueError(f"geology_classifier_mode '{self.geology_classifier_mode}' is not implemented; use 'patch'.")
+            self.geology_classifier = GeologyClassifierDecoder(
+                latent_dim=self.latent_dim,
+                hidden=self.geology_classifier_hidden,
+            )
+        else:
+            self.geology_classifier = None
+
+    def classify(self, mu):
+        """Return a dict of geology classifier logits for a batch of ``mu``."""
+        if self.geology_classifier is None:
+            raise RuntimeError('classify() requires geology_classifier=True.')
+        return self.geology_classifier(mu)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)

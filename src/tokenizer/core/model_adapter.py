@@ -74,14 +74,10 @@ class VaeLatentAdapter:
         )
         state_dict = checkpoint["model_state_dict"]
         load_result = self.model.load_state_dict(state_dict, strict=False)
-        invalid_missing = [
-            k for k in load_result.missing_keys
-            if not (k.startswith("decoder.aux_head_") or k.startswith("geology_head."))
-        ]
-        invalid_unexpected = [
-            k for k in load_result.unexpected_keys
-            if not (k.startswith("decoder.aux_head_") or k.startswith("geology_head."))
-        ]
+        # The geology classifier head is training-only; retrieval never builds it.
+        ignored_prefixes = ("decoder.aux_head_", "geology_head.", "geology_classifier.")
+        invalid_missing = [k for k in load_result.missing_keys if not k.startswith(ignored_prefixes)]
+        invalid_unexpected = [k for k in load_result.unexpected_keys if not k.startswith(ignored_prefixes)]
         if invalid_missing or invalid_unexpected:
             raise ValueError(
                 "Checkpoint state_dict is incompatible with tokenizer adapter model. "
