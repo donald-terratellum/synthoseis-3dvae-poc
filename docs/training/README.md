@@ -13,76 +13,48 @@ This component covers:
 
 ## Quick start
 
+The recommended end-to-end geology experiment is the staged suite below. It keeps the
+validation volumes out of training, uses the verified label-depth offset, and runs a
+leak-free control before the anchored/classifier experiments. It is compute-intensive:
+sampling takes hours, followed by four training runs. Configure `SOURCE` for your machine;
+the default path in the script is specific to the original macOS workstation.
+
 ```bash
 uv sync
+mkdir -p logs
+export SOURCE=/path/to/fake_data
 
-# Build training patches from canonical synthetic volumes.
-# Source pattern: /Volumes/CrucialX9/fake_data/seismic__2026.*__synthoseis_run_*/model_data.zarr
-uv run python scripts/sample_patches.py \
-  --source '/Volumes/CrucialX9/fake_data' \
-  --patch_size 32 32 64 \
-  --n_patches 120000 \
-  --n_per_volume 600 \
-  --seismic_key seismicCubes_cumsum_fullstack \
-  --geoscore_key geologic_score \
-  --out data/synth_train_32-32-64.zarr
+# Preview commands before starting the long run.
+PRINT_COMMANDS=1 scripts/geoaware_classifier_suite.sh all
 
-# Build validation patches from the same synthetic source.
-# Note: this legacy example overlaps the training volumes. For held-out validation, use
-# --source '/Volumes/CrucialX9/fake_data/validation' and add --exclude_dir validation to the
-# training command (see "Geology classifier and class-anchored sampling" below).
-uv run python scripts/sample_patches.py \
-  --source '/Volumes/CrucialX9/fake_data' \
-  --patch_size 32 32 64 \
-  --n_patches 24000 \
-  --n_per_volume 200 \
-  --seismic_key seismicCubes_cumsum_fullstack \
-  --geoscore_key geologic_score \
-  --out data/synth_val_32-32-64.zarr
+# Linux: run sequentially in the background and keep stdout/stderr in the log.
+nohup scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
+tail -f logs/suite.log
+```
 
-# Geology-aware retraining pass (derived metadata vectors are read automatically).
+The stages can be run separately: `sample`, `train`, `benchmark`, `summary`. Completed
+stores/runs/reports are skipped on rerun; set `OVERWRITE=1` to regenerate them. See the
+suite section below for run definitions and current experiment conclusions.
+
+For a small reconstruction-only smoke test, first run the suite's `sample` stage, then:
+
+```bash
 uv run python scripts/train.py \
-  --data data/synth_train_32.zarr \
-  --validation_data data/synth_val_32.zarr \
+  --data data/synth_train_anchored_32-32-64.zarr \
+  --validation_data data/synth_val_uniform_32-32-64.zarr \
   --patch_size 32 32 64 \
-  --batch_size 12 \
-  --number_batches 300 \
-  --epochs 120 \
-  --augment \
-  --vertical_warp_prob 0.5 \
-  --mixup_augment_prob 0.2 \
+  --batch_size 4 --number_batches 2 --epochs 1 \
+  --seed 20260925 \
   --learning_rate 1e-4 \
   --weight_decay 1e-4 \
-  --kl_schedule warmup \
-  --kl_start 0.0 \
-  --kl_end 1e-3 \
-  --kl_warmup_epochs 20 \
-  --lr_scheduler plateau \
-  --lr_scheduler_patience 4 \
-  --lr_scheduler_factor 0.5 \
-  --early_stopping_patience 12 \
-  --geology_loss_weight 0.10 \
-  --geology_metadata_keys \
-    meta_dip_mean_deg \
-    meta_dip_std_deg \
-    meta_azimuth_mean_deg \
-    meta_azimuth_circular_variance \
-    meta_fault_intersection_fraction \
-    meta_geologic_score_mean \
-    meta_sand_fraction \
-    meta_shale_fraction \
-    meta_flat_spot_fraction \
-    meta_onlap_fraction \
-    meta_onlap_variability \
-    meta_channel_fraction \
-    meta_channel_core_fraction \
-    meta_structural_complexity \
+  --kl_schedule fixed --kl_fixed 1e-4 \
+  --out_dir checkpoints/smoke_reconstruction \
   --best_checkpoint_name vae_best.pt \
-  --out_dir checkpoints/synth_geoaware_v1
-
-Use --patch_size X Y Z for anisotropic examples. If you provide a single value, it is applied to all three axes.
-
+  --no_save_epoch_checkpoints
 ```
+
+For one-dimensional sizes, `--patch_size N` broadcasts to all axes; anisotropic sizes use
+`--patch_size X Y Z`. The production suite uses 32×32×64 patches.
 
 ## Derived metadata pipeline
 
@@ -90,6 +62,9 @@ scripts/sample_patches.py now writes per-patch derived metadata arrays alongside
 
 - meta_dip_mean_deg
 - meta_dip_std_deg
+- meta_dip_range_deg
+- meta_dip_mean_class
+- meta_dip_range_class
 - meta_azimuth_mean_deg
 - meta_azimuth_circular_variance
 - meta_fault_intersection_fraction
@@ -102,17 +77,24 @@ scripts/sample_patches.py now writes per-patch derived metadata arrays alongside
 - meta_channel_fraction
 - meta_channel_core_fraction
 - meta_structural_complexity
+- meta_water_fraction
+- meta_closure_fraction
 
-These vectors are computed from synthetic label volumes (for example geologic_age_faulted and fault_intersection_segments) and used by scripts/train.py when geology loss is enabled.
+Metadata arrays are computed from source label volumes (for example `geologic_age_faulted`
+and `fault_intersection_segments`) and are stored in the patch zarr. Training reads the
+selected arrays only when the corresponding metadata, contrastive, classifier, or sampler
+objective needs them. The class-presence target arrays are documented in the classifier
+section below.
 
-## New geology-aware train.py options
+## Metadata-to-latent regression loss (legacy objective)
 
 - --geology_loss_weight FLOAT
   - Default: 0.0
   - Set > 0 to activate metadata-to-latent similarity shaping.
 - --geology_metadata_keys KEY [KEY ...]
-  - Default keys are the derived metadata set above.
-  - Use this if you want to drop or reorder features for ablations.
+  - Defaults to `DEFAULT_DERIVED_METADATA_KEYS` in `scripts/train.py`; this is a subset of
+    the arrays written by the sampler, not every array in the inventory above.
+  - Explicitly pass this flag to choose or reorder metadata keys for ablations.
 
 ## Latent geology validation diagnostics
 
@@ -132,39 +114,33 @@ Configure diagnostic cost and retrieval neighborhood size with:
 
 The values are written to TensorBoard each epoch. Correlation, separation, and neighbor overlap are also appended to `training_metrics.csv` and printed after the epoch summary. Monitor trends on validation data rather than absolute training-batch values.
 
-## Recommended values for the first full run
+## Current recommendations and experiment status
 
-- patch creation
-  - --patch_size 32 32 64
-  - --n_patches 120000 (train), 24000 (val)
-  - --n_per_volume 600 (train), 200 (val) — must be high enough that n_patches ≤ n_volumes × n_per_volume; otherwise the preallocated zarr is filled with silence and PMSE explodes
-  - --seismic_key seismicCubes_cumsum_fullstack
-  - --geoscore_key geologic_score
-- training core
-  - --batch_size 12
-  - --number_batches 300
-  - --epochs 120
-  - --learning_rate 1e-4
-  - --weight_decay 1e-4
-  - --kl_schedule warmup --kl_start 0.0 --kl_end 1e-3 --kl_warmup_epochs 20
-  - --geology_loss_weight 0.10
-- augmentation and stability
-  - --augment
-  - --vertical_warp_prob 0.5
-  - --mixup_augment_prob 0.2
-  - --lr_scheduler plateau --lr_scheduler_patience 4 --lr_scheduler_factor 0.5
-  - --early_stopping_patience 12
-
-If training is unstable, lower geology pressure first (for example --geology_loss_weight 0.05), then increase once reconstruction is stable.
+- For the evaluated geology-aware experiments, use
+  `scripts/geoaware_classifier_suite.sh`; it owns the current patch sizes, splits, offsets,
+  seeds, warm start, and flags. Avoid copying old hyperparameter snippets into a new run.
+- The suite's training data contains 108,000 patches from 180 labeled training volumes;
+  validation contains 4,000 uniform patches from 20 labeled validation volumes. Five of the
+  25 validation volumes have no geology label arrays and are skipped.
+- The old 0.139 checkpoint was trained on volumes overlapping the frozen benchmark source.
+  Use the suite's leak-free `r1ctrl` run as the comparison control for new experiments.
+- Current experiments show a modest R2 improvement over that control, but no repeatable
+  result exceeds the previous 0.1385 score. The best classifier macro AUROC is below the
+  0.75 sanity gate. Keep the Phase 2 checkpoint as the adopted model; voxel mode (WP6/R5)
+  is not currently justified. See the [progress log](../sessions/2026-09-25-geology-classifier-progress.md)
+  for measured results and the [plan](../plans/2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md)
+  for remaining gates.
 
 ## Minimal smoke command
 
-For a quick integration check before long training:
+After running the suite's `sample` stage, this checks the training CLI and data loader with
+two batches. It does not test geology supervision:
 
 ```bash
 uv run python scripts/train.py \
-  --data data/synth_train_32-32-64.zarr \
-  --validation_data data/synth_val_32-32-64.zarr \
+  --data data/synth_train_anchored_32-32-64.zarr \
+  --validation_data data/synth_val_uniform_32-32-64.zarr \
+  --patch_size 32 32 64 \
   --batch_size 4 \
   --number_batches 2 \
   --epochs 1 \
@@ -172,8 +148,7 @@ uv run python scripts/train.py \
   --weight_decay 1e-4 \
   --kl_schedule fixed \
   --kl_fixed 1e-4 \
-  --geology_loss_weight 0.10 \
-  --out_dir checkpoints/smoke_geoaware \
+  --out_dir checkpoints/smoke_reconstruction \
   --best_checkpoint_name vae_best.pt \
   --no_save_epoch_checkpoints
 ```
@@ -182,125 +157,111 @@ uv run python scripts/train.py \
 
 Symptoms: training loss in the hundreds of thousands, validation loss nan/inf from epoch 1.
 
-Root cause: the sampled zarr file has far fewer real patches than the preallocated size. The zarr is created with shape (n_patches, ...) but if n_volumes × n_per_volume < n_patches, the remainder is zarr zero-fill. The PMSE reconstruction loss divides by label energy, which is 0 for zero patches, producing huge or infinite loss values. This also causes metadata vectors of all zeros which produce NaN in the geology loss on MPS.
+Root cause: the sampled zarr file has fewer written patches than its requested size. If the
+sampler writes fewer than `n_patches`, the preallocated remainder is zero-filled. PMSE can
+then become very large or non-finite on those empty rows. Check `n_written` before training;
+the current suite uses MAE reconstruction loss.
 
 Check:
 
 ```bash
 uv run python - <<'PY'
 import zarr, numpy as np
-z = zarr.open('data/synth_train_32-32-64.zarr', mode='r')
+z = zarr.open('data/synth_train_anchored_32-32-64.zarr', mode='r')
 patches = np.asarray(z['patches'])
 zero_rows = int(np.all(patches.reshape(len(patches), -1) == 0.0, axis=1).sum())
 print(f'zero patches: {zero_rows}/{len(patches)} ({100.0*zero_rows/len(patches):.1f}%)')
 PY
 ```
 
-Fix: ensure n_per_volume × n_volumes ≥ n_patches. With ~200 volumes, use n_per_volume=600 for n_patches=120000.
+Fix: check the sampler's final `n_written` attribute and ensure all requested patches were
+written. The suite's standard training set uses 600 patches × 180 labeled training volumes
+= 108,000 patches. Do not use the old preallocated zarr if it contains unwritten zero rows.
 
 If training fails with an error like:
 
-- KeyError: Required geology metadata key 'meta_sand_fraction' was not found in the dataset.
+- KeyError: a required classifier target such as 'label_presence_fault' was not found in the dataset.
 
-then your patch zarr was created before the latest metadata schema update. Regenerate both train and validation patch datasets with scripts/sample_patches.py, then rerun training.
+then the patch zarr predates the label-target schema or classifier flags were enabled on an
+unlabeled dataset. Regenerate it with the suite's `sample` stage. For non-classifier legacy
+training, leave `--geology_classifier` off and use only metadata keys present in the dataset.
 
 Quick check:
 
 ```bash
 uv run python - <<'PY'
 import zarr
-z = zarr.open('data/synth_train_32-32-64.zarr', mode='r')
+z = zarr.open('data/synth_train_anchored_32-32-64.zarr', mode='r')
 print('derived_metadata_keys:', z.attrs.get('derived_metadata_keys'))
-print('has meta_sand_fraction:', 'meta_sand_fraction' in z)
+print('has label_presence_fault:', 'label_presence_fault' in z)
 PY
 ```
 
-If you must train with older patch files, pass only keys that exist in those files to --geology_metadata_keys.
+`uniform` and `class_anchored` sampling skip source volumes without all label arrays; review
+`skipped_volumes_missing_labels` in the output attrs before training/evaluation.
 
-## Better rerun strategy
+## Choosing and repeating experiments
 
-For better stability, do not start with the full geology key set at full weight on the first pass. Use a staged run:
+Use the suite for the evaluated recipe instead of the older 120-epoch
+`--geology_loss_weight` examples. Its named runs change one main factor at a time:
 
-1. First pass: regenerate patches, then train with a smaller geology weight and only the structural keys.
-   - --geology_loss_weight 0.02 to 0.05
-   - --geology_metadata_keys meta_dip_mean_deg meta_dip_std_deg meta_azimuth_mean_deg meta_azimuth_circular_variance meta_structural_complexity
-2. Second pass: once reconstruction is stable, resume from the best checkpoint and add the remaining interpretation keys.
-   - --resume checkpoints/synth_geoaware_v1/vae_best.pt
-   - add meta_sand_fraction, meta_shale_fraction, meta_flat_spot_fraction, meta_onlap_fraction, meta_onlap_variability, meta_channel_fraction, meta_channel_core_fraction
+- `r1ctrl`: leak-free geoscore control;
+- `r1`: class-anchored sampling;
+- `r2`: R1 plus the patch classifier;
+- `r3`: R2 plus presence-label strata and per-batch class quotas.
 
-Recommended rerun sequence:
+Set `RUNS="r2"` to rerun only R2, `EPOCHS=40` to choose the epoch count, and
+`BENCH_EPOCHS="10 20 30 40"` to choose evaluation epochs. The suite does not expose the R4
+classifier-weight sweep; use the experiment commands in the session summary for that
+separate ablation.
 
-```bash
-uv run python scripts/sample_patches.py \
-  --source '/Volumes/CrucialX9/fake_data' \
-  --patch_size 32 32 64 \
-  --n_patches 120000 \
-  --n_per_volume 600 \
-  --seismic_key seismicCubes_cumsum_fullstack \
-  --geoscore_key geologic_score \
-  --out data/synth_train_32-32-64.zarr
+**Cautions:**
 
-uv run python scripts/sample_patches.py \
-  --source '/Volumes/CrucialX9/fake_data' \
-  --patch_size 32 32 64 \
-  --n_patches 24000 \
-  --n_per_volume 200 \
-  --seismic_key seismicCubes_cumsum_fullstack \
-  --geoscore_key geologic_score \
-  --out data/synth_val_32-32-64.zarr
-```
+- Compare new runs with `r1ctrl`, because the historical 0.139 checkpoint was trained on
+  volumes overlapping the frozen validation source. The prior results show only a modest
+  repeatable R2 gain over the leak-free control; no repeatable result exceeded 0.1385.
+- The classifier sanity gate is macro AUROC ≥ 0.75. Current runs are below it; the highest
+  observed value was 0.677. Do not start voxel mode unless retrieval improvement is
+  repeatable and the WP6 gate is met.
+- Compare reconstruction `val_loss` only on the same validation store and loss settings;
+  regressions over 2% are not acceptable for adoption.
+- Do not sample training from the parent directory without `--exclude_dir validation`.
+  Keep `data/synth_val_32-32-64.zarr` and the frozen manifest unchanged for benchmark
+  comparability.
 
-Then train with a smaller first-pass geology weight:
-
-```bash
-uv run python scripts/train.py \
-  --data data/synth_train_32-32-64.zarr \
-  --validation_data data/synth_val_32-32-64.zarr \
-  --patch_size 32 32 64 \
-  --batch_size 12 \
-  --number_batches 300 \
-  --epochs 120 \
-  --augment \
-  --vertical_warp_prob 0.5 \
-  --mixup_augment_prob 0.2 \
-  --learning_rate 1e-4 \
-  --weight_decay 1e-4 \
-  --kl_schedule warmup \
-  --kl_start 0.0 \
-  --kl_end 1e-3 \
-  --kl_warmup_epochs 20 \
-  --lr_scheduler plateau \
-  --lr_scheduler_patience 4 \
-  --lr_scheduler_factor 0.5 \
-  --early_stopping_patience 12 \
-  --geology_loss_weight 0.03 \
-  --geology_metadata_keys meta_dip_mean_deg meta_dip_std_deg meta_azimuth_mean_deg meta_azimuth_circular_variance meta_structural_complexity \
-  --best_checkpoint_name vae_best.pt \
-  --out_dir checkpoints/synth_geoaware_v1
-```
-
-If that run is stable and validation keeps improving, resume from the best checkpoint and expand the metadata keys to include the channel, flat-spot, onlap, and lithology-derived features.
-
-## Geology classifier and class-anchored sampling (2026-09-25)
+## Geology classifier and class-anchored sampling
 
 Plan: [2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md](../plans/2026-09-25__geology_classifier_decoder_and_class_anchored_sampling_plan.md).
 Progress and findings: [2026-09-25-geology-classifier-progress.md](../sessions/2026-09-25-geology-classifier-progress.md).
 
-Run all experiments with one script. It samples the data, trains R1-ctrl, R1, R2, and R3,
-benchmarks them, and prints a summary:
+Set `SOURCE` to a directory containing the source volumes and its nested `validation/`
+directory, then run the pipeline on Linux:
 
 ```bash
+cd /path/to/synthoseis-3dvae-poc
+uv sync
+export SOURCE=/path/to/fake_data
 mkdir -p logs
-nohup caffeinate -i scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
-scripts/geoaware_classifier_suite.sh summary                  # results table at any time
-RUNS="r1ctrl r1" scripts/geoaware_classifier_suite.sh train  # subset of runs
-PRINT_COMMANDS=1 scripts/geoaware_classifier_suite.sh all     # print commands only
+
+# Preview commands before starting the long run.
+PRINT_COMMANDS=1 scripts/geoaware_classifier_suite.sh all
+
+# Run sampling, training, benchmarks, and summary sequentially in the background.
+nohup env SOURCE="$SOURCE" scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
+echo $! > logs/suite.pid
+tail -f logs/suite.log
 ```
+
+Stages are `sample`, `train`, `benchmark`, and `summary`. For example,
+`RUNS="r1ctrl r2" scripts/geoaware_classifier_suite.sh train` selects runs. Set
+`OVERWRITE=1` only when you intend to delete and rebuild completed outputs. `nohup` is
+optional if you want to keep the command attached to the current terminal; Linux does not
+need macOS's `caffeinate`.
 
 The runs, one primary variable each, all warm-started from Phase 2 epoch 20:
 
 | Run | Training data | Adds |
-|---|---|---|
+| --- | --- | --- |
 | `r1ctrl` | geoscore sampling, validation volumes excluded | nothing; this is the leak-free baseline |
 | `r1` | class-anchored | anchored data |
 | `r2` | class-anchored | + classifier decoder (focal, weight 0.1) |
@@ -309,17 +270,20 @@ The runs, one primary variable each, all warm-started from Phase 2 epoch 20:
 Compare r1, r2, and r3 against `r1ctrl`, not 0.139. The old training set included the
 validation volumes.
 
-The script can be re-run safely. It skips finished items: sampled stores that have the
+The script skips finished items: sampled stores that have the
 `n_written` attr, runs whose last epoch checkpoint exists, and existing benchmark reports.
-`OVERWRITE=1` redoes them. It stops at once on missing inputs. Per-step logs go to
-`logs/`. It never writes to `data/synth_val_32-32-64.zarr` or the frozen manifest.
+`OVERWRITE=1` rebuilds them. It stops at once on missing inputs. Per-step logs go to
+`logs/`. It does not regenerate or overwrite `data/synth_val_32-32-64.zarr` or the frozen
+manifest. The old frozen set remains for historical comparison; `r1ctrl` is the fair,
+leak-free control.
 
-All new flags default to the previous behavior.
+Opt-in classifier, strata, quota, and anchored-sampling flags preserve their legacy defaults.
+WP1 intentionally corrected the default seismic key and sand/shale metadata semantics.
 
 ### scripts/sample_patches.py
 
 | Flag | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--exclude_dir NAME` (repeatable) | none | Skip volumes under a folder with this name; use `validation` for training sets |
 | `--sampling_mode {geoscore,class_anchored,uniform}` | `geoscore` | Legacy geoscore-weighted, class-anchored, or natural-prevalence origins |
 | `--class_quotas CLASS=FRACTION ...` | 0.125 for each class except sand | Share of anchored patches per class (fault, fault_x, channel, closure, onlap, sand, flat_spot) |
@@ -334,6 +298,7 @@ All new flags default to the previous behavior.
 | `--disjoint_from ZARR` (repeatable) | none | Fail if any source volume also appears in that store's `source_volumes` |
 
 New per-patch arrays:
+
 - `label_presence_<class>`: 7 arrays, uint8;
 - `anchor_class`: int8, −1 means background;
 - `inclusion_weight`: undoes the oversampling of rare classes;
@@ -346,7 +311,7 @@ validation volumes) and list them in the `skipped_volumes_missing_labels` attr.
 ### scripts/train.py
 
 | Flag | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--geology_classifier` | off | Build the patch-level classifier head on `mu` |
 | `--geology_classifier_mode {patch}` | `patch` | Voxel mode is planned (WP6) |
 | `--geology_classifier_hidden` | 256 | Hidden width of the classifier |
@@ -367,7 +332,7 @@ The tokenizer ignores the classifier weights.
 ### scripts/evaluate_geology_benchmark.py
 
 | Flag | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--classifier_data ZARR` | none | Natural-prevalence set (`--sampling_mode uniform`); adds `classifier_metrics` to the report |
 | `--classifier_threshold_data ZARR` | none | Training split used to tune per-class F1 thresholds (default: fixed 0.5) |
 | `--classifier_max_samples` | 5000 | Maximum patches read from each classifier dataset |
@@ -380,8 +345,30 @@ on the frozen manifest remain the primary metric.
 
 ### scripts/verify_label_alignment.py
 
-This script measures the label/seismic depth offset by cross-correlating on real volumes.
-The verified result is +1.
+This is a repeatable data-audit utility, not a test module. It measures the label/seismic
+depth offset on real volumes; the verified convention is `seismic[z]` ↔ `label[z + 1]`.
+
+```bash
+uv run python scripts/verify_label_alignment.py \
+  --source "$SOURCE" \
+  --n_volumes 20 \
+  --out_json data/wp0_label_alignment.json
+```
+
+## Further work and scope limits
+
+- **Voxel classifier (WP6/R5):** not implemented. The current R2/R4 results do not show a
+  repeatable n@5 improvement sufficient to justify the voxel-label storage and training
+  cost; classifier macro AUROC also remains below 0.75. Keep `--geology_classifier_mode`
+  at `patch`.
+- **Per-batch segment-ID telemetry:** deferred. Segment IDs are not stored per sampled patch;
+  current batch logs report per-class shares and quota fallbacks.
+- **Tokenizer UI classifier filters:** not implemented; this is an optional follow-up after
+  a classifier checkpoint is adopted.
+- **Preprocessing parity:** classifier evaluation supports `tokenizer` and `extrema`
+  preprocessing. Training uses dataset-scaled inputs plus augmentation choices, while the
+  tokenizer normalizes each cube individually. Compare the modes when interpreting classifier
+  scores; do not treat them as directly interchangeable.
 
 ## Main files
 
