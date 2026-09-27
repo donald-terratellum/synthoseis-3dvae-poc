@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -228,6 +229,28 @@ class TestCheckpoints(unittest.TestCase):
 
 
 class TestDatasetAndGuards(unittest.TestCase):
+    def test_contrastive_loss_loads_metadata_arrays(self):
+        args = SimpleNamespace(
+            geology_metadata_keys=['meta_fault_fraction'],
+            geology_loss_weight=0.0,
+            geology_contrastive_weight=0.5,
+            geology_uniformity_weight=0.0,
+            geology_batch_sampler=False,
+            geology_classifier_weight=0.0,
+            geology_classifier_classes=[],
+            input_scaling='none', input_mean=0.0, input_std=1.0,
+            swap_xy_prob=0.0, flip_x_prob=0.0, flip_y_prob=0.0,
+            vertical_warp_prob=0.0, zero_cluster_min=0, zero_cluster_max=0,
+            input_extrema_prob=1.0, input_sparse_keep_prob=0.0,
+            input_decimate_trilinear_prob=0.0, sparse_keep_fraction_min=0.1,
+            sparse_keep_fraction_max=0.3, sparse_poisson_radius_scale=0.85,
+            mixup_augment_prob=0.0,
+        )
+        with mock.patch.object(train_script, 'ZarrPatchDataset', return_value='dataset') as dataset_cls:
+            self.assertEqual(train_script.build_dataset(args, 'unused.zarr'), 'dataset')
+        self.assertTrue(dataset_cls.call_args.kwargs['include_metadata'])
+        self.assertEqual(dataset_cls.call_args.kwargs['geology_metadata_keys'], ('meta_fault_fraction',))
+
     def _write_dataset(self, root, with_presence=True, n=6):
         g = zarr.open_group(str(root), mode='w')
         g.create_array('patches', data=np.random.default_rng(0).normal(size=(n,) + PATCH).astype(np.float32))

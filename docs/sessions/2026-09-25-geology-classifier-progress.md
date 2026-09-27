@@ -49,7 +49,7 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 | WP3 | Classifier decoder (patch mode) | **Done** | 18 new; suite 157 OK | Warm-start smoke run trains; tokenizer ignores head |
 | WP4 | Label-driven batch sampler | **Done** | 16 new; suite 173 OK | Quotas met in 100% of smoke batches |
 | WP5 | Evaluation additions | **Done** | 13 new; suite 186 OK | R0 reproduces n@5 0.139; 5 of 25 validation volumes have no labels |
-| WP6 | Voxel mode | Not started | — | Gated on WP3 improving n@5 (needs R2) |
+| WP6 | Voxel mode | Not started | — | Not justified: no repeatable n@5 above the old best; classifier gate fails |
 | WP7 | Suite script and docs | **Done** | 4 new; suite 190 OK | `scripts/geoaware_classifier_suite.sh` |
 
 ## Benchmark results
@@ -58,6 +58,15 @@ Source data: 205 synthoseis volumes at `/Volumes/CrucialX9/fake_data` (the 25 un
 |---|---|---:|---:|---:|---|
 | baseline | Phase 2 epoch 20 (`z_geo`) | 0.139 | 0.227 | 0.128 | current |
 | R0 | Re-benchmark of baseline with the WP5 script (2026-09-25) | 0.1385 | 0.2269 | — | sanity OK |
+| R1ctrl | Leak-free geoscore, epoch 10 (best n@5) | 0.1115 | 0.1904 | 0.3381 | control |
+| R1 | Anchored only, epoch 10 (best n@5) | 0.1269 | 0.2250 | 0.3413 | not adopted |
+| R2 seed 1 | Classifier 0.1, epoch 30 | 0.1346 | 0.2288 | 0.3384 | candidate; not above old best |
+| R2 seed 2 | Classifier 0.1, epoch 20 (best n@5) | 0.1308 | 0.2135 | 0.3412 | modest control gain; not replicated above old best |
+| R3 | R2 + presence strata/quotas, epoch 20 (best n@5) | 0.1269 | 0.2135 | 0.3435 | no gain over R2 |
+| R4 w=0.05 seed 1 | Classifier-weight sweep, epoch 10 | 0.1423 | 0.2212 | 0.3420 | isolated peak; not reproduced |
+| R4 w=0.05 seed 2 | Repeat, epoch 20 (best n@5) | 0.1308 | 0.2038 | 0.3360 | peak not reproduced |
+| R4 w=0.10 | Epoch 30 (best n@5) | 0.1231 | 0.2192 | 0.3376 | no improvement |
+| R4 w=0.30 | Epoch 10 (best n@5) | 0.1115 | 0.2154 | 0.3453 | no improvement |
 
 ## Known defects (from the plan) and where they are fixed
 
@@ -227,8 +236,9 @@ that `z_geo` is projected from.
     only), `--geology_classifier_hidden`, `--geology_classifier_weight`,
     `--geology_classifier_loss {bce,focal}`, `--geology_classifier_focal_gamma`,
     `--geology_classifier_label_smoothing`, `--geology_classifier_classes`.
-  - The training dataset loads `label_presence_*` and the dip-class arrays only when the
-    classifier weight is > 0, and fails with a clear message if they are missing.
+  - The training dataset loads `label_presence_*` and dip-class arrays when classifier
+    supervision is enabled. Metadata keys are loaded when metadata regression, contrastive,
+    uniformity, or the geology batch sampler needs them.
   - A classifier weight > 0 requires `--geology_classifier`.
   - Checkpoints now store the classifier settings.
   - Warm-starting and resuming tolerate missing or unexpected classifier weights.
@@ -257,6 +267,10 @@ that `z_geo` is projected from.
 - **Bug found and fixed.** With only the classifier enabled, the dataset tried to read
   metadata keys it had never loaded. It now reads only the arrays it loaded, and a test
   covers this case.
+- **Follow-up fix (2026-09-27).** R4 with SupCon enabled but metadata regression and the
+  batch sampler disabled failed at the first batch because SupCon's metadata keys were not
+  loaded. `build_dataset()` now enables metadata loading when contrastive or uniformity
+  weight is positive. A regression test covers this configuration; full suite: 193 tests OK.
 
 **Notes:**
 - `pos_weight` is 1 for a class with no positives. Fault intersections were absent from the
@@ -417,37 +431,46 @@ improving n@5, which requires the R1/R2 training runs on the full sampled datase
 - that an unknown stage exits with code 2;
 - that missing inputs fail fast.
 
-**Decision:** implementation of WP0–WP5 and WP7 is complete. Next are the experiment runs.
+**Decision:** implementation of WP0–WP5 and WP7 is complete. The experiment runs are
+complete; WP6 remains gated.
 
----
+## Experiment results and decision (2026-09-27)
 
-## Next steps (experiments)
+The suite generated leak-free control and validation data, trained R1ctrl/R1/R2/R3, and
+benchmarked epochs 10/20/30/40. R4 then swept classifier weights 0.05, 0.1, and 0.3;
+weight 0.05 was repeated with a second seed. R2 weight 0.1 was also repeated with a second
+seed. All values below are from the frozen manifest; validation loss is from the same
+epoch's `training_metrics.csv`.
 
-Everything below is automated by one script:
+| Run | Best sampled epoch | n@5 | n@10 | val_loss | Macro AUROC | Interpretation |
+|---|---:|---:|---:|---:|---:|---|
+| R1ctrl, leak-free geoscore | 10 | 0.1115 | 0.1904 | 0.3381 | — | comparison control |
+| R1, anchored only | 10 | 0.1269 | 0.2250 | 0.3413 | — | observed gain over control |
+| R2 seed 1, classifier 0.1 | 30/40 | 0.1346 | 0.2288 (ep30) | 0.3384 (ep30) | 0.637 | strongest repeatable candidate so far |
+| R2 seed 2, classifier 0.1 | 20 | 0.1308 | 0.2135 | 0.3412 | 0.630 | directionally supports R2; below seed 1 |
+| R3, R2 + presence strata/quotas | 20 | 0.1269 | 0.2135 | 0.3435 | 0.642 | no measured gain over R2 |
+| R4 weight 0.05, seed 1 | 10 | 0.1423 | 0.2212 | 0.3420 | 0.642 | isolated high n@5 |
+| R4 weight 0.05, seed 2 | 20 | 0.1308 | 0.2038 | 0.3360 | 0.651 | isolated peak did not replicate |
+| R4 weight 0.1 | 30 | 0.1231 | 0.2192 | 0.3376 | 0.648 | no improvement |
+| R4 weight 0.3 | 10 | 0.1115 | 0.2154 | 0.3453 | 0.644 | no improvement |
 
-```bash
-nohup caffeinate -i scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
-```
+**Objective interpretation:**
+- R2 improves n@5 over the leak-free control in both seeds (best 0.1346 and 0.1308 vs
+  control's best 0.1115); its paired reconstruction losses are within the 2% guardrail.
+  This is a modest, directionally repeatable gain, not a confirmed new best.
+- R2's best values remain below the previous 0.1385 baseline. The old baseline trained on
+  volumes overlapping the frozen validation source, so it is not a fair leak-free control;
+  nevertheless, no new result has robustly exceeded it.
+- The R4 weight-0.05 seed-1 n@5 of 0.1423 did not repeat (seed 2 peak 0.1308). The frozen
+  manifest has only 52 eligible queries, and the n@5 bootstrap intervals overlap; treat
+  small differences as noisy.
+- The best classifier macro AUROC is 0.677 (R4 weight 0.3, epoch 20), below the 0.75 gate.
+  The classifier shows learning signal but has not met its planned sanity criterion.
 
-1. **Sample** three stores:
-   - class-anchored training data;
-   - leak-free geoscore control data;
-   - uniform validation data.
-
-   Expect about 2.5 h each for the two training stores. Check the attrs
-   (`anchored_counts`, `fallback_counts`, `skipped_volumes_missing_labels`) in
-   `logs/sample_*.log` before trusting the training results.
-2. **Train** `r1ctrl`, `r1`, `r2`, and `r3`, one primary variable each (plan Section 7).
-   **Leakage found:** the old training set
-   (`data/synth_train_32-32-64.zarr`) used all 205 volumes, including the 25 validation
-   volumes that the frozen benchmark is drawn from. So the 0.139 baseline is optimistic.
-   `r1ctrl` repeats the Phase 2 recipe on leak-free geoscore data and is the fair baseline.
-3. **Benchmark** epochs 10/20/30/40 (`summary` prints the table), and add the rows to the
-   results table. Adopt a run only if n@5 beats `r1ctrl` and `val_loss` regresses by no
-   more than 2% relative to `r1ctrl` on the same validation set.
-4. **Classifier checks.** Check `classifier_metrics.sanity_gate`, and compare
-   `--classifier_preprocess tokenizer` with `extrema` (see the WP5 findings).
-5. **WP6 (voxel mode)** only if R2 or R3 improves n@5.
+**Decision:** do not start WP6 voxel mode. Keep R2 seed 1, epoch 30 as an experimental
+checkpoint, but retain the Phase 2 checkpoint as the adopted model. No further weight
+sweep is warranted from these results; a materially different lever would be needed to
+justify more compute.
 
 <!-- Template for next WP:
 ### WPn — Title (status)

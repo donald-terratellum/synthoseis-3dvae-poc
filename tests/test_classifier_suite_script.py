@@ -80,7 +80,7 @@ class TestClassifierSuiteScript(unittest.TestCase):
             self.assertFalse(stores["ctrl"].exists())
 
     def test_missing_inputs_fail_fast(self):
-        env = dict(os.environ, TRAIN_DATA="/nonexistent/train.zarr")
+        env = dict(os.environ, CTRL_DATA="/nonexistent/train.zarr", OUT_PREFIX="/tmp/nonexistent-geoaware-suite")
         result = subprocess.run(["bash", str(SUITE), "train"], cwd=REPO, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("Missing required input", result.stderr)

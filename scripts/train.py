@@ -2051,6 +2051,8 @@ def build_dataset(args, data_path, augment=False):
         len(geology_keys) > 0
         and (
             args.geology_loss_weight > 0.0
+            or args.geology_contrastive_weight > 0.0
+            or args.geology_uniformity_weight > 0.0
             or bool(getattr(args, 'geology_batch_sampler', False))
         )
     )
