@@ -472,6 +472,11 @@ checkpoint, but retain the Phase 2 checkpoint as the adopted model. No further w
 sweep is warranted from these results; a materially different lever would be needed to
 justify more compute.
 
+**Plan reconciliation (2026-09-27):** the readiness checklist now reflects completed
+compatibility, evaluation, operational, and test checks. Remaining work is the deferred
+WP4 per-batch segment-ID telemetry and gated WP6/R5 voxel experiment. The optional tokenizer
+UI classifier-filter follow-up remains out of scope.
+
 <!-- Template for next WP:
 ### WPn — Title (status)
 

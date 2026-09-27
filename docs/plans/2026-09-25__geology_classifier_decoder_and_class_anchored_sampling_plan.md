@@ -236,8 +236,8 @@ a label-driven mode alongside it; keep the current behavior as the default.
 - Positive pairs for SupCon: prefer pairs that share a rare presence class.
 - Use `inclusion_weight` when fitting `fit_geology_metadata_calibration` so calibration reflects
   natural prevalence, not the rebalanced training set.
-- Log new sampler stats per epoch: achieved per-class share, quota fallbacks, unique segment
-  ids per batch.
+- Log new sampler stats per epoch: achieved per-class share and quota fallbacks. Unique
+  segment ids per batch are deferred: the dataset does not retain segment IDs per patch.
 
 **Batch size:** Phase 2 uses 12. With 7 rare classes, a per-class quota of 2 would fill the
 whole batch. Use quotas only for the 3 rarest classes (fault intersection, flat spot, channel)
@@ -349,6 +349,14 @@ Run one primary variable at a time for clean attribution (parent plan guardrail)
 | R3 | R2 + label-driven batch sampler (WP4) | n@5 > best so far |
 | R4 | Sweep `--geology_classifier_weight` ∈ {0.05, 0.1, 0.3} on the best of R1–R3 | n@5 > best so far |
 | R5 | Voxel mode (WP6) | n@5 > best so far |
+
+**Experiment status (2026-09-27):** R0–R4 have been run, including independent repeats of
+R2 and R4 at classifier weight 0.05. R2 showed a modest gain over the leak-free R1 control
+in both seeds (best n@5 0.1346 and 0.1308 vs 0.1115), but no result robustly exceeded the
+previous 0.1385 baseline. R4 weight 0.05 reached 0.1423 once, but its repeat peaked at
+0.1308. The manifest has only 52 eligible queries and the n@5 intervals overlap. The best
+classifier macro AUROC was 0.677, below the 0.75 sanity gate. Keep the Phase 2 checkpoint
+adopted; do not start R5/WP6 on this evidence. The target n@5 band (0.18–0.25) remains unmet.
 
 **Guardrail on reconstruction:** compare `val_loss` only against the baseline measured on
 **the same validation set and loss configuration**. The v1b history (Section 8.1) shows that
@@ -594,26 +602,35 @@ Parameter notes:
 
 **Backward compatibility**
 
-- [ ] All new flags default to current behavior; fixed-seed regression tests for
+- [x] All new flags default to current behavior; fixed-seed regression tests for
       `--sampling_mode geoscore` and `--geology_classifier` off.
-- [ ] Old datasets without `label_presence_*` still train with existing flags.
-- [ ] Old checkpoints load in `train.py` and the tokenizer; new checkpoints load in the
+- [x] Old datasets without `label_presence_*` still load/train when classifier supervision is off.
+- [x] Old checkpoints load in `train.py` and the tokenizer; new checkpoints load in the
       tokenizer.
 
 **Evaluation discipline**
 
-- [ ] Frozen manifest and `data/synth_val_32-32-64.zarr` untouched; n@5 compared to 0.139.
-- [ ] Classifier metrics reported on natural-prevalence validation only.
-- [ ] Reconstruction guardrail compared within one validation set (≤ 2% regression).
-- [ ] One primary variable per run.
+- [x] Frozen manifest and `data/synth_val_32-32-64.zarr` were left untouched; R0 compared to 0.139.
+- [x] Classifier metrics reported on natural-prevalence validation only.
+- [x] Reconstruction guardrail compared within the same uniform validation set; runs outside 2% were not adopted.
+- [x] One primary variable per run (R1ctrl, R1, R2, R3; R4 varies classifier weight).
 
 **Operational**
 
 - [x] Anchor index built chunk by chunk; peak memory per volume measured on one real volume (1.8 GB).
 - [x] Sampling runtime measured for one real volume and reported before a full run (51 s / 600 patches).
 - [x] Output attrs record every sampling parameter, the seed, and the label class order.
-- [ ] Suite script uses `set -euo pipefail` and fails fast on missing inputs.
-- [ ] Tests run with: `.venv/bin/python -m unittest discover -s tests`.
+- [x] Suite script uses `set -euo pipefail` and fails fast on missing inputs.
+- [x] Tests run with: `.venv/bin/python -m unittest discover -s tests` (193 passed, 2026-09-27).
+
+**Remaining / gated work (reviewed 2026-09-27)**
+
+- WP4 unique-segment-ID counts per batch were not implemented; this telemetry is deferred
+  because segment IDs are not stored per sampled patch.
+- R5/WP6 voxel mode is intentionally not implemented until a repeatable retrieval gain
+  justifies it. Current R2/R4 repeats did not establish a new adopted n@5 best, and the
+  classifier sanity gate remains below target.
+- The optional tokenizer UI classifier-filter follow-up remains out of scope.
 
 **Risks and mitigations**
 
