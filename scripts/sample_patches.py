@@ -10,9 +10,12 @@ Usage:
 from pathlib import Path
 import sys
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR in sys.path:
     sys.path.remove(SCRIPT_DIR)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import argparse
 import random
@@ -21,6 +24,15 @@ import numpy as np
 import zarr
 import math
 from typing import Any, cast
+
+from src.geology_label_augment import (
+    DEFAULT_DIP_SAMPLE_COUNT,
+    DIP_MEAN_CLASS_EDGES_DEG,
+    DIP_RANGE_CLASS_EDGES_DEG,
+    dip_field_deg,
+    quantize,
+    sample_dip_field,
+)
 
 
 DERIVED_METADATA_KEYS = (
@@ -67,14 +79,6 @@ DEFAULT_CLASS_QUOTAS = {c: 0.125 for c in ("fault", "fault_x", "channel", "closu
 DEFAULT_BACKGROUND_FRACTION = 0.25
 DEFAULT_MAX_PATCHES_PER_OBJECT = 24
 BACKGROUND = "background"
-
-# Edges chosen from observed patch distributions (dip mean p5-p95 ~10-56 deg, p90-p10 range p5-p95 ~7-30 deg).
-DIP_MEAN_CLASS_EDGES_DEG = (10.0, 20.0, 30.0, 40.0, 50.0)
-DIP_RANGE_CLASS_EDGES_DEG = (8.0, 12.0, 16.0, 24.0, 32.0)
-
-
-def quantize(value, edges):
-    return float(np.digitize(float(value), edges))
 
 
 def normalize_patch_size(values):
@@ -156,11 +160,7 @@ def _safe_extract_patch_by_key(zvol, key, origin, patch_size):
 
 
 def _compute_dip_azimuth_features(structural_patch):
-    eps = 1e-8
-    gx, gy, gz = np.gradient(structural_patch.astype(np.float32), edge_order=1)
-    horizontal_mag = np.sqrt(gx * gx + gy * gy)
-    dip_rad = np.arctan2(horizontal_mag, np.abs(gz) + eps)
-    dip_deg = np.degrees(dip_rad)
+    dip_deg, gx, gy, horizontal_mag = dip_field_deg(structural_patch)
 
     azimuth_rad = np.arctan2(gy, gx)
     valid_mask = horizontal_mag > 1e-6
@@ -181,6 +181,33 @@ def _compute_dip_azimuth_features(structural_patch):
     dip_p10_deg, dip_p90_deg = np.nanpercentile(dip_deg, [10.0, 90.0])
     dip_range_deg = float(dip_p90_deg - dip_p10_deg)
     return dip_mean_deg, dip_std_deg, dip_range_deg, azimuth_mean_deg, azimuth_circular_variance
+
+
+def compute_patch_dip_samples(
+    zvol, origin, patch_size, n_samples, rng, dip_source_key="geologic_age_faulted", label_z_offset=0
+):
+    """Voxel dip samples (deg, float16) and local z indices for the label window of a seismic patch."""
+    origin = (origin[0], origin[1], origin[2] + int(label_z_offset))
+    structural_patch = _safe_extract_patch_by_key(zvol, dip_source_key, origin, patch_size)
+    if structural_patch is None or structural_patch.size == 0:
+        structural_patch = np.zeros(tuple(patch_size), dtype=np.float32)
+    structural_patch = np.nan_to_num(structural_patch, nan=0.0, posinf=0.0, neginf=0.0)
+    return sample_dip_field(dip_field_deg(structural_patch)[0], n_samples, rng)
+
+
+def write_dip_samples(dst, dip_samples_deg, dip_samples_z):
+    """Write (N, K) dip sample arrays to an open zarr group, replacing existing ones."""
+    n, k = dip_samples_deg.shape
+    chunks = (min(max(n, 1), 4096), k)
+    for name, data in (("dip_samples_deg", dip_samples_deg), ("dip_samples_z", dip_samples_z)):
+        if name in dst:
+            del dst[name]
+        if hasattr(dst, "create_dataset"):
+            arr = dst.create_dataset(name, shape=data.shape, dtype=data.dtype, chunks=chunks)
+        else:
+            arr = dst.create_array(name, shape=data.shape, dtype=data.dtype, chunks=chunks)
+        arr[:] = data
+    dst.attrs["dip_sample_count"] = int(k)
 
 
 def compute_lithology_fractions(lith_patch, sand_threshold=DEFAULT_SAND_THRESHOLD):
@@ -848,12 +875,21 @@ def main():
         metavar="ZARR",
         help="Fail if any source volume is listed in this existing output store's source_volumes (repeatable).",
     )
+    p.add_argument(
+        "--dip_sample_count",
+        type=int,
+        default=DEFAULT_DIP_SAMPLE_COUNT,
+        help="Voxel dip samples stored per patch (dip_samples_deg, dip_samples_z) so training can re-derive dip "
+             "labels after depth-warp augmentation; 0 disables.",
+    )
     args = p.parse_args()
     patch_size = normalize_patch_size(args.patch_size)
     sampling_seed = int(args.seed) if args.seed is not None else secrets.randbits(32)
     random.seed(sampling_seed)
     np.random.seed(sampling_seed)
     label_rng = np.random.default_rng(sampling_seed)
+    # Separate stream so dip sampling never changes patch origins for a given seed.
+    dip_rng = np.random.default_rng([sampling_seed, 1])
     print(f"Sampling seed: {sampling_seed}")
 
     class_quotas = parse_class_quotas(args.class_quotas) if args.class_quotas else dict(DEFAULT_CLASS_QUOTAS)
@@ -930,6 +966,12 @@ def main():
     if args.store_label_patches:
         lp_shape = (len(LABEL_CLASS_ORDER),) + tuple(patch_size)
         label_patches_dst = create("label_patches", (args.n_patches,) + lp_shape, "u1", (1,) + lp_shape)
+    dip_samples_buf = dip_z_buf = None
+    if args.dip_sample_count > 0:
+        k = int(args.dip_sample_count)
+        # Buffered in memory (N x K x 3 bytes) and written once; per-row writes would rewrite whole chunks.
+        dip_samples_buf = np.zeros((args.n_patches, k), np.float16)
+        dip_z_buf = np.zeros((args.n_patches, k), np.uint8 if patch_size[2] <= 256 else np.uint16)
     totals = {k: {c: 0 for c in LABEL_CLASS_ORDER} for k in ("anchored", "fallback", "object_cap_fallback")}
     skipped_missing_labels = []
 
@@ -1024,6 +1066,10 @@ def main():
                 inclusion_weight_dst[written] = np.float32(item["inclusion_weight"])
                 if label_patches_dst is not None:
                     label_patches_dst[written] = label_patch
+                if dip_samples_buf is not None and dip_z_buf is not None:
+                    dip_samples_buf[written], dip_z_buf[written] = compute_patch_dip_samples(
+                        z, origin, patch_size, args.dip_sample_count, dip_rng, label_z_offset=args.label_z_offset
+                    )
                 written += 1
             if written >= args.n_patches:
                 break
@@ -1036,6 +1082,8 @@ def main():
         print("Anchored counts:", totals["anchored"])
         print("Fallback counts:", totals["fallback"], "object cap fallbacks:", totals["object_cap_fallback"])
     dst.attrs["n_written"] = int(written)
+    if dip_samples_buf is not None and dip_z_buf is not None:
+        write_dip_samples(dst, dip_samples_buf, dip_z_buf)
     if args.sampling_mode != "geoscore":
         dst.attrs["skipped_volumes_missing_labels"] = skipped_missing_labels
     print(f"Wrote {written} patches to {out}")

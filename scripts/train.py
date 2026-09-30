@@ -38,6 +38,21 @@ from src.augmentations import apply_pair_augmentations
 from src.augmentations import keep_trace_extrema_only
 from src.augmentations import sample_mixup_corpus_index
 from src.deep_supervision import DeepSupervisionLoss
+from src.geology_label_augment import (
+    AZIMUTH_KEY,
+    AZIMUTH_VARIANCE_KEY,
+    DIP_CLASS_KEYS,
+    DIP_DEGREE_KEYS,
+    DIP_DEPENDENT_KEYS,
+    DIP_IGNORE_CLASS,
+    DIP_LABEL_POLICIES,
+    DIP_MEAN_CLASS_EDGES_DEG,
+    DIP_RANGE_CLASS_EDGES_DEG,
+    DIP_SAMPLE_KEYS,
+    adjust_azimuth_deg,
+    adjusted_dip_values_for_stretch,
+    vertical_warp_stretch_at_source,
+)
 from src.geology_classifier import (
     ALL_CLASSIFIER_TARGETS,
     PRESENCE_TARGET_KEYS,
@@ -128,6 +143,8 @@ class ZarrPatchDataset(Dataset):
         flip_x_prob=0.5,
         flip_y_prob=0.5,
         vertical_warp_prob=0.5,
+        phase_rotation_prob=0.0,
+        phase_range=(-60.0, 0.0, 40.0),
         zero_cluster_min=8,
         zero_cluster_max=12,
         extrema_only: Optional[bool] = None,
@@ -141,6 +158,7 @@ class ZarrPatchDataset(Dataset):
         include_metadata: bool = False,
         geology_metadata_keys: Optional[tuple[str, ...]] = None,
         label_target_keys: Optional[tuple[str, ...]] = None,
+        dip_label_policy: str = 'adjust',
     ):
         z = cast(Any, zarr.open(str(zarr_path), mode='r'))
         self.data = cast(Any, z['patches'])
@@ -156,6 +174,8 @@ class ZarrPatchDataset(Dataset):
         self.flip_x_prob = float(flip_x_prob)
         self.flip_y_prob = float(flip_y_prob)
         self.vertical_warp_prob = float(vertical_warp_prob)
+        self.phase_rotation_prob = float(phase_rotation_prob)
+        self.phase_range = tuple(float(v) for v in phase_range)
         self.zero_cluster_min = int(zero_cluster_min)
         self.zero_cluster_max = int(zero_cluster_max)
         self.extrema_only = None if extrema_only is None else bool(extrema_only)
@@ -194,6 +214,40 @@ class ZarrPatchDataset(Dataset):
         if self._label_arrays:
             self.include_metadata = True
 
+        self.dip_label_policy = str(dip_label_policy)
+        if self.dip_label_policy not in DIP_LABEL_POLICIES:
+            raise ValueError(f"--dip_label_policy must be one of {DIP_LABEL_POLICIES}.")
+        loaded_keys = set(self._metadata_arrays) | set(self._label_arrays)
+        self._dip_keys_loaded = tuple(key for key in DIP_DEPENDENT_KEYS if key in loaded_keys)
+        self._adjust_azimuth = bool(
+            self.augment
+            and AZIMUTH_KEY in loaded_keys
+            and max(self.swap_xy_prob, self.flip_x_prob, self.flip_y_prob) > 0.0
+        )
+        self._azimuth_variance = (
+            np.asarray(z[AZIMUTH_VARIANCE_KEY][:]) if self._adjust_azimuth and AZIMUTH_VARIANCE_KEY in z else None
+        )
+        self._dip_source = {}
+        self._dip_mean_edges = tuple(float(v) for v in z.attrs.get('dip_mean_class_edges_deg', DIP_MEAN_CLASS_EDGES_DEG))
+        self._dip_range_edges = tuple(float(v) for v in z.attrs.get('dip_range_class_edges_deg', DIP_RANGE_CLASS_EDGES_DEG))
+        if (
+            self.dip_label_policy == 'adjust'
+            and self.augment
+            and float(vertical_warp_prob) > 0.0
+            and self._dip_keys_loaded
+        ):
+            missing = [key for key in DIP_SAMPLE_KEYS + DIP_DEGREE_KEYS if key not in z]
+            if missing:
+                raise KeyError(
+                    f"Dataset '{zarr_path}' lacks {missing}, needed to adjust {self._dip_keys_loaded} for vertical "
+                    "warp. Run scripts/add_dip_samples.py on it, or pass --dip_label_policy mask (drop dip-class "
+                    "targets for warped samples) or ignore (old behavior)."
+                )
+            source_keys = DIP_SAMPLE_KEYS + DIP_DEGREE_KEYS
+            if 'meta_structural_complexity' in self._dip_keys_loaded:
+                source_keys += ('meta_structural_complexity',)
+            self._dip_source = {key: np.asarray(z[key][:]) for key in source_keys}
+
         if self.scaling not in {'none', 'divide_by_std', 'zscore'}:
             raise ValueError("--input_scaling must be one of: none, divide_by_std, zscore")
         if self.scaling != 'none' and abs(self.scaling_std) <= 0.0:
@@ -204,6 +258,11 @@ class ZarrPatchDataset(Dataset):
             raise ValueError('--zero_cluster_min must be <= --zero_cluster_max.')
         if not 0.0 <= self.vertical_warp_prob <= 1.0:
             raise ValueError('--vertical_warp_prob must be in [0, 1].')
+        if not 0.0 <= self.phase_rotation_prob <= 1.0:
+            raise ValueError('--phase_rotation_prob must be in [0, 1].')
+        phase_min, phase_mode, phase_max = self.phase_range
+        if not (phase_min <= phase_mode <= phase_max):
+            raise ValueError('--phase_range must be ordered as (min, mode, max) with min <= mode <= max.')
         if self.sparse_keep_fraction_min < 0.01 or self.sparse_keep_fraction_max > 1.0:
             raise ValueError('--sparse_keep_fraction_min/max must be in [0.01, 1.0].')
         if self.sparse_keep_fraction_min > self.sparse_keep_fraction_max:
@@ -297,20 +356,59 @@ class ZarrPatchDataset(Dataset):
             metadata[key] = arr[int(idx)]
         return metadata
 
+    def _adjust_geometric_labels(self, metadata, idx, params):
+        """Update azimuth for x/y flips and swaps, and dip-dependent labels for vertical warp, in place."""
+        def _like(original, value):
+            return np.asarray(value, dtype=np.asarray(original).dtype)[()]
+
+        reflected = params['swap_xy'] or params['flip_x'] or params['flip_y']
+        if self._adjust_azimuth and reflected and AZIMUTH_KEY in metadata:
+            # Circular variance 1 means no valid gradient; the stored 0 deg azimuth is a placeholder.
+            if self._azimuth_variance is None or float(self._azimuth_variance[idx]) < 1.0 - 1e-6:
+                metadata[AZIMUTH_KEY] = _like(
+                    metadata[AZIMUTH_KEY],
+                    adjust_azimuth_deg(metadata[AZIMUTH_KEY], params['swap_xy'], params['flip_x'], params['flip_y']),
+                )
+
+        warp = params['vertical_warp_indices']
+        if warp is None or not self._dip_keys_loaded or self.dip_label_policy == 'ignore':
+            return
+        if self.dip_label_policy == 'mask':
+            for key in DIP_CLASS_KEYS:
+                if key in metadata:
+                    metadata[key] = _like(metadata[key], DIP_IGNORE_CLASS)
+            return
+        stored = {key: self._dip_source[key][idx] for key in self._dip_source if key not in DIP_SAMPLE_KEYS}
+        stretch = vertical_warp_stretch_at_source(warp, self._dip_source['dip_samples_z'][idx])
+        new_values = adjusted_dip_values_for_stretch(
+            stored,
+            self._dip_source['dip_samples_deg'][idx],
+            stretch,
+            mean_edges=self._dip_mean_edges,
+            range_edges=self._dip_range_edges,
+        )
+        for key in self._dip_keys_loaded:
+            if key in metadata and key in new_values:
+                metadata[key] = _like(metadata[key], new_values[key])
+
     def __getitem__(self, idx):
         arr = self._load_scaled_example(int(idx))
 
         # For denoising-style augmentation, label stays clean while input is perturbed.
         x = arr.copy()
         y = arr.copy()
+        aug_params = None
         if self.augment:
-            x, y = apply_pair_augmentations(
+            x, y, aug_params = apply_pair_augmentations(
                 x,
                 y,
                 self.swap_xy_prob,
                 self.flip_x_prob,
                 self.flip_y_prob,
                 self.vertical_warp_prob,
+                phase_rotation_prob=self.phase_rotation_prob,
+                phase_range=self.phase_range,
+                return_params=True,
             )
             x = apply_input_trace_dropout(x, self.zero_cluster_min, self.zero_cluster_max)
         if self.extrema_only is None:
@@ -329,7 +427,10 @@ class ZarrPatchDataset(Dataset):
         y = np.ascontiguousarray(y[np.newaxis, ...])
         sample = (torch.from_numpy(x), torch.from_numpy(y))
         if self.include_metadata:
-            return sample[0], sample[1], self._read_metadata_for_index(int(idx))
+            metadata = self._read_metadata_for_index(int(idx))
+            if aug_params is not None:
+                self._adjust_geometric_labels(metadata, int(idx), aug_params)
+            return sample[0], sample[1], metadata
         return sample[0], sample[1]
 
 
@@ -406,11 +507,54 @@ class CombinedReconLoss(nn.Module):
         return self.mse_weight * mse + self.pmse_weight * pmse
 
 
-def build_reconstruction_loss(loss_type: str, mse_weight: float = 0.6) -> nn.Module:
+class MultiComponentReconLoss(nn.Module):
+    """MAE-dominant reconstruction loss with optional TV and gradient matching."""
+
+    def __init__(self, mae_weight=1.0, tv_weight=0.0, gdl_weight=0.0):
+        super().__init__()
+        self.mae_weight = float(mae_weight)
+        self.tv_weight = float(tv_weight)
+        self.gdl_weight = float(gdl_weight)
+        if min(self.mae_weight, self.tv_weight, self.gdl_weight) < 0.0:
+            raise ValueError('multi-component reconstruction weights must be non-negative.')
+
+    @staticmethod
+    def _differences(value):
+        return (
+            value[:, :, 1:, :, :] - value[:, :, :-1, :, :],
+            value[:, :, :, 1:, :] - value[:, :, :, :-1, :],
+            value[:, :, :, :, 1:] - value[:, :, :, :, :-1],
+        )
+
+    def forward(self, pred, target):
+        total = self.mae_weight * torch.nn.functional.l1_loss(pred, target)
+        if self.tv_weight:
+            tv = torch.stack([diff.abs().mean() for diff in self._differences(pred)]).mean()
+            total = total + self.tv_weight * tv
+        if self.gdl_weight:
+            pred_diff = self._differences(pred)
+            target_diff = self._differences(target)
+            gdl = torch.stack([
+                (pred_value.abs() - target_value.abs()).abs().mean()
+                for pred_value, target_value in zip(pred_diff, target_diff)
+            ]).mean()
+            total = total + self.gdl_weight * gdl
+        return total
+
+
+def build_reconstruction_loss(
+    loss_type: str,
+    mse_weight: float = 0.6,
+    recon_mae_weight: float = 1.0,
+    recon_tv_weight: float = 0.0,
+    recon_gdl_weight: float = 0.0,
+) -> nn.Module:
     if loss_type == 'mse_pmse':
         return CombinedReconLoss(mse_weight=mse_weight)
     if loss_type == 'mae':
         return nn.L1Loss()
+    if loss_type == 'multi_component':
+        return MultiComponentReconLoss(recon_mae_weight, recon_tv_weight, recon_gdl_weight)
     raise ValueError(f"Unsupported reconstruction loss: {loss_type!r}")
 
 
@@ -1355,7 +1499,7 @@ def compute_per_example_combined_recon_loss(recon, targets, mse_weight, eps=1e-8
 def compute_per_example_recon_loss(recon, targets, loss_type, mse_weight, eps=1e-8):
     if loss_type == 'mse_pmse':
         return compute_per_example_combined_recon_loss(recon, targets, mse_weight, eps=eps)
-    if loss_type == 'mae':
+    if loss_type in {'mae', 'multi_component'}:
         return (recon - targets).abs().mean(dim=(1, 2, 3, 4))
     raise ValueError(f"Unsupported reconstruction loss: {loss_type!r}")
 
@@ -2045,6 +2189,75 @@ def resolve_label_target_keys(args):
     return tuple(dict.fromkeys(keys))
 
 
+def _read_zarr_attrs(path):
+    return dict(cast(Any, zarr.open(str(path), mode='r')).attrs)
+
+
+def assert_train_validation_consistency(data_path, validation_data_path, skip=False):
+    """Fail fast if --data and --validation_data were sampled from overlapping synthoseis volumes,
+    or use different amplitude scaling / label conventions, so a leak or a normalization mismatch is
+    caught before training rather than showing up as an unexplained metric. --skip_data_location_checks
+    bypasses this (e.g. for datasets made before these attrs existed).
+    """
+    if skip:
+        return
+    train_attrs = _read_zarr_attrs(data_path)
+    val_attrs = _read_zarr_attrs(validation_data_path)
+
+    train_vols = set(str(v) for v in train_attrs.get('source_volumes', ()))
+    val_vols = set(str(v) for v in val_attrs.get('source_volumes', ()))
+    if train_vols and val_vols:
+        overlap = sorted(train_vols & val_vols)
+        if overlap:
+            raise ValueError(
+                f"--data ({data_path}) and --validation_data ({validation_data_path}) share "
+                f"{len(overlap)} source synthoseis volume(s), e.g. {overlap[0]}. Training and validation "
+                "patches must come from disjoint volumes (sample --validation_data from a separate "
+                "--source, e.g. the synthoseis 'validation' folder, or with --disjoint_from). "
+                "Pass --skip_data_location_checks to override."
+            )
+    else:
+        print(
+            "WARNING: --data or --validation_data lacks a 'source_volumes' attr "
+            "(dataset predates scripts/sample_patches.py provenance tracking); cannot verify they are disjoint."
+        )
+
+    train_scale = (train_attrs.get('scaling_mode'), train_attrs.get('scaling_mean'), train_attrs.get('scaling_std'))
+    val_scale = (val_attrs.get('scaling_mode'), val_attrs.get('scaling_mean'), val_attrs.get('scaling_std'))
+    if train_scale[0] is not None and val_scale[0] is not None:
+        if train_scale[0] != val_scale[0]:
+            raise ValueError(
+                f"--data scaling_mode={train_scale[0]!r} does not match --validation_data "
+                f"scaling_mode={val_scale[0]!r}. Pass --skip_data_location_checks to override."
+            )
+        # scaling_mean only affects the baked-in patch values under 'zscore'; 'divide_by_std'
+        # (and 'none') ignore it, so comparing it there would flag harmless near-zero noise.
+        checks = [('scaling_std', train_scale[2], val_scale[2])]
+        if train_scale[0] == 'zscore':
+            checks.append(('scaling_mean', train_scale[1], val_scale[1]))
+        for name, t, v in checks:
+            if t is None or v is None:
+                continue
+            if abs(float(t) - float(v)) > 1e-3 * max(abs(float(t)), 1e-8):
+                raise ValueError(
+                    f"--data {name}={t} does not match --validation_data {name}={v} (>0.1% relative "
+                    "difference). Regenerate --validation_data with --no_derive_dataset_stats and the "
+                    "--dataset_mean/--dataset_std recorded on --data, or pass --skip_data_location_checks."
+                )
+
+    for key in ('label_z_offset', 'dip_mean_class_edges_deg', 'dip_range_class_edges_deg', 'label_class_order'):
+        t, v = train_attrs.get(key), val_attrs.get(key)
+        if t is None or v is None:
+            continue
+        t_cmp = list(t) if isinstance(t, (list, tuple)) else t
+        v_cmp = list(v) if isinstance(v, (list, tuple)) else v
+        if t_cmp != v_cmp:
+            raise ValueError(
+                f"--data and --validation_data disagree on {key}: {t!r} vs {v!r}. "
+                "Pass --skip_data_location_checks to override."
+            )
+
+
 def build_dataset(args, data_path, augment=False):
     geology_keys = tuple(str(v) for v in (args.geology_metadata_keys or ()))
     include_metadata = bool(
@@ -2066,6 +2279,8 @@ def build_dataset(args, data_path, augment=False):
         flip_x_prob=args.flip_x_prob,
         flip_y_prob=args.flip_y_prob,
         vertical_warp_prob=args.vertical_warp_prob,
+        phase_rotation_prob=getattr(args, 'phase_rotation_prob', 0.0),
+        phase_range=getattr(args, 'phase_range', (-60.0, 0.0, 40.0)),
         zero_cluster_min=args.zero_cluster_min,
         zero_cluster_max=args.zero_cluster_max,
         extrema_only=None,
@@ -2079,6 +2294,7 @@ def build_dataset(args, data_path, augment=False):
         include_metadata=include_metadata,
         geology_metadata_keys=geology_keys,
         label_target_keys=resolve_label_target_keys(args),
+        dip_label_policy=getattr(args, 'dip_label_policy', 'adjust'),
     )
 
 
@@ -2540,6 +2756,11 @@ def train(args):
     if int(args.geology_diagnostic_neighbor_k) not in args.geology_diagnostic_topk:
         args.geology_diagnostic_topk.insert(0, int(args.geology_diagnostic_neighbor_k))
 
+    if Path(args.data).exists() and Path(args.validation_data).exists():
+        assert_train_validation_consistency(
+            args.data, args.validation_data, skip=bool(getattr(args, 'skip_data_location_checks', False))
+        )
+
     geology_metadata_calibration = None
     geology_background_key_indices = ()
     if bool((args.geology_loss_weight > 0.0 or bool(getattr(args, 'geology_batch_sampler', False))) and len(args.geology_metadata_keys) > 0):
@@ -2742,6 +2963,9 @@ def train(args):
         f"flip_x_prob={args.flip_x_prob}",
         f"flip_y_prob={args.flip_y_prob}",
         f"vertical_warp_prob={args.vertical_warp_prob}",
+        f"phase_rotation_prob={args.phase_rotation_prob}",
+        f"phase_range={list(args.phase_range)}",
+        f"dip_label_policy={args.dip_label_policy}",
         f"mixup_augment_prob={args.mixup_augment_prob}",
         f"zero_cluster_range=[{args.zero_cluster_min},{args.zero_cluster_max}]",
         f"input_extrema_prob={args.input_extrema_prob}",
@@ -2814,6 +3038,11 @@ def train(args):
         raise ValueError('--lpips_min_size must be positive.')
     if not 0.0 <= args.vertical_warp_prob <= 1.0:
         raise ValueError('--vertical_warp_prob must be in [0, 1].')
+    if not 0.0 <= args.phase_rotation_prob <= 1.0:
+        raise ValueError('--phase_rotation_prob must be in [0, 1].')
+    phase_min, phase_mode, phase_max = (float(v) for v in args.phase_range)
+    if not (phase_min <= phase_mode <= phase_max):
+        raise ValueError('--phase_range must be ordered as (min, mode, max) with min <= mode <= max.')
     if not 0.0 <= args.mixup_augment_prob <= 1.0:
         raise ValueError('--mixup_augment_prob must be in [0, 1].')
     if not 0.0 <= args.input_extrema_prob <= 1.0:
@@ -2884,6 +3113,9 @@ def train(args):
     rec_loss_fn = build_reconstruction_loss(
         args.reconstruction_loss,
         mse_weight=float(args.loss_mse_weight),
+        recon_mae_weight=float(args.recon_mae_weight),
+        recon_tv_weight=float(args.recon_tv_weight),
+        recon_gdl_weight=float(args.recon_gdl_weight),
     )
     lpips_loss_fn = None
     if args.lpips_weight > 0.0:
@@ -3348,6 +3580,16 @@ if __name__ == '__main__':
     p.add_argument('--flip_x_prob', type=float, default=0.5)
     p.add_argument('--flip_y_prob', type=float, default=0.5)
     p.add_argument('--vertical_warp_prob', type=float, default=0.5, help='Probability of applying non-linear depth stretch/squeeze to label and paired input.')
+    p.add_argument('--phase_rotation_prob', type=float, default=0.0, help='Probability of applying a constant phase rotation (along z) to label and paired input.')
+    p.add_argument('--phase_range', type=float, nargs=3, default=[-60.0, 0.0, 40.0], metavar=('MIN_DEG', 'MODE_DEG', 'MAX_DEG'), help='Triangular-distribution (min, mode, max) phase rotation range in degrees.')
+    p.add_argument(
+        '--dip_label_policy',
+        choices=list(DIP_LABEL_POLICIES),
+        default='adjust',
+        help='How dip-dependent labels follow vertical warp: adjust (re-derive from dip_samples_*; see '
+             'scripts/add_dip_samples.py), mask (ignore dip-class targets for warped samples), ignore (unchanged). '
+             'Azimuth is always adjusted for x/y flips and swaps.',
+    )
     p.add_argument('--mixup_augment_prob', type=float, default=0.10, help='Probability of adding extrema-only signal from a random second zarr example into the input volume.')
     p.add_argument('--input_extrema_prob', type=float, default=1.0, help='Weight for selecting extrema-only input transform in one-of-three input transform mode.')
     p.add_argument('--input_sparse_keep_prob', type=float, default=0.0, help='Weight for selecting sparse-keep input transform in one-of-three input transform mode.')
@@ -3360,6 +3602,12 @@ if __name__ == '__main__':
     p.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint to resume training from.')
     p.add_argument('--resume_epoch', type=int, default=None, help='Override the completed epoch count used for resumed runs.')
     p.add_argument('--validation_data', type=str, default='data/validation.zarr', help='Path to validation zarr patches.')
+    p.add_argument(
+        '--skip_data_location_checks',
+        action='store_true',
+        help='Skip the startup check that --data and --validation_data come from disjoint synthoseis '
+             'volumes and use matching amplitude scaling / label conventions.',
+    )
     p.add_argument('--validation_extrema_only', dest='validation_extrema_only', action='store_true', help='Use the same input transform family and probabilities as training for validation data (default).')
     p.add_argument('--no_validation_extrema_only', dest='validation_extrema_only', action='store_false', help='Disable input transforms for validation data.')
     p.set_defaults(validation_extrema_only=True)
@@ -3426,8 +3674,11 @@ if __name__ == '__main__':
         help='Per-patch metadata array keys stored in sampled zarr datasets for geology-aware loss.',
     )
     p.add_argument('--deep_supervision_weights', type=float, nargs=3, default=[1.0, 0.5, 0.25], help='Three deep supervision reconstruction loss weights (fine, mid, coarse).')
-    p.add_argument('--reconstruction_loss', type=str, default='mse_pmse', choices=['mse_pmse', 'mae'], help='Voxelwise reconstruction objective. mse_pmse preserves the existing blended MSE/PMSE behavior; mae uses L1 loss.')
+    p.add_argument('--reconstruction_loss', type=str, default='mse_pmse', choices=['mse_pmse', 'mae', 'multi_component'], help='Voxelwise reconstruction objective. multi_component is MAE plus optional TV/GDL terms.')
     p.add_argument('--loss_mse_weight', type=float, default=0.6, help='Weight for MSE component of reconstruction loss in [0, 1]; PMSE weight = 1 - this value.')
+    p.add_argument('--recon_mae_weight', type=float, default=1.0, help='MAE weight for --reconstruction_loss multi_component.')
+    p.add_argument('--recon_tv_weight', type=float, default=0.0, help='Total-variation weight for --reconstruction_loss multi_component.')
+    p.add_argument('--recon_gdl_weight', type=float, default=0.0, help='Gradient-difference weight for --reconstruction_loss multi_component.')
     p.add_argument('--lpips_weight', type=float, default=0.0, help='Weight for optional slice-wise LPIPS perceptual loss. Default 0 keeps baseline behavior.')
     p.add_argument('--lpips_min_size', type=int, default=64, help='Minimum LPIPS slice height/width. Smaller slices are bilinearly upsampled before LPIPS.')
     p.add_argument('--lr_scheduler', type=str, default='plateau', choices=['none', 'plateau'])

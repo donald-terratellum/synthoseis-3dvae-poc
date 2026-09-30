@@ -74,8 +74,13 @@ def compute_geology_classifier_loss(
     for name, key in DIP_TARGET_KEYS.items():
         if name not in targets:
             continue
-        cls = torch.as_tensor(batch[key]).to(device).round().long().clamp(0, GEOLOGY_DIP_CLASSES - 1)
-        dip_loss = F.cross_entropy(logits[name], cls, label_smoothing=float(label_smoothing))
+        raw = torch.as_tensor(batch[key]).to(device).round().long()
+        # Negative class = ignored target (dip label masked after a depth-warp augmentation).
+        valid = raw >= 0
+        if not bool(valid.any()):
+            continue
+        cls = raw.clamp(0, GEOLOGY_DIP_CLASSES - 1)
+        dip_loss = F.cross_entropy(logits[name][valid], cls[valid], label_smoothing=float(label_smoothing))
         parts[name] = float(dip_loss.detach())
         total = total + dip_loss
     return total, parts

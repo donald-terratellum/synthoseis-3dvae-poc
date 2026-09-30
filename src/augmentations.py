@@ -10,6 +10,49 @@ DEFAULT_VERTICAL_WARP_Z_HIGH_RATIO = 18.5 / 15.5
 DEFAULT_MIXUP_SCALE_LOW = 1.0 / 150.0
 DEFAULT_MIXUP_SCALE_MODE = 1.0 / 110.0
 DEFAULT_MIXUP_SCALE_HIGH = 1.0 / 75.0
+DEFAULT_PHASE_RANGE_DEG = (-60.0, 0.0, 40.0)
+
+
+def _next_regular(n):
+    """Smallest 5-smooth integer >= n, so rfft/irfft stay in the fast split-radix path."""
+    if n <= 1:
+        return 1
+    m = n
+    while True:
+        x = m
+        while x % 2 == 0:
+            x //= 2
+        while x % 3 == 0:
+            x //= 3
+        while x % 5 == 0:
+            x //= 5
+        if x == 1:
+            return m
+        m += 1
+
+
+def sample_phase_rotation_deg(phase_range=DEFAULT_PHASE_RANGE_DEG):
+    phase_min, phase_mode, phase_max = (float(v) for v in phase_range)
+    if not (phase_min <= phase_mode <= phase_max):
+        raise ValueError('phase_range must be ordered as (min, mode, max) with min <= mode <= max.')
+    if phase_min == phase_mode == phase_max:
+        return phase_min
+    return float(np.random.triangular(phase_min, phase_mode, phase_max))
+
+
+def phase_rotation_3d(cube, phase_deg):
+    """Apply a constant phase rotation to every trace along the last (z) axis.
+
+    A single angle is applied uniformly to every (x, y) trace via one vectorized
+    rfft/irfft pair along axis=-1. The z-axis is zero-padded to the next 5-smooth
+    size before the FFT and trimmed back afterward.
+    """
+    z_size = cube.shape[-1]
+    pad_z = _next_regular(z_size)
+    spectrum = np.fft.rfft(cube, n=pad_z, axis=-1)
+    spectrum = spectrum * np.exp(1j * np.deg2rad(float(phase_deg)))
+    rotated = np.fft.irfft(spectrum, n=pad_z, axis=-1)[..., :z_size]
+    return rotated.astype(cube.dtype, copy=False)
 
 
 def sample_vertical_warp_target_indices(
@@ -267,23 +310,56 @@ def apply_input_decimate_trilinear(x, parity=None):
     return out
 
 
-def apply_pair_augmentations(x, y, swap_xy_prob, flip_x_prob, flip_y_prob, vertical_warp_prob):
-    # Geometric transforms are applied to both input and target.
+def apply_pair_augmentations(
+    x,
+    y,
+    swap_xy_prob,
+    flip_x_prob,
+    flip_y_prob,
+    vertical_warp_prob,
+    phase_rotation_prob=0.0,
+    phase_range=DEFAULT_PHASE_RANGE_DEG,
+    return_params=False,
+):
+    """Geometric transforms applied to both input and target.
+
+    With ``return_params`` also returns {"swap_xy", "flip_x", "flip_y", "vertical_warp_indices",
+    "phase_deg"} (indices are None when no warp was applied; phase_deg is None when phase
+    rotation was not applied) so per-patch labels can be adjusted.
+    """
+    params = {
+        "swap_xy": False,
+        "flip_x": False,
+        "flip_y": False,
+        "vertical_warp_indices": None,
+        "phase_deg": None,
+    }
+    if phase_rotation_prob > 0.0 and np.random.random() < phase_rotation_prob:
+        phase_deg = sample_phase_rotation_deg(phase_range)
+        x = phase_rotation_3d(x, phase_deg)
+        y = phase_rotation_3d(y, phase_deg)
+        params["phase_deg"] = phase_deg
     if np.random.random() < swap_xy_prob:
         x = np.swapaxes(x, 0, 1)
         y = np.swapaxes(y, 0, 1)
+        params["swap_xy"] = True
     if np.random.random() < flip_x_prob:
         x = x[::-1, :, :]
         y = y[::-1, :, :]
+        params["flip_x"] = True
     if np.random.random() < flip_y_prob:
         x = x[:, ::-1, :]
         y = y[:, ::-1, :]
+        params["flip_y"] = True
 
     # Non-linear depth warp is applied to the clean label first, then mirrored to input.
     if np.random.random() < vertical_warp_prob:
         target_indices = sample_vertical_warp_target_indices(y.shape[-1])
         y = apply_vertical_warp_to_cube(y, target_indices)
         x = y.copy()
+        params["vertical_warp_indices"] = target_indices
+    if return_params:
+        return x, y, params
     return x, y
 
 

@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 import random
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +17,36 @@ from scripts import sample_patches as sample_patches_script
 
 
 class InputAugmentationTests(unittest.TestCase):
+    def test_phase_rotation_zero_is_identity(self):
+        cube = np.random.default_rng(7).normal(size=(4, 5, 64)).astype(np.float32)
+
+        rotated = augmentations.phase_rotation_3d(cube, 0.0)
+
+        np.testing.assert_allclose(rotated, cube, rtol=1e-6, atol=1e-6)
+
+    def test_phase_rotation_180_negates_cube(self):
+        cube = np.random.default_rng(8).normal(size=(4, 5, 64)).astype(np.float32)
+
+        rotated = augmentations.phase_rotation_3d(cube, 180.0)
+
+        np.testing.assert_allclose(rotated, -cube, rtol=1e-5, atol=1e-5)
+
+    def test_phase_rotation_preserves_interior_spectrum_magnitude(self):
+        cube = np.random.default_rng(9).normal(size=(4, 5, 64)).astype(np.float32)
+
+        rotated = augmentations.phase_rotation_3d(cube, -37.0)
+
+        original_spectrum = np.abs(np.fft.rfft(cube, axis=-1))[..., 1:-1]
+        rotated_spectrum = np.abs(np.fft.rfft(rotated, axis=-1))[..., 1:-1]
+        np.testing.assert_allclose(rotated_spectrum, original_spectrum, rtol=1e-5, atol=1e-5)
+
+    def test_phase_rotation_uses_requested_triangular_range(self):
+        with mock.patch.object(np.random, 'triangular', return_value=-12.5) as triangular:
+            phase_deg = augmentations.sample_phase_rotation_deg((-60.0, 0.0, 40.0))
+
+        triangular.assert_called_once_with(-60.0, 0.0, 40.0)
+        self.assertEqual(phase_deg, -12.5)
+
     def test_patch_sampling_seed_controls_origins(self):
         geoscore = np.ones((16, 16, 16), dtype=np.float32)
 

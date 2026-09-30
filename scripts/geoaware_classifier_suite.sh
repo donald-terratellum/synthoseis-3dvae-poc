@@ -5,7 +5,7 @@
 #   Runs: r1ctrl (Phase 2 recipe, leak-free geoscore data), r1 (class-anchored data),
 #         r2 (r1 + classifier), r3 (r2 + presence strata + batch class quotas).
 # Re-running is safe: finished datasets, runs, and reports are skipped (OVERWRITE=1 redoes them).
-# Environment overrides: RUNS, SOURCE, OUT_PREFIX, WARM_START, EPOCHS, BENCH_EPOCHS, PYTHON,
+# Environment overrides: RUNS, SOURCE, OUT_PREFIX, WARM_START, EPOCHS, BENCH_EPOCHS, SEED, PYTHON,
 # LOG_DIR, OVERWRITE=1, PRINT_COMMANDS=1 (print commands without running them or checking inputs).
 # Long runs on macOS: nohup caffeinate -i scripts/geoaware_classifier_suite.sh all > logs/suite.log 2>&1 &
 set -euo pipefail
@@ -25,6 +25,7 @@ OUT_PREFIX="${OUT_PREFIX:-checkpoints/geoaware_v4}"
 RUNS="${RUNS:-r1ctrl r1 r2 r3}"
 EPOCHS="${EPOCHS:-40}"
 BENCH_EPOCHS="${BENCH_EPOCHS:-10 20 30 40}"
+SEED="${SEED:-20260925}"
 LOG_DIR="${LOG_DIR:-logs}"
 LABEL_Z_OFFSET=1  # verified in WP0: seismic[z] <-> label[z + 1]
 METADATA_KEYS=(
@@ -108,7 +109,7 @@ stage_sample() {
       --max_patches_per_object 24 \
       --presence_min_voxels 32 \
       --label_z_offset "$LABEL_Z_OFFSET" \
-      --seed 20260925 \
+      --seed "$SEED" \
       --out "$TRAIN_DATA"
   fi
 
@@ -189,7 +190,7 @@ stage_train() {
       --batch_size 12 \
       --number_batches 450 \
       --epochs "$EPOCHS" \
-      --seed 20260925 \
+      --seed "$SEED" \
       --resume "$WARM_START" --resume_epoch 0 \
       --augment --vertical_warp_prob 0.5 --mixup_augment_prob 0.0 \
       --input_scaling divide_by_std \
