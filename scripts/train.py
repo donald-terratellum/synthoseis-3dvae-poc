@@ -145,6 +145,9 @@ class ZarrPatchDataset(Dataset):
         vertical_warp_prob=0.5,
         phase_rotation_prob=0.0,
         phase_range=(-60.0, 0.0, 40.0),
+        stretch_prob=0.0,
+        stretch_xy=(1.0, 1.25),
+        stretch_z=(1.0, 1.5),
         zero_cluster_min=8,
         zero_cluster_max=12,
         extrema_only: Optional[bool] = None,
@@ -176,6 +179,9 @@ class ZarrPatchDataset(Dataset):
         self.vertical_warp_prob = float(vertical_warp_prob)
         self.phase_rotation_prob = float(phase_rotation_prob)
         self.phase_range = tuple(float(v) for v in phase_range)
+        self.stretch_prob = float(stretch_prob)
+        self.stretch_xy = tuple(float(v) for v in stretch_xy)
+        self.stretch_z = tuple(float(v) for v in stretch_z)
         self.zero_cluster_min = int(zero_cluster_min)
         self.zero_cluster_max = int(zero_cluster_max)
         self.extrema_only = None if extrema_only is None else bool(extrema_only)
@@ -233,15 +239,15 @@ class ZarrPatchDataset(Dataset):
         if (
             self.dip_label_policy == 'adjust'
             and self.augment
-            and float(vertical_warp_prob) > 0.0
+            and max(float(vertical_warp_prob), float(stretch_prob)) > 0.0
             and self._dip_keys_loaded
         ):
             missing = [key for key in DIP_SAMPLE_KEYS + DIP_DEGREE_KEYS if key not in z]
             if missing:
                 raise KeyError(
-                    f"Dataset '{zarr_path}' lacks {missing}, needed to adjust {self._dip_keys_loaded} for vertical "
-                    "warp. Run scripts/add_dip_samples.py on it, or pass --dip_label_policy mask (drop dip-class "
-                    "targets for warped samples) or ignore (old behavior)."
+                    f"Dataset '{zarr_path}' lacks {missing}, needed to adjust {self._dip_keys_loaded} for depth "
+                    "warp/stretch. Run scripts/add_dip_samples.py on it, or pass --dip_label_policy mask (drop "
+                    "dip-class targets for transformed samples) or ignore (old behavior)."
                 )
             source_keys = DIP_SAMPLE_KEYS + DIP_DEGREE_KEYS
             if 'meta_structural_complexity' in self._dip_keys_loaded:
@@ -263,6 +269,12 @@ class ZarrPatchDataset(Dataset):
         phase_min, phase_mode, phase_max = self.phase_range
         if not (phase_min <= phase_mode <= phase_max):
             raise ValueError('--phase_range must be ordered as (min, mode, max) with min <= mode <= max.')
+        if not 0.0 <= self.stretch_prob <= 1.0:
+            raise ValueError('--stretch_prob must be in [0, 1].')
+        if not (1.0 <= self.stretch_xy[0] <= self.stretch_xy[1]):
+            raise ValueError('--stretch_xy must be ordered MIN MAX with both values >= 1.')
+        if not (1.0 <= self.stretch_z[0] <= self.stretch_z[1]):
+            raise ValueError('--stretch_z must be ordered MIN MAX with both values >= 1.')
         if self.sparse_keep_fraction_min < 0.01 or self.sparse_keep_fraction_max > 1.0:
             raise ValueError('--sparse_keep_fraction_min/max must be in [0.01, 1.0].')
         if self.sparse_keep_fraction_min > self.sparse_keep_fraction_max:
@@ -371,7 +383,8 @@ class ZarrPatchDataset(Dataset):
                 )
 
         warp = params['vertical_warp_indices']
-        if warp is None or not self._dip_keys_loaded or self.dip_label_policy == 'ignore':
+        stretch_factors = params['stretch_factors']
+        if (warp is None and stretch_factors is None) or not self._dip_keys_loaded or self.dip_label_policy == 'ignore':
             return
         if self.dip_label_policy == 'mask':
             for key in DIP_CLASS_KEYS:
@@ -379,11 +392,20 @@ class ZarrPatchDataset(Dataset):
                     metadata[key] = _like(metadata[key], DIP_IGNORE_CLASS)
             return
         stored = {key: self._dip_source[key][idx] for key in self._dip_source if key not in DIP_SAMPLE_KEYS}
-        stretch = vertical_warp_stretch_at_source(warp, self._dip_source['dip_samples_z'][idx])
+        dip_stretch = np.ones_like(self._dip_source['dip_samples_deg'][idx], dtype=np.float64)
+        density_weights = np.ones_like(dip_stretch)
+        if stretch_factors is not None:
+            scale_xy, _, scale_z = stretch_factors
+            dip_stretch *= float(scale_z) / float(scale_xy)
+        if warp is not None:
+            warp_stretch = vertical_warp_stretch_at_source(warp, self._dip_source['dip_samples_z'][idx])
+            dip_stretch *= warp_stretch
+            density_weights *= warp_stretch
         new_values = adjusted_dip_values_for_stretch(
             stored,
             self._dip_source['dip_samples_deg'][idx],
-            stretch,
+            dip_stretch,
+            density_weights=density_weights,
             mean_edges=self._dip_mean_edges,
             range_edges=self._dip_range_edges,
         )
@@ -399,16 +421,22 @@ class ZarrPatchDataset(Dataset):
         y = arr.copy()
         aug_params = None
         if self.augment:
-            x, y, aug_params = apply_pair_augmentations(
-                x,
-                y,
-                self.swap_xy_prob,
-                self.flip_x_prob,
-                self.flip_y_prob,
-                self.vertical_warp_prob,
-                phase_rotation_prob=self.phase_rotation_prob,
-                phase_range=self.phase_range,
-                return_params=True,
+            x, y, aug_params = cast(
+                tuple[Any, Any, dict[str, Any]],
+                apply_pair_augmentations(
+                    x,
+                    y,
+                    self.swap_xy_prob,
+                    self.flip_x_prob,
+                    self.flip_y_prob,
+                    self.vertical_warp_prob,
+                    phase_rotation_prob=self.phase_rotation_prob,
+                    phase_range=self.phase_range,
+                    stretch_prob=self.stretch_prob,
+                    stretch_xy=self.stretch_xy,
+                    stretch_z=self.stretch_z,
+                    return_params=True,
+                ),
             )
             x = apply_input_trace_dropout(x, self.zero_cluster_min, self.zero_cluster_max)
         if self.extrema_only is None:
@@ -2281,6 +2309,9 @@ def build_dataset(args, data_path, augment=False):
         vertical_warp_prob=args.vertical_warp_prob,
         phase_rotation_prob=getattr(args, 'phase_rotation_prob', 0.0),
         phase_range=getattr(args, 'phase_range', (-60.0, 0.0, 40.0)),
+        stretch_prob=getattr(args, 'stretch_prob', 0.0),
+        stretch_xy=getattr(args, 'stretch_xy', (1.0, 1.25)),
+        stretch_z=getattr(args, 'stretch_z', (1.0, 1.5)),
         zero_cluster_min=args.zero_cluster_min,
         zero_cluster_max=args.zero_cluster_max,
         extrema_only=None,
@@ -2965,6 +2996,9 @@ def train(args):
         f"vertical_warp_prob={args.vertical_warp_prob}",
         f"phase_rotation_prob={args.phase_rotation_prob}",
         f"phase_range={list(args.phase_range)}",
+        f"stretch_prob={args.stretch_prob}",
+        f"stretch_xy={list(args.stretch_xy)}",
+        f"stretch_z={list(args.stretch_z)}",
         f"dip_label_policy={args.dip_label_policy}",
         f"mixup_augment_prob={args.mixup_augment_prob}",
         f"zero_cluster_range=[{args.zero_cluster_min},{args.zero_cluster_max}]",
@@ -3043,6 +3077,12 @@ def train(args):
     phase_min, phase_mode, phase_max = (float(v) for v in args.phase_range)
     if not (phase_min <= phase_mode <= phase_max):
         raise ValueError('--phase_range must be ordered as (min, mode, max) with min <= mode <= max.')
+    if not 0.0 <= args.stretch_prob <= 1.0:
+        raise ValueError('--stretch_prob must be in [0, 1].')
+    if not (1.0 <= args.stretch_xy[0] <= args.stretch_xy[1]):
+        raise ValueError('--stretch_xy must be ordered MIN MAX with both values >= 1.')
+    if not (1.0 <= args.stretch_z[0] <= args.stretch_z[1]):
+        raise ValueError('--stretch_z must be ordered MIN MAX with both values >= 1.')
     if not 0.0 <= args.mixup_augment_prob <= 1.0:
         raise ValueError('--mixup_augment_prob must be in [0, 1].')
     if not 0.0 <= args.input_extrema_prob <= 1.0:
@@ -3582,6 +3622,9 @@ if __name__ == '__main__':
     p.add_argument('--vertical_warp_prob', type=float, default=0.5, help='Probability of applying non-linear depth stretch/squeeze to label and paired input.')
     p.add_argument('--phase_rotation_prob', type=float, default=0.0, help='Probability of applying a constant phase rotation (along z) to label and paired input.')
     p.add_argument('--phase_range', type=float, nargs=3, default=[-60.0, 0.0, 40.0], metavar=('MIN_DEG', 'MODE_DEG', 'MAX_DEG'), help='Triangular-distribution (min, mode, max) phase rotation range in degrees.')
+    p.add_argument('--stretch_prob', type=float, default=0.0, help='Probability of applying paired zoom-in stretch followed by a center crop.')
+    p.add_argument('--stretch_xy', type=float, nargs=2, default=[1.0, 1.25], metavar=('MIN', 'MAX'), help='Uniform XY zoom range; values must be >= 1.')
+    p.add_argument('--stretch_z', type=float, nargs=2, default=[1.0, 1.5], metavar=('MIN', 'MAX'), help='Z zoom range; values must be >= 1.')
     p.add_argument(
         '--dip_label_policy',
         choices=list(DIP_LABEL_POLICIES),

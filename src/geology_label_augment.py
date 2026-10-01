@@ -107,6 +107,7 @@ def adjusted_dip_values_for_stretch(
     stored,
     dip_samples_deg,
     stretch_per_sample,
+    density_weights=None,
     mean_edges=DIP_MEAN_CLASS_EDGES_DEG,
     range_edges=DIP_RANGE_CLASS_EDGES_DEG,
 ):
@@ -119,8 +120,9 @@ def adjusted_dip_values_for_stretch(
     """
     samples = np.asarray(dip_samples_deg, dtype=np.float64)
     stretch = np.asarray(stretch_per_sample, dtype=np.float64)
+    weights = stretch if density_weights is None else np.asarray(density_weights, dtype=np.float64)
     base = dip_stats(samples)
-    warped = dip_stats(stretch_dip_deg(samples, stretch), weights=stretch)
+    warped = dip_stats(stretch_dip_deg(samples, stretch), weights=weights)
     mean = float(np.clip(float(stored["meta_dip_mean_deg"]) + warped[0] - base[0], 0.0, 90.0))
     std = float(max(0.0, float(stored["meta_dip_std_deg"]) + warped[1] - base[1]))
     dip_range = float(np.clip(float(stored["meta_dip_range_deg"]) + warped[2] - base[2], 0.0, 90.0))

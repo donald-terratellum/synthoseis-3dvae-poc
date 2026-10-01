@@ -105,9 +105,10 @@ class TestVerticalWarpDip(unittest.TestCase):
         np.testing.assert_array_equal(a[1], b[1])
         self.assertEqual(
             set(b[2]),
-            {"swap_xy", "flip_x", "flip_y", "vertical_warp_indices", "phase_deg"},
+            {"swap_xy", "flip_x", "flip_y", "vertical_warp_indices", "phase_deg", "stretch_factors"},
         )
         self.assertIsNone(b[2]["phase_deg"])
+        self.assertIsNone(b[2]["stretch_factors"])
         self.assertIsNotNone(b[2]["vertical_warp_indices"])
 
 
@@ -131,10 +132,22 @@ def make_dataset_store(root, with_dip_samples=True, n=6):
 class TestDatasetLabelAdjustment(unittest.TestCase):
     DIP_KEYS = ("meta_dip_mean_class", "meta_dip_range_class")
 
-    def _dataset(self, path, policy, warp=1.0, swap=0.0, flip=0.0, metadata_keys=("meta_azimuth_mean_deg",)):
+    def _dataset(
+        self,
+        path,
+        policy,
+        warp=1.0,
+        stretch=0.0,
+        stretch_xy=(1.0, 1.25),
+        stretch_z=(1.0, 1.5),
+        swap=0.0,
+        flip=0.0,
+        metadata_keys=("meta_azimuth_mean_deg",),
+    ):
         return train_script.ZarrPatchDataset(
             path, augment=True, swap_xy_prob=swap, flip_x_prob=flip, flip_y_prob=flip,
-            vertical_warp_prob=warp, mixup_augment_prob=0.0, include_metadata=True,
+            vertical_warp_prob=warp, stretch_prob=stretch, stretch_xy=stretch_xy, stretch_z=stretch_z,
+            mixup_augment_prob=0.0, include_metadata=True,
             geology_metadata_keys=metadata_keys, label_target_keys=self.DIP_KEYS, dip_label_policy=policy,
         )
 
@@ -168,6 +181,30 @@ class TestDatasetLabelAdjustment(unittest.TestCase):
             stored = float(zarr.open_group(str(path), mode="r")["meta_dip_mean_class"][0])
             _, _, meta = self._dataset(path, "ignore")[0]
             self.assertEqual(float(meta["meta_dip_mean_class"]), stored)
+
+    def test_zoom_in_stretch_adjusts_dip_classes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "d.zarr"
+            _, stored, _ = make_dataset_store(path)
+            group = zarr.open_group(str(path), mode="r")
+            expected = adjusted_dip_values_for_stretch(
+                stored,
+                np.asarray(group["dip_samples_deg"][0]),
+                np.full(512, 2.0),
+                density_weights=np.ones(512),
+            )
+
+            _, _, meta = self._dataset(
+                path,
+                "adjust",
+                warp=0.0,
+                stretch=1.0,
+                stretch_xy=(1.0, 1.0),
+                stretch_z=(2.0, 2.0),
+            )[0]
+
+            self.assertEqual(float(meta["meta_dip_mean_class"]), expected["meta_dip_mean_class"])
+            self.assertEqual(float(meta["meta_dip_range_class"]), expected["meta_dip_range_class"])
 
     def test_adjust_without_dip_samples_fails_clearly(self):
         with tempfile.TemporaryDirectory() as tmp:

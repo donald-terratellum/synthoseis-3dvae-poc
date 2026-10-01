@@ -1,4 +1,4 @@
-# WP0–P2 Transfer Experiments — Verification and Next-Steps Handoff
+# WP0–P3 Transfer Experiments — Verification and Next-Steps Handoff
 
 Started: 2026-09-29
 Updated: 2026-09-30
@@ -8,10 +8,10 @@ Plan this belongs to: [docs/plans/2026-09-27__pretrain_v2_encoder_loss_augmentat
 
 The older verification instructions below are retained as provenance; all of their open items
 are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_size=5000`,
-2,048 benchmark indices), and P0, P0a, P0b, P1, and P2 have finished.
+2,048 benchmark indices), and P0, P0a, P0b, P1, P2, and P3 have finished.
 
-- P0b remains the control: best n@5 was 0.0120 for seed `20260925` and 0.0107 for seed
-  `20260926` (best-per-run mean 0.01145).
+- P0b remains the control: best n@5 was 0.0120 for seed `20260925` and 0.0109 for seed
+  `20260926` (best-per-run mean 0.01146).
 - P1 loss recipes L1–L4 were rejected. The strongest provisional result did not reproduce in
   the second seed.
 - WP3 phase rotation is implemented with vectorized FFT rotation, triangular angle sampling,
@@ -23,17 +23,21 @@ are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_s
   `checkpoints/p2_phase_seed20260926`. Reports are
   `docs/benchmarks/p2_phase_seed<seed>_ep<10|20|30|40>_zgeo.json`; the combined log is
   `logs/p2_phase_suite.log`.
+- WP3 zoom-in stretch is implemented with label-consistent dip adjustment and no-padding
+  enforcement. A real training-Zarr smoke check and all 222 tests pass.
+- P3 seed `20260925` improved to n@5 0.0130, but seed `20260926` regressed to 0.0086. The
+  best-per-run mean was 0.01081 versus P0b 0.01146, so zoom-in stretch is rejected.
+- P3 checkpoints are under `checkpoints/p3_zoom_stretch_seed20260925` and
+  `checkpoints/p3_zoom_stretch_seed20260926`; reports follow
+  `docs/benchmarks/p3_zoom_stretch_seed<seed>_ep<10|20|30|40>_zgeo.json`.
 
 ### Next action
 
-Create and push a milestone commit containing source, tests, experiment scripts, and this
-summary. Exclude logs, checkpoints, and generated benchmark reports. The plan file is locally
-excluded by `.git/info/exclude`, so it will not enter a normal commit unless that local policy is
-deliberately overridden.
-
-After the checkpoint, implement only WP3 zoom-in stretch and run P3 from unchanged P0b with
-phase rotation off and `dip_label_policy=adjust`. Run one seed first and replicate only a gain.
-Do not start P4 or encoder experiments before the P3 decision.
+Commit and push the P3 source, tests, runner, plan, and this summary. Exclude logs, checkpoints,
+and generated benchmark reports. Then implement WP4 real-seismic reconstruction mixing and run
+P4 from unchanged P0b with `K=2`, phase rotation off, and zoom-in stretch off. Start one seed and
+replicate only if real MAE improves without worsening v2 n@5. Do not start encoder experiments
+before the P4 decision.
 
 This file is written so a lower-cost agentic model can execute it with minimal judgment calls.
 Every step has an exact command and an unambiguous pass/fail check. Do the steps in order; do

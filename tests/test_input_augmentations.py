@@ -17,6 +17,27 @@ from scripts import sample_patches as sample_patches_script
 
 
 class InputAugmentationTests(unittest.TestCase):
+    def test_zoom_in_stretch_identity(self):
+        cube = np.random.default_rng(10).normal(size=(8, 10, 12)).astype(np.float32)
+
+        stretched = augmentations.apply_zoom_in_stretch(cube, 1.0, 1.0)
+
+        np.testing.assert_array_equal(stretched, cube)
+
+    def test_zoom_in_stretch_center_crops_without_padding(self):
+        cube = np.ones((8, 10, 12), dtype=np.float32)
+
+        stretched = augmentations.apply_zoom_in_stretch(cube, 1.25, 1.5)
+
+        self.assertEqual(stretched.shape, cube.shape)
+        np.testing.assert_allclose(stretched, 1.0)
+
+    def test_zoom_in_stretch_rejects_squeeze(self):
+        cube = np.ones((8, 10, 12), dtype=np.float32)
+
+        with self.assertRaisesRegex(ValueError, 'must be >= 1'):
+            augmentations.apply_zoom_in_stretch(cube, 0.9, 1.0)
+
     def test_phase_rotation_zero_is_identity(self):
         cube = np.random.default_rng(7).normal(size=(4, 5, 64)).astype(np.float32)
 

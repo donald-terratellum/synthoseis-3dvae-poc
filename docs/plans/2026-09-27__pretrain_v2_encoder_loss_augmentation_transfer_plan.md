@@ -379,6 +379,13 @@ angle per patch to both clean target and paired input before input-only masking.
 `--phase_rotation_prob 1.0 --phase_range -60 0 40`; the remaining WP3 augmentations and
 stack-ready sampling are still pending and are not part of P2.
 
+**Zoom-in stretch implementation status (2026-09-30):** paired trilinear zoom plus center crop
+is implemented with `--stretch_prob`, `--stretch_xy`, and `--stretch_z`. XY uses one shared scale
+so apparent dip follows the exact factor `s_z / s_xy`; sampled dip labels are adjusted under
+`dip_label_policy=adjust`, including composition with the existing vertical warp. Scales below
+1 are rejected, so no padding is possible. A real training-Zarr smoke test and the full 222-test
+suite pass. P3 starts with seed `20260925`; seed `20260926` is gated on beating P0b n@5 0.0120.
+
 **Context for squeeze (D4: zoom-in only):** pre-sampled patches have no margin, so only `s ≥ 1`
 (zoom in and center crop) is implemented. No new data is needed. A `--context_margin` option
 (48×48×96 stored patches, ~85 GB per 108 k set) is not part of this plan.
@@ -627,8 +634,8 @@ sets, unless stated.
 
 **P0b status (2026-09-29):** completed with the 180-volume training set and the v2 validation
 manifest. Seed `20260925` reached its best n@5 of **0.0120** at epoch 30 (n@10 0.0221,
-best synthetic val loss 0.218987); seed `20260926` reached **0.0107** at epoch 40 (n@10
-0.0168, best synthetic val loss 0.218169). The adopted checkpoint's v2 reference is n@5
+best synthetic val loss 0.218987); seed `20260926` reached **0.0109** at epoch 30 (n@10
+0.0167; its best synthetic val loss was 0.218169 at epoch 40). The adopted checkpoint's v2 reference is n@5
 0.0102 / n@10 0.0178, and the P0a R2 seed-1 epoch-30 reference is n@5 0.0091 / n@10
 0.0207. P0b therefore establishes the v2 baseline and is not a robust retrieval improvement
 over the adopted model. Classifier macro AUROC was 0.639 and 0.635, below the 0.75 sanity
@@ -656,13 +663,19 @@ macro AUROC 0.652), above its P0b peak of 0.0109. The best-per-run two-seed mean
 below P0b's 0.01145, and the gain did not reproduce across seeds. Do not adopt phase rotation
 or carry it into P3/P4/P5–P8. Retain P0b as the control; no later experiment has been started.
 
-**Next recommended step (as of 2026-09-30):** checkpoint the completed P0–P2 milestone before
-opening another implementation slice: update the session handoff, review and commit the source,
-tests, runner scripts, and summary, then push the branch. Do not commit logs, checkpoints, or
-generated benchmark reports. After that checkpoint, finish only WP3's zoom-in stretch path and
-its label/identity/no-padding tests, then run P3 from P0b with `dip_label_policy=adjust` and phase
-rotation off. Start with one seed; run the second seed only if the first clears its matching P0b
-n@5 without worsening reconstruction. P4 and encoder work remain gated on that P3 decision.
+**P3 status (2026-09-30): rejected.** Zoom-in stretch was implemented with paired trilinear
+zoom/center crop, scales `s_xy ~ U(1, 1.25)` and `s_z ~ U(1, 1.5)`, phase rotation off, and
+`dip_label_policy=adjust`. The real-data smoke check and all 222 tests passed. Seed `20260925`
+peaked at n@5 **0.0130** at epoch 30 (n@10 0.0207; macro AUROC 0.628), clearing its P0b
+0.0120 gate and triggering replication. Seed `20260926` peaked at only **0.0086** at epoch 10
+(n@10 0.0169; macro AUROC 0.629), below its P0b 0.0109. The best-per-run mean was 0.01081
+versus P0b 0.01146; the gain did not reproduce. Do not adopt or carry zoom-in stretch forward.
+
+**Next recommended step (as of 2026-09-30):** retain unchanged P0b as the current-architecture
+recipe, checkpoint and push the P3 implementation/result, then implement WP4 real-seismic
+reconstruction mixing. P4 should add only `K=2` real reconstruction samples to P0b, with phase
+rotation and zoom-in stretch off. Run one seed first; replicate only if real MAE improves without
+worsening v2 n@5. Encoder work (P5–P8) remains gated on the P4 decision.
 
 P1–P4 are cheap warm-start runs on the current architecture and give the loss and augmentation
 settings that P5–P8 then use. P5–P8 need a new reconstruction stage because the trunk changes;

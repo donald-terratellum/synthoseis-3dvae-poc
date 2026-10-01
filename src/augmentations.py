@@ -1,4 +1,6 @@
 import numpy as np
+from scipy.ndimage import zoom
+from typing import cast
 
 
 DEFAULT_VERTICAL_WARP_MIN_STEP = 0.5
@@ -11,6 +13,8 @@ DEFAULT_MIXUP_SCALE_LOW = 1.0 / 150.0
 DEFAULT_MIXUP_SCALE_MODE = 1.0 / 110.0
 DEFAULT_MIXUP_SCALE_HIGH = 1.0 / 75.0
 DEFAULT_PHASE_RANGE_DEG = (-60.0, 0.0, 40.0)
+DEFAULT_STRETCH_XY = (1.0, 1.25)
+DEFAULT_STRETCH_Z = (1.0, 1.5)
 
 
 def _next_regular(n):
@@ -53,6 +57,37 @@ def phase_rotation_3d(cube, phase_deg):
     spectrum = spectrum * np.exp(1j * np.deg2rad(float(phase_deg)))
     rotated = np.fft.irfft(spectrum, n=pad_z, axis=-1)[..., :z_size]
     return rotated.astype(cube.dtype, copy=False)
+
+
+def sample_zoom_in_stretch(stretch_xy=DEFAULT_STRETCH_XY, stretch_z=DEFAULT_STRETCH_Z):
+    xy_min, xy_max = (float(v) for v in stretch_xy)
+    z_min, z_max = (float(v) for v in stretch_z)
+    if not (1.0 <= xy_min <= xy_max):
+        raise ValueError('stretch_xy must be ordered (min, max) with both values >= 1.')
+    if not (1.0 <= z_min <= z_max):
+        raise ValueError('stretch_z must be ordered (min, max) with both values >= 1.')
+    scale_xy = xy_min if xy_min == xy_max else float(np.random.uniform(xy_min, xy_max))
+    scale_z = z_min if z_min == z_max else float(np.random.uniform(z_min, z_max))
+    return scale_xy, scale_z
+
+
+def apply_zoom_in_stretch(cube, scale_xy, scale_z):
+    """Trilinear zoom with shared x/y scale followed by a center crop to the input shape."""
+    scale_xy = float(scale_xy)
+    scale_z = float(scale_z)
+    if scale_xy < 1.0 or scale_z < 1.0:
+        raise ValueError('Zoom-in stretch scales must be >= 1; pre-sampled patches have no padding margin.')
+    if scale_xy == 1.0 and scale_z == 1.0:
+        return cube.copy()
+
+    target_shape = tuple(int(v) for v in cube.shape)
+    stretched = zoom(cube, (scale_xy, scale_xy, scale_z), order=1, mode='nearest', prefilter=False)
+    stretched_shape = cast(tuple[int, int, int], stretched.shape)
+    if any(current < target for current, target in zip(stretched_shape, target_shape)):
+        raise RuntimeError('Zoom-in stretch unexpectedly produced an axis smaller than the target shape.')
+    starts = tuple((current - target) // 2 for current, target in zip(stretched_shape, target_shape))
+    slices = tuple(slice(start, start + target) for start, target in zip(starts, target_shape))
+    return np.ascontiguousarray(stretched[slices], dtype=cube.dtype)
 
 
 def sample_vertical_warp_target_indices(
@@ -319,6 +354,9 @@ def apply_pair_augmentations(
     vertical_warp_prob,
     phase_rotation_prob=0.0,
     phase_range=DEFAULT_PHASE_RANGE_DEG,
+    stretch_prob=0.0,
+    stretch_xy=DEFAULT_STRETCH_XY,
+    stretch_z=DEFAULT_STRETCH_Z,
     return_params=False,
 ):
     """Geometric transforms applied to both input and target.
@@ -333,6 +371,7 @@ def apply_pair_augmentations(
         "flip_y": False,
         "vertical_warp_indices": None,
         "phase_deg": None,
+        "stretch_factors": None,
     }
     if phase_rotation_prob > 0.0 and np.random.random() < phase_rotation_prob:
         phase_deg = sample_phase_rotation_deg(phase_range)
@@ -351,6 +390,12 @@ def apply_pair_augmentations(
         x = x[:, ::-1, :]
         y = y[:, ::-1, :]
         params["flip_y"] = True
+
+    if stretch_prob > 0.0 and np.random.random() < stretch_prob:
+        scale_xy, scale_z = sample_zoom_in_stretch(stretch_xy, stretch_z)
+        x = apply_zoom_in_stretch(x, scale_xy, scale_z)
+        y = apply_zoom_in_stretch(y, scale_xy, scale_z)
+        params["stretch_factors"] = (scale_xy, scale_xy, scale_z)
 
     # Non-linear depth warp is applied to the clean label first, then mirrored to input.
     if np.random.random() < vertical_warp_prob:
