@@ -33,11 +33,13 @@ are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_s
 
 ### Next action
 
-Commit and push the P3 source, tests, runner, plan, and this summary. Exclude logs, checkpoints,
-and generated benchmark reports. Then implement WP4 real-seismic reconstruction mixing and run
-P4 from unchanged P0b with `K=2`, phase rotation off, and zoom-in stretch off. Start one seed and
-replicate only if real MAE improves without worsening v2 n@5. Do not start encoder experiments
-before the P4 decision.
+The P3 source, tests, runner, plan, and summary are committed and pushed in `2d81e6b`; local and
+remote branch heads match. Implement WP4 real-seismic sampling and mixed batching next. Verify
+source axes and spatial hold-outs, generate real train/validation/test patch stores, test that
+real samples contribute only reconstruction loss, and enforce batches of 12 synthetic plus
+`K` real samples. Then run P4 from unchanged P0b with `K=2`, phase rotation off, and zoom-in
+stretch off. Start one seed and replicate only if real MAE improves without worsening v2 n@5.
+Do not start encoder experiments before the P4 decision.
 
 This file is written so a lower-cost agentic model can execute it with minimal judgment calls.
 Every step has an exact command and an unambiguous pass/fail check. Do the steps in order; do

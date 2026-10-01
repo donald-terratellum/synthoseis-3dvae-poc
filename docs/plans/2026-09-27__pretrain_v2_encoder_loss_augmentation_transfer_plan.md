@@ -672,10 +672,13 @@ peaked at n@5 **0.0130** at epoch 30 (n@10 0.0207; macro AUROC 0.628), clearing 
 versus P0b 0.01146; the gain did not reproduce. Do not adopt or carry zoom-in stretch forward.
 
 **Next recommended step (as of 2026-09-30):** retain unchanged P0b as the current-architecture
-recipe, checkpoint and push the P3 implementation/result, then implement WP4 real-seismic
-reconstruction mixing. P4 should add only `K=2` real reconstruction samples to P0b, with phase
-rotation and zoom-in stretch off. Run one seed first; replicate only if real MAE improves without
-worsening v2 n@5. Encoder work (P5–P8) remains gated on the P4 decision.
+recipe. The P3 implementation and result are committed and pushed in `2d81e6b`. Implement WP4
+real-seismic sampling and mixed batching next: verify source axes and spatial hold-outs, write
+real train/validation/test patch stores, ensure real samples contribute only reconstruction loss,
+and enforce `12 synthetic + K real` batches. After smoke tests and real-split overlap checks,
+run P4 with `K=2` from P0b, phase rotation and zoom-in stretch off. Start one seed; replicate
+only if real MAE improves without worsening v2 n@5. Encoder work (P5–P8) remains gated on the
+P4 decision.
 
 P1–P4 are cheap warm-start runs on the current architecture and give the loss and augmentation
 settings that P5–P8 then use. P5–P8 need a new reconstruction stage because the trunk changes;
