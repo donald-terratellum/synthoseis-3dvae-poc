@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from scripts import train as train_script
+from scripts import diagnose_p5_p6_reconstruction as diagnostics
 from src.model import VAE3D
 from src.tokenizer.core.model_adapter import VaeLatentAdapter
 
@@ -236,6 +237,37 @@ class EncoderArchitectureTests(unittest.TestCase):
                     mu = model.encoder(torch.from_numpy(inputs[:, None]))[0]
                     expected = model.encode_geo(mu).numpy()
                 np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_diagnostic_selection_is_seeded_and_unique(self):
+        indices = diagnostics.select_indices(100, 12, 20261003)
+        self.assertEqual(indices, diagnostics.select_indices(100, 12, 20261003))
+        self.assertEqual(len(set(indices)), 12)
+        with self.assertRaises(ValueError):
+            diagnostics.select_indices(10, 11, 1)
+
+    def test_diagnostic_recipe_matches_training_kl_normalization(self):
+        targets = torch.ones(2, 1, 8, 8, 8)
+        prediction = torch.zeros_like(targets)
+        mu = torch.ones(2, 4)
+        logvar = torch.zeros_like(mu)
+        metrics = diagnostics.component_metrics(prediction, targets, mu, logvar, lambda pred, target: pred.new_tensor(2.0))
+        self.assertEqual(metrics['mae'], 1.0)
+        self.assertEqual(metrics['kl_per_example'], 2.0)
+        self.assertAlmostEqual(metrics['kl_per_voxel'], 4 / targets.numel())
+        self.assertAlmostEqual(metrics['recipe_total'], 1.2 + 0.001 * 4 / targets.numel(), places=6)
+
+    def test_diagnostic_asymmetric_axis_fixture(self):
+        result = diagnostics.axis_audit(self._e2().eval(), torch.device('cpu'))
+        self.assertTrue(result['passed'])
+
+    def test_diagnostic_fit_does_not_mutate_checkpoint_modules(self):
+        model = VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8)).eval()
+        before = {key: value.clone() for key, value in model.state_dict().items()}
+        result = diagnostics.fit_decoder(model, torch.randn(2, 1, 8, 8, 8), torch.device('cpu'), 2, 10)
+        self.assertTrue(result['encoder_unchanged'])
+        self.assertTrue(np.isfinite(result['history'][-1]['mae']))
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
 
 if __name__ == '__main__':

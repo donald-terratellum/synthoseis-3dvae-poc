@@ -84,6 +84,53 @@ Retain P0b. P7 E1/E3 remains prospective; P8 remains gated. WP2 component loggin
 and orthogonal LPIPS, remaining WP3 augmentations/stack support, and WP8 voxel decoding
 are not implied complete by these results.
 
+### Reconstruction diagnostics completed (2026-10-03)
+
+Recovery checkpoint commit `7a0453a` was pushed to origin on the existing
+`geology-classifier-2026-09-25` branch before diagnostic implementation. It preserves
+WP4-WP6 implementation and the updated handoff without experiment artifacts.
+
+Implemented `scripts/diagnose_p5_p6_reconstruction.py` and
+`scripts/p5_p6_reconstruction_diagnostics.sh`, reusing training LPIPS and loss arithmetic.
+The runner uses Python module execution to avoid `scripts/tokenize.py` shadowing the
+stdlib `tokenize` module (the first path-based launch failed before checkpoint loading).
+The repaired runner completed the full default budget: CPU, threads=2, seed=20261003,
+32 identical seed-selected patches per split, batch=2, and 40 decoder-fit steps.
+Stdout and stderr are in `logs/p5_p6_reconstruction_diagnostics.log`; structured results
+are in `logs/p5_p6_reconstruction_diagnostics.json`. These remain local artifacts.
+
+| Arm | Synthetic mean-latent MAE | Real mean-latent MAE | Native two-patch fit initial -> final | Fresh legacy fit initial -> final |
+|---|---:|---:|---|---|
+| P0b | 0.256640 | 0.708492 | 0.23634 -> 0.09035 | not run |
+| P5a | 0.463623 | 0.753793 | 0.36002 -> 0.09077 | 0.46753 -> 0.15307 |
+| P5b | 0.485695 | 0.745650 | not run | not run |
+| P6 | 0.507599 | 0.749700 | 0.46511 -> 0.09098 | 0.46628 -> 0.14429 |
+
+Interpretation:
+- Strict full state-dict loads and asymmetric axis adapter/inverse checks passed.
+- Sampled-minus-mean MAE magnitude was below 0.0006; weighted KL below 0.0001.
+  The regression is predominantly reconstruction error, not sampling or KL accounting.
+- Synthetic mean MAE regressed 81%/89%/98%; real mean MAE regressed 6.4%/5.2%/5.8%.
+  These are 32-patch diagnostic deltas, not official full-set acceptance results.
+- Native decoders fit these two fixed patches better than independently initialized legacy
+  decoders in this short test. Initializations differ; this is not a fair superiority claim,
+  and overfitting two patches does not establish generalization. Encoders and original
+  checkpoint modules stayed unchanged. No saved weights or datasets were modified.
+- Stage 1's best val epoch was 56/60 in every arm. Last-ten versus previous-ten mean
+  validation loss improved 4.11% (P5a), 1.59% (P5b), and 2.97% (P6). More reconstruction
+  training is plausible, but neither a root cause nor a successful fix has been demonstrated.
+- Pylance syntax check, bash syntax, 14 focused tests, full 241-test suite, and diff checks pass.
+
+Recommended next approval: extend only P5a reconstruction warmup toward the plan's
+150-epoch ceiling, preserving original artifacts and checking component metrics on the
+same patches. Require a reconstruction gate before another geology stage. No new long
+training, P7/P8, or seed replication was launched during this diagnostic task.
+
+Run again: `bash scripts/p5_p6_reconstruction_diagnostics.sh`.
+Observe: `tail -n 50 -F logs/p5_p6_reconstruction_diagnostics.log`.
+Overrides: `DEVICE`, `SAMPLES`, `FIT_STEPS`, `BATCH_SIZE`, `SEED`, `LOG_PATH`, `OUT_JSON`,
+and `PYTHON`. Default runner output replaces its diagnostic log/report, not training files.
+
 ### Previous next action (2026-10-01; superseded)
 
 P1–P4 produced no repeatable primary-metric gain, so retain unchanged P0b. Do not replicate P4

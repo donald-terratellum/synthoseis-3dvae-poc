@@ -773,7 +773,7 @@ Override `RECON_EPOCHS`, `GEOLOGY_EPOCHS`, `BATCHES`, `OUT_ROOT`, `PRETRAIN_CHEC
 
 ### 9.2 Bounded P5/P6 reconstruction regression diagnostics (2026-10-03)
 
-Run `scripts/p5_p6_reconstruction_diagnostics.sh` from the repository root. The script
+Run `bash scripts/p5_p6_reconstruction_diagnostics.sh` from the repository root. The script
 uses `set -euo pipefail`, unbuffered Python, and `tee` to capture stdout and stderr in
 `logs/p5_p6_reconstruction_diagnostics.log`. It must fail on missing inputs or failed
 invariants and must not overwrite training checkpoints, the frozen manifest, or datasets.
@@ -797,7 +797,8 @@ sample/step overrides and record them. No augmentation or geology loss during ev
   Check input/target/output shapes and finiteness. Verify zxy encoder permutation and
   the decoder inverse with an asymmetric coordinate fixture, not just equal shapes.
 3. On identical patches evaluate `decoder(mu)` and seeded `decoder(z)` independently;
-  report MAE, MSE, vertical LPIPS, per-example KL, reconstruction standard deviation,
+  report MAE, MSE, vertical LPIPS, per-example KL and training's voxel-normalized KL,
+  reconstruction standard deviation,
   and zero-output MAE. Report the current recipe total (MAE + 0.1 LPIPS + 0.001 KL).
   Report synthetic/real deltas against P0b on these same patches; subset results are
   diagnostics only, not official +2% guardrail certification or adoption evidence.
@@ -819,6 +820,26 @@ then `.venv/bin/python -m unittest discover -s tests`. Execute the actual bash d
 and record its results in the session handoff. Do not start P7/P8 or modify production
 architecture/loss defaults automatically. Official full-set reconstruction evaluation and
 two-seed frozen-manifest retrieval gates remain required before adoption.
+
+**Diagnostic result (2026-10-03 local date; executed 2026-10-04 UTC):** completed on CPU
+with 32 patches per split and 40 fit steps. All axis and strict checkpoint-load checks passed.
+Sampled versus mean MAE differences were below 0.0006; weighted KL was below 0.0001.
+Neither explains the regression on this subset. Deterministic synthetic MAEs were
+P0b 0.256640, P5a 0.463623, P5b 0.485695, P6 0.507599; real MAEs were
+0.708492/0.753793/0.745650/0.749700. This randomly selected subset is not the original
+training-validation prefix; do not equate these values with CSV val_loss or full-set gates.
+Native decoder fitting reached 0.09077 (P5a) and 0.09098 (P6), versus fresh legacy decoder
+0.15307/0.14429, with encoders unchanged. This disconfirms a simple inability of the native
+decoder to fit two patches, but says nothing about held-out generalization or fair decoder
+architecture superiority. Stage-1 best epochs were all 56/60; last-ten versus previous-ten
+mean val losses improved 4.11%/1.59%/2.97%. Insufficient reconstruction training remains
+plausible; no root cause or fix is proven. Next proposal: a separately approved extension
+of P5a reconstruction warmup toward the planned 150 epochs, with matching component
+evaluation and a reconstruction gate before new geology training. Do not automatically
+launch P7/P8 or replication. The full diagnostic test gate passes 241 tests.
+
+Progress command: `tail -n 50 -F logs/p5_p6_reconstruction_diagnostics.log`.
+Report: `logs/p5_p6_reconstruction_diagnostics.json` (local artifact, not committed).
 
 ## 10. Decisions (answered 2026-09-27)
 
