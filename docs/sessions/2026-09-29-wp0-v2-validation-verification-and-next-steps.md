@@ -1,14 +1,14 @@
-# WP0–P3 Transfer Experiments — Verification and Next-Steps Handoff
+# WP0–P6 Transfer Experiments — Verification and Next-Steps Handoff
 
 Started: 2026-09-29
-Updated: 2026-09-30
+Updated: 2026-10-03
 Plan this belongs to: [docs/plans/2026-09-27__pretrain_v2_encoder_loss_augmentation_transfer_plan.md](../plans/2026-09-27__pretrain_v2_encoder_loss_augmentation_transfer_plan.md), Sections 8–9.
 
-## Current status (2026-09-30)
+## Current status (2026-10-01)
 
 The older verification instructions below are retained as provenance; all of their open items
 are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_size=5000`,
-2,048 benchmark indices), and P0, P0a, P0b, P1, P2, and P3 have finished.
+2,048 benchmark indices), and P0, P0a, P0b, P1, P2, P3, and P4 have finished.
 
 - P0b remains the control: best n@5 was 0.0120 for seed `20260925` and 0.0109 for seed
   `20260926` (best-per-run mean 0.01146).
@@ -30,16 +30,73 @@ are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_s
 - P3 checkpoints are under `checkpoints/p3_zoom_stretch_seed20260925` and
   `checkpoints/p3_zoom_stretch_seed20260926`; reports follow
   `docs/benchmarks/p3_zoom_stretch_seed<seed>_ep<10|20|30|40>_zgeo.json`.
+- WP4 real patch stores contain 10,000 train, 2,500 spatial validation, and 5,000 test patches.
+  Train/validation use Netherlands1–4 plus Penobscot3D; test uses CostaRica, Poseidon parts 1/2,
+  and cn1. All patches have per-patch standard deviation 1, and source-specific inline origin
+  audits confirmed the required 32-sample gap.
+- Mixed batches preserve 12 synthetic examples and append `K=2` real examples. Real examples
+  contribute reconstruction and KL only; every geology and GAN path uses the synthetic prefix.
+- P4 seed `20260925` peaked at n@5 0.01094 and n@10 0.01979 at epoch 20, below its P0b
+  control (0.01198 and 0.02214). Best real validation/test MAE was 0.70821/0.67208, but the
+  primary retrieval gate failed, so P4 is rejected without replication.
+- P4 checkpoints are under `checkpoints/p4_real_mix_seed20260925`; reports follow
+  `docs/benchmarks/p4_real_mix_seed20260925_ep<10|20|30|40>_zgeo.json`, and the log is
+  `logs/p4_real_mix_seed20260925.log`. The full suite passes: 226 tests.
+- WP5/WP6 implementation is complete: configurable E0/E1/E2/E3/E4 models, architecture-aware
+  checkpoint/tokenizer config, strict r006 EMA transfer, `zxy` input adapter, and scheduled encoder
+  freezing/unfreezing. The real r006 checkpoint loaded 150/150 tensors; an MPS two-epoch smoke run
+  and stage-2 resume both succeeded. Focused architecture tests cover all E1–E4 candidates.
+- P5/P6 runners are `scripts/p5_encoder_transfer_suite.sh` and
+  `scripts/p6_encoder_scratch_suite.sh`, with tail-able logs and print-only command rendering.
+  They preserve the P0b recipe, keep phase/stretch off, and use no real training examples; real
+  validation/test data are metrics-only.
 
-### Next action
+### Recovery audit and next action (2026-10-03)
 
-The P3 source, tests, runner, plan, and summary are committed and pushed in `2d81e6b`; local and
-remote branch heads match. Implement WP4 real-seismic sampling and mixed batching next. Verify
-source axes and spatial hold-outs, generate real train/validation/test patch stores, test that
-real samples contribute only reconstruction loss, and enforce batches of 12 synthetic plus
-`K` real samples. Then run P4 from unchanged P0b with `K=2`, phase rotation off, and zoom-in
-stretch off. Start one seed and replicate only if real MAE improves without worsening v2 n@5.
-Do not start encoder experiments before the P4 decision.
+The interrupted Copilot session did not interrupt training. P5a finished on October 2;
+P5b and P6 finished on October 3. Each completed 60 reconstruction epochs, 40 geology
+epochs, and frozen-manifest benchmarks at epochs 10/20/30/40. All 60/40 epoch checkpoints
+and both best checkpoints exist per arm. No traceback or interruption marker was found.
+No training/evaluation process remains; TensorBoard alone is still running.
+
+| Seed 20260925 arm | Best n@5 epoch | n@5 | n@10 | AUROC at that epoch | Best synthetic val loss | Best real-test MAE |
+|---|---:|---:|---:|---:|---:|---:|
+| P0b control | 30 | 0.011979 | 0.022135 | 0.6362 | 0.218987 | not logged in control CSV |
+| P5a transfer, stage-1 classifier 0.05 | 40 | 0.011719 | 0.019661 | 0.7755 | 0.356375 | 0.717662 |
+| P5b transfer, stage-1 classifier 0 | 40 | 0.011198 | 0.020573 | 0.7675 | 0.356796 | 0.710287 |
+| P6 scratch, stage-1 classifier 0.05 | 30 | 0.010938 | 0.023177 | 0.7677 | 0.354272 | 0.717474 |
+
+These are single-seed results; best reconstruction metrics need not belong to the best
+retrieval epoch. None beats P0b n@5. Best synthetic validation losses are 62-63% worse
+than P0b under the same MAE + LPIPS recipe. Classifier gains do not override either gate.
+Do not replicate these arms or launch P8 (which requires P5 to win).
+
+The v2 manifest was rechecked: dataset_size=5000, 2048 indices, maximum index 4996.
+The full current suite passed 237 tests in 92 seconds; git diff --check passed.
+The recovery audit made no code changes. WP4-WP6 code, runners, tests, and documentation
+were still uncommitted after commit 24a5971; experiment artifacts remain excluded.
+
+Next: the bounded reconstruction diagnostics defined in the plan's Section 9.2. P5/P6
+changed both encoder and decoder versus P0b, so they do not isolate encoder capacity.
+Evaluate the same fixed patches, deterministic mean and seeded sampled latents, separate
+MAE/LPIPS/KL, axis round-trip, and fixed-patch decoder fitting before further long runs.
+Retain P0b. P7 E1/E3 remains prospective; P8 remains gated. WP2 component logging/masking
+and orthogonal LPIPS, remaining WP3 augmentations/stack support, and WP8 voxel decoding
+are not implied complete by these results.
+
+### Previous next action (2026-10-01; superseded)
+
+P1–P4 produced no repeatable primary-metric gain, so retain unchanged P0b. Do not replicate P4
+or carry real mixing, phase rotation, or zoom-in stretch into P5/P6. Implementation and focused
+validation gates pass. The inspected P5a/P5b/P6 seed `20260925` sequence launched on 2026-10-01,
+running sequentially on MPS; P5a stage 1 is active. Monitor with
+`tail -f logs/p5a_seed20260925.log`; later arms write `logs/p5b_seed20260925.log` and
+`logs/p6_seed20260925.log`. P5a completed: its best n@5 was **0.01172** at epoch 40 (n@10
+0.01966), below the P0b seed-1 control (0.01198 / 0.02214); classifier macro AUROC reached
+0.775, and best real-test MAE was 0.71766. P5b stage 1 is underway at epoch 11/60, with the
+encoder unfrozen after its five-epoch warmup; P6 has not started. These are provisional single-
+seed results, not adoption decisions. Generated stores, logs, checkpoints, and benchmark reports
+remain experiment artifacts and should not be committed unless explicitly requested.
 
 This file is written so a lower-cost agentic model can execute it with minimal judgment calls.
 Every step has an exact command and an unambiguous pass/fail check. Do the steps in order; do

@@ -62,6 +62,7 @@ class VaeLatentAdapter:
         self.geology_projection = bool(checkpoint.get("geology_projection", False))
         self.geology_proj_hidden = int(checkpoint.get("geology_proj_hidden", 128))
         self.geology_proj_dim = int(checkpoint.get("geology_proj_dim", 64))
+        model_config = checkpoint.get("model_config") or {}
         self.geology_classifier = bool(load_classifier)
         if self.geology_classifier and not bool(checkpoint.get("geology_classifier", False)):
             raise ValueError(f"Checkpoint {checkpoint_path} has no geology classifier head (train with --geology_classifier).")
@@ -77,6 +78,15 @@ class VaeLatentAdapter:
             geology_classifier=self.geology_classifier,
             geology_classifier_mode=str(checkpoint.get("geology_classifier_mode", "patch")),
             geology_classifier_hidden=int(checkpoint.get("geology_classifier_hidden", 256)),
+            encoder_arch=str(model_config.get('encoder_arch', 'conv')),
+            encoder_hidden_dims=model_config.get('encoder_hidden_dims'),
+            encoder_depth_profile=str(model_config.get('encoder_depth_profile', 'baseline')),
+            encoder_stage_blocks=model_config.get('encoder_stage_blocks'),
+            encoder_norm=model_config.get('encoder_norm'),
+            encoder_stem=str(model_config.get('encoder_stem', 'pretrain_v2')),
+            encoder_input_axes=str(model_config.get('encoder_input_axes', 'xyz')),
+            decoder_hidden_dims=model_config.get('decoder_hidden_dims'),
+            decoder_block=str(model_config.get('decoder_block', 'conv')),
         )
         state_dict = checkpoint["model_state_dict"]
         load_result = self.model.load_state_dict(state_dict, strict=False)

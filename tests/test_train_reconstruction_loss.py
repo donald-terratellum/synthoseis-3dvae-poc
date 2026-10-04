@@ -7,6 +7,29 @@ from src.deep_supervision import DeepSupervisionLoss
 
 
 class TrainReconstructionLossTests(unittest.TestCase):
+    def test_append_real_batch_preserves_synthetic_prefix(self):
+        synthetic = torch.arange(4, dtype=torch.float32).reshape(2, 1, 1, 1, 2)
+        real = torch.full((1, 1, 1, 1, 2), 9.0)
+
+        inputs, targets, synthetic_count = train_script.append_real_batch(
+            synthetic, synthetic + 1.0, (real, real + 1.0)
+        )
+
+        self.assertEqual(synthetic_count, 2)
+        torch.testing.assert_close(inputs[:synthetic_count], synthetic)
+        torch.testing.assert_close(targets[:synthetic_count], synthetic + 1.0)
+        torch.testing.assert_close(inputs[synthetic_count:], real)
+
+    def test_real_reconstruction_weight_adjusts_only_real_fraction(self):
+        targets = torch.zeros((4, 1, 1, 1, 1))
+        recon = torch.tensor([0.0, 0.0, 2.0, 2.0]).reshape_as(targets)
+
+        adjustment = train_script.weighted_real_reconstruction_adjustment(
+            recon, targets, synthetic_count=2, real_recon_weight=2.0
+        )
+
+        self.assertAlmostEqual(float(adjustment), 2.0)
+
     def test_mae_loss_and_per_example_scores_match_voxelwise_l1(self):
         prediction = torch.tensor([[[[[1.0, -1.0]]]], [[[[2.0, 4.0]]]]])
         target = torch.tensor([[[[[0.0, 1.0]]]], [[[[1.0, 1.0]]]]])

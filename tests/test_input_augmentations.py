@@ -17,6 +17,35 @@ from scripts import sample_patches as sample_patches_script
 
 
 class InputAugmentationTests(unittest.TestCase):
+    def test_real_inline_splits_have_buffer_gap(self):
+        train_low, train_high = sample_patches_script.real_inline_origin_bounds(
+            300, 32, "train", holdout_fraction=0.15, buffer=32
+        )
+        val_low, val_high = sample_patches_script.real_inline_origin_bounds(
+            300, 32, "validation", holdout_fraction=0.15, buffer=32
+        )
+
+        self.assertEqual((train_low, val_high), (0, 268))
+        self.assertGreaterEqual(val_low - (train_high + 32), 32)
+
+    def test_real_axis_aware_patch_extraction(self):
+        xyz = np.arange(6 * 7 * 8, dtype=np.float32).reshape(6, 7, 8)
+        zxy = np.transpose(xyz, (2, 0, 1))
+
+        patch = sample_patches_script._extract_real_patch(zxy, (1, 2, 3), (3, 4, 2), "zxy")
+
+        np.testing.assert_array_equal(patch, xyz[1:4, 2:6, 3:5])
+
+    def test_real_volume_discovery_ignores_appledouble_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Netherlands1.npy").touch()
+            (root / "._Netherlands1.npy").touch()
+
+            discovered = sample_patches_script.list_real_volumes(root)
+
+        self.assertEqual([path.name for path in discovered], ["Netherlands1.npy"])
+
     def test_zoom_in_stretch_identity(self):
         cube = np.random.default_rng(10).normal(size=(8, 10, 12)).astype(np.float32)
 

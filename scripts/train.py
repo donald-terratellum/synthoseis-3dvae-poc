@@ -1249,6 +1249,49 @@ def compute_generator_gan_loss(discriminator, fake_cubes):
     return g_gan_loss
 
 
+def append_real_batch(inputs, targets, real_batch):
+    """Append an unlabeled real batch while preserving the synthetic prefix."""
+    synthetic_count = int(inputs.shape[0])
+    if real_batch is None:
+        return inputs, targets, synthetic_count
+    real_inputs, real_targets = real_batch
+    if tuple(real_inputs.shape[1:]) != tuple(inputs.shape[1:]):
+        raise ValueError(
+            f"real batch shape {tuple(real_inputs.shape[1:])} does not match synthetic shape {tuple(inputs.shape[1:])}"
+        )
+    return (
+        torch.cat((inputs, real_inputs.to(inputs.device)), dim=0),
+        torch.cat((targets, real_targets.to(targets.device)), dim=0),
+        synthetic_count,
+    )
+
+
+def weighted_real_reconstruction_adjustment(
+    recon,
+    targets,
+    synthetic_count,
+    real_recon_weight,
+    rec_loss_fn=None,
+    deep_supervision_loss=None,
+    lpips_loss_fn=None,
+    lpips_weight=0.0,
+):
+    real_count = int(targets.shape[0]) - int(synthetic_count)
+    if real_count <= 0 or float(real_recon_weight) == 1.0:
+        return targets.new_zeros(())
+    real_targets = targets[int(synthetic_count):]
+    real_recon = tuple(value[int(synthetic_count):] for value in recon) if isinstance(recon, (list, tuple)) else recon[int(synthetic_count):]
+    if deep_supervision_loss is not None:
+        real_loss = deep_supervision_loss(real_recon, real_targets)
+    else:
+        loss_fn = rec_loss_fn if rec_loss_fn is not None else torch.nn.functional.mse_loss
+        real_loss = loss_fn(_get_primary_prediction(real_recon), real_targets)
+    if lpips_loss_fn is not None and float(lpips_weight) > 0.0:
+        real_loss = real_loss + float(lpips_weight) * lpips_loss_fn(_get_primary_prediction(real_recon), real_targets)
+    real_fraction = float(real_count) / float(targets.shape[0])
+    return (float(real_recon_weight) - 1.0) * real_fraction * real_loss
+
+
 def compute_average_loss(
     model,
     dataloader,
@@ -1326,10 +1369,17 @@ def apply_parameter_freezing(model, args):
     Returns a short human-readable summary of which submodules were frozen.
     """
     frozen = []
+    if bool(getattr(args, 'freeze_encoder', False)) and int(getattr(args, 'freeze_encoder_epochs', 0)) > 0:
+        raise ValueError('--freeze_encoder cannot be combined with --freeze_encoder_epochs.')
     if bool(getattr(args, 'freeze_encoder', False)):
         for param in model.encoder.parameters():
             param.requires_grad = False
         frozen.append('encoder')
+    freeze_epochs = int(getattr(args, 'freeze_encoder_epochs', 0))
+    if freeze_epochs > 0 and not bool(getattr(args, 'freeze_encoder', False)):
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        frozen.append(f'encoder for {freeze_epochs} epochs')
     if bool(getattr(args, 'freeze_decoder', False)):
         for param in model.decoder.parameters():
             param.requires_grad = False
@@ -1344,13 +1394,14 @@ def build_optimizer(model, args):
         raise ValueError('--decoder_lr_mult must be positive.')
 
     base_lr = float(args.learning_rate)
-    if args.encoder_lr_mult == 1.0 and args.decoder_lr_mult == 1.0:
+    scheduled_encoder = int(getattr(args, 'freeze_encoder_epochs', 0)) > 0
+    if args.encoder_lr_mult == 1.0 and args.decoder_lr_mult == 1.0 and not scheduled_encoder:
         trainable = [p for p in model.parameters() if p.requires_grad]
         if not trainable:
             raise ValueError('No trainable parameters remain after freezing; check --freeze_encoder/--freeze_decoder.')
         return torch.optim.AdamW(trainable, lr=base_lr, weight_decay=args.weight_decay)
 
-    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad or scheduled_encoder]
     decoder_params = [p for p in model.decoder.parameters() if p.requires_grad]
     tracked_ids = {id(p) for p in list(model.encoder.parameters()) + list(model.decoder.parameters())}
     other_params = [p for p in model.parameters() if id(p) not in tracked_ids and p.requires_grad]
@@ -1373,6 +1424,17 @@ def build_optimizer(model, args):
     if not param_groups:
         raise ValueError('No trainable parameters remain after freezing; check --freeze_encoder/--freeze_decoder.')
     return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=args.weight_decay)
+
+
+def unfreeze_encoder_after_warmup(model, optimizer, epoch_idx, args):
+    freeze_epochs = int(getattr(args, 'freeze_encoder_epochs', 0))
+    if freeze_epochs <= 0 or bool(getattr(args, 'freeze_encoder', False)) or int(epoch_idx) < freeze_epochs:
+        return False
+    if any(param.requires_grad for param in model.encoder.parameters()):
+        return False
+    for param in model.encoder.parameters():
+        param.requires_grad = True
+    return True
 
 
 def build_discriminator(args):
@@ -1420,6 +1482,8 @@ METRICS_CSV_COLUMNS = [
     'train_lpips_loss',
     'val_loss',
     'val_lpips_loss',
+    'real_validation_mae',
+    'real_test_mae',
     'kl_weight',
     'learning_rate',
     'discriminator_learning_rate',
@@ -1481,12 +1545,66 @@ def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=Non
         'geology_classifier': bool(getattr(model, 'geology_classifier_enabled', False)),
         'geology_classifier_mode': str(getattr(model, 'geology_classifier_mode', 'patch')),
         'geology_classifier_hidden': int(getattr(model, 'geology_classifier_hidden', 256)),
+        'model_config': dict(getattr(model, 'model_config', {})),
+        'encoder_init': dict(getattr(model, 'encoder_init_metadata', {})),
     }
     if epoch is not None:
         payload['epoch'] = int(epoch)
     if geology_metadata_calibration is not None:
         payload['geology_metadata_calibration'] = geology_metadata_calibration
     return payload
+
+
+def load_pretrained_encoder(model, checkpoint_path):
+    if getattr(model, 'encoder_arch', None) != 'resnetv2':
+        raise ValueError('--init_encoder_from requires --encoder_arch resnetv2.')
+    if model.encoder.norm_type != 'instance' or model.encoder_stem != 'pretrain_v2' or model.encoder_input_axes != 'zxy':
+        raise ValueError(
+            '--init_encoder_from requires --encoder_norm instance, --encoder_stem pretrain_v2, '
+            'and --encoder_input_axes zxy.'
+        )
+    checkpoint = torch.load(str(checkpoint_path), map_location='cpu', weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f'Pretrained checkpoint {checkpoint_path} must contain a dictionary.')
+    ema_state = checkpoint.get('ema_state')
+    if isinstance(ema_state, dict) and isinstance(ema_state.get('shadow'), dict):
+        source_state = ema_state['shadow']
+        source_kind = 'ema_state.shadow'
+    elif isinstance(checkpoint.get('model'), dict):
+        source_state = checkpoint['model']
+        source_kind = 'model'
+    else:
+        raise ValueError(f'Pretrained checkpoint {checkpoint_path} contains neither ema_state.shadow nor model weights.')
+    source = {
+        key.removeprefix('encoder.'): value
+        for key, value in source_state.items()
+        if str(key).startswith('encoder.')
+    }
+    target = model.encoder.trunk.state_dict()
+    missing = sorted(set(target).difference(source))
+    unexpected = sorted(set(source).difference(target))
+    mismatched = sorted(
+        key for key in set(target).intersection(source)
+        if tuple(target[key].shape) != tuple(source[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        details = []
+        if missing:
+            details.append(f'missing={missing[:8]}')
+        if unexpected:
+            details.append(f'unexpected={unexpected[:8]}')
+        if mismatched:
+            details.append(f'shape_mismatch={[(key, tuple(source[key].shape), tuple(target[key].shape)) for key in mismatched[:8]]}')
+        raise ValueError(f'Pretrained encoder state is incompatible: {"; ".join(details)}')
+    model.encoder.trunk.load_state_dict(source, strict=True)
+    model.encoder_init_metadata = {
+        'path': str(Path(checkpoint_path).resolve()),
+        'epoch': int(checkpoint.get('epoch', -1)),
+        'train_paths_count': len(checkpoint.get('train_paths', ())),
+        'source_state': source_kind,
+        'tensors_loaded': len(source),
+    }
+    return dict(model.encoder_init_metadata)
 
 
 @dataclass
@@ -1935,6 +2053,8 @@ def train_one_epoch(
     geology_classifier_label_smoothing=0.05,
     geology_presence_strata=None,
     epoch_stats=None,
+    real_dataloader=None,
+    real_recon_weight=1.0,
 ):
     if steps_per_epoch is None:
         raise ValueError('steps_per_epoch must be provided for train_one_epoch.')
@@ -1960,6 +2080,7 @@ def train_one_epoch(
     total_geology_uniformity_loss = 0.0
     total_geology_classifier_loss = 0.0
     batch_iter = itertools.cycle(dataloader)
+    real_batch_iter = itertools.cycle(real_dataloader) if real_dataloader is not None else None
 
     last_snapshot = None
     for _ in range(steps_per_epoch):
@@ -1975,6 +2096,8 @@ def train_one_epoch(
             inputs, targets = batch
         inputs = inputs.to(device)
         targets = targets.to(device)
+        real_batch = next(real_batch_iter) if real_batch_iter is not None else None
+        inputs, targets, synthetic_count = append_real_batch(inputs, targets, real_batch)
         ds_outputs = None
 
         d_gan_loss_value = 0.0
@@ -1987,7 +2110,9 @@ def train_one_epoch(
                 else:
                     recon_for_d, _, _ = model(inputs)
             disc_optimizer.zero_grad()
-            d_gan_loss, d_gan_accuracy = compute_discriminator_gan_loss(discriminator, targets, recon_for_d.detach())
+            d_gan_loss, d_gan_accuracy = compute_discriminator_gan_loss(
+                discriminator, targets[:synthetic_count], recon_for_d[:synthetic_count].detach()
+            )
             d_gan_loss.backward()
             disc_optimizer.step()
             d_gan_loss_value = float(d_gan_loss.item())
@@ -2009,7 +2134,7 @@ def train_one_epoch(
                 geology_metadata_batch=geology_metadata_batch,
                 geology_metadata_keys=geology_metadata_keys,
                 geology_loss_weight=geology_loss_weight,
-                latent_vectors=mu,
+                latent_vectors=mu[:synthetic_count],
                 geology_metadata_calibration=geology_metadata_calibration,
                 geology_background_threshold=geology_background_threshold,
                 geology_background_key_indices=geology_background_key_indices,
@@ -2031,7 +2156,7 @@ def train_one_epoch(
                 geology_metadata_batch=geology_metadata_batch,
                 geology_metadata_keys=geology_metadata_keys,
                 geology_loss_weight=geology_loss_weight,
-                latent_vectors=mu,
+                latent_vectors=mu[:synthetic_count],
                 geology_metadata_calibration=geology_metadata_calibration,
                 geology_background_threshold=geology_background_threshold,
                 geology_background_key_indices=geology_background_key_indices,
@@ -2041,9 +2166,18 @@ def train_one_epoch(
             )
 
         g_gan_loss_value = 0.0
-        total_g_loss = vae_loss
+        total_g_loss = vae_loss + weighted_real_reconstruction_adjustment(
+            ds_outputs if deep_supervision else recon,
+            targets,
+            synthetic_count,
+            real_recon_weight,
+            rec_loss_fn=rec_loss_fn,
+            deep_supervision_loss=deep_supervision_loss,
+            lpips_loss_fn=lpips_loss_fn,
+            lpips_weight=lpips_weight,
+        )
         if discriminator is not None:
-            g_gan_loss = compute_generator_gan_loss(discriminator, recon)
+            g_gan_loss = compute_generator_gan_loss(discriminator, recon[:synthetic_count])
             g_gan_loss_value = float(g_gan_loss.item())
             total_g_loss = total_g_loss + gan_weight * g_gan_loss
 
@@ -2074,7 +2208,7 @@ def train_one_epoch(
                     strata_max_active_keys=geology_strata_max_active_keys,
                 )
             if strata_labels is not None:
-                z_geo = model.encode_geo(mu)
+                z_geo = model.encode_geo(mu[:synthetic_count])
                 if float(geology_contrastive_weight) > 0.0:
                     contrastive_loss = compute_supervised_contrastive_loss(
                         z_geo,
@@ -2095,7 +2229,7 @@ def train_one_epoch(
         classifier = getattr(model, 'geology_classifier', None)
         if float(geology_classifier_weight) > 0.0 and classifier is not None and geology_metadata_batch is not None:
             classifier_loss, _ = compute_geology_classifier_loss(
-                model.classify(mu),
+                model.classify(mu[:synthetic_count]),
                 geology_metadata_batch,
                 targets=geology_classifier_targets,
                 loss_type=geology_classifier_loss,
@@ -2327,6 +2461,57 @@ def build_dataset(args, data_path, augment=False):
         label_target_keys=resolve_label_target_keys(args),
         dip_label_policy=getattr(args, 'dip_label_policy', 'adjust'),
     )
+
+
+def build_real_dataset(args, data_path, augment=False):
+    return ZarrPatchDataset(
+        data_path,
+        scaling='none',
+        augment=augment,
+        swap_xy_prob=args.swap_xy_prob,
+        flip_x_prob=args.flip_x_prob,
+        flip_y_prob=args.flip_y_prob,
+        vertical_warp_prob=args.vertical_warp_prob,
+        phase_rotation_prob=args.phase_rotation_prob,
+        phase_range=args.phase_range,
+        stretch_prob=args.stretch_prob,
+        stretch_xy=args.stretch_xy,
+        stretch_z=args.stretch_z,
+        zero_cluster_min=args.zero_cluster_min,
+        zero_cluster_max=args.zero_cluster_max,
+        extrema_only=None if augment else False,
+        input_extrema_prob=args.input_extrema_prob,
+        input_sparse_keep_prob=args.input_sparse_keep_prob,
+        input_decimate_trilinear_prob=args.input_decimate_trilinear_prob,
+        sparse_keep_fraction_min=args.sparse_keep_fraction_min,
+        sparse_keep_fraction_max=args.sparse_keep_fraction_max,
+        sparse_poisson_radius_scale=args.sparse_poisson_radius_scale,
+        mixup_augment_prob=args.mixup_augment_prob if augment else 0.0,
+        include_metadata=False,
+        geology_metadata_keys=(),
+        label_target_keys=(),
+    )
+
+
+def compute_real_mae(model, args, data_path, device, max_steps):
+    if not data_path:
+        return float('nan')
+    dataset = build_real_dataset(args, data_path, augment=False)
+    if dataset.patch_shape != args.patch_size_xyz:
+        raise ValueError(f"real patch shape {dataset.patch_shape} does not match --patch_size {args.patch_size_xyz}")
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    steps = min(len(dataloader), max(1, int(max_steps)))
+    total_absolute_error = 0.0
+    total_voxels = 0
+    model.eval()
+    with torch.no_grad():
+        for inputs, targets in itertools.islice(dataloader, steps):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            outputs = model(inputs, return_deep_supervision=True)[0] if args.deep_supervision else model(inputs)[0]
+            total_absolute_error += float(torch.sum(torch.abs(outputs - targets)).item())
+            total_voxels += int(targets.numel())
+    return total_absolute_error / float(max(1, total_voxels))
 
 
 def presence_matrix_from_labels(label_arrays, class_names):
@@ -2744,7 +2929,44 @@ def resume_state_dict_incompatibilities(missing_keys, unexpected_keys):
     return invalid(missing_keys), invalid(unexpected_keys)
 
 
+def validate_resume_model_config(checkpoint_model_config, model):
+    if checkpoint_model_config:
+        mismatched = {
+            key: (checkpoint_model_config.get(key), model.model_config.get(key))
+            for key in model.model_config
+            if checkpoint_model_config.get(key) != model.model_config.get(key)
+        }
+        if mismatched:
+            raise ValueError(f'Resume checkpoint architecture config does not match active model: {mismatched}')
+    elif model.encoder_arch != 'conv' or model.residual_encoder:
+        raise ValueError('Resume checkpoint has no architecture config and can only load the legacy conv encoder.')
+
+
 def train(args):
+    args.encoder_arch = str(getattr(args, 'encoder_arch', 'conv'))
+    args.encoder_hidden_dims = getattr(args, 'encoder_hidden_dims', None)
+    args.encoder_depth_profile = str(getattr(args, 'encoder_depth_profile', 'baseline'))
+    args.encoder_stage_blocks = getattr(args, 'encoder_stage_blocks', None)
+    args.encoder_norm = getattr(args, 'encoder_norm', None)
+    args.encoder_stem = str(getattr(args, 'encoder_stem', 'pretrain_v2'))
+    args.encoder_input_axes = str(getattr(args, 'encoder_input_axes', 'xyz'))
+    args.decoder_hidden_dims = getattr(args, 'decoder_hidden_dims', None)
+    args.decoder_block = str(getattr(args, 'decoder_block', 'conv'))
+    args.init_encoder_from = getattr(args, 'init_encoder_from', None)
+    args.freeze_encoder_epochs = int(getattr(args, 'freeze_encoder_epochs', 0))
+    if args.freeze_encoder_epochs < 0:
+        raise ValueError('--freeze_encoder_epochs must be non-negative.')
+    args.real_batch_count = int(getattr(args, 'real_batch_count', 0))
+    args.real_recon_weight = float(getattr(args, 'real_recon_weight', 1.0))
+    args.real_data = getattr(args, 'real_data', None)
+    args.real_validation_data = getattr(args, 'real_validation_data', None)
+    args.real_test_data = getattr(args, 'real_test_data', None)
+    if args.real_batch_count < 0:
+        raise ValueError('--real_batch_count must be non-negative.')
+    if args.real_recon_weight < 0.0:
+        raise ValueError('--real_recon_weight must be non-negative.')
+    if args.real_batch_count > 0 and not args.real_data:
+        raise ValueError('--real_data is required when --real_batch_count > 0.')
     if args.geology_classifier_weight < 0.0:
         raise ValueError('--geology_classifier_weight must be non-negative.')
     if args.geology_classifier_weight > 0.0 and not args.geology_classifier:
@@ -2863,11 +3085,25 @@ def train(args):
         geology_background_key_indices=geology_background_key_indices,
         presence_strata=presence_strata,
     )
+    real_dl = None
+    if args.real_batch_count > 0:
+        real_ds = build_real_dataset(args, args.real_data, augment=args.augment)
+        if real_ds.patch_shape != args.patch_size_xyz:
+            raise ValueError(
+                f"real patch shape {real_ds.patch_shape} does not match --patch_size {args.patch_size_xyz}"
+            )
+        real_dl = DataLoader(
+            real_ds,
+            batch_size=args.real_batch_count,
+            shuffle=True,
+            drop_last=True,
+            num_workers=2,
+        )
 
     if args.number_batches is not None and args.number_batches <= 0:
         raise ValueError('--number_batches must be a positive integer when provided.')
     steps_per_epoch = args.number_batches if args.number_batches is not None else len(dl)
-    samples_per_epoch = steps_per_epoch * args.batch_size
+    samples_per_epoch = steps_per_epoch * (args.batch_size + args.real_batch_count)
 
     model = VAE3D(
         in_ch=1,
@@ -2883,7 +3119,27 @@ def train(args):
         geology_classifier=bool(args.geology_classifier),
         geology_classifier_mode=str(args.geology_classifier_mode),
         geology_classifier_hidden=int(args.geology_classifier_hidden),
+        encoder_arch=args.encoder_arch,
+        encoder_hidden_dims=tuple(args.encoder_hidden_dims) if args.encoder_hidden_dims else None,
+        encoder_depth_profile=args.encoder_depth_profile,
+        encoder_stage_blocks=tuple(args.encoder_stage_blocks) if args.encoder_stage_blocks else None,
+        encoder_norm=args.encoder_norm,
+        encoder_stem=args.encoder_stem,
+        encoder_input_axes=args.encoder_input_axes,
+        decoder_hidden_dims=tuple(args.decoder_hidden_dims) if args.decoder_hidden_dims else None,
+        decoder_block=args.decoder_block,
     )
+    if args.init_encoder_from is not None:
+        if args.resume is not None:
+            raise ValueError('--init_encoder_from cannot be combined with --resume.')
+        transfer = load_pretrained_encoder(model, args.init_encoder_from)
+        print(
+            'Initialized pretrained encoder:',
+            f"source={transfer['path']}",
+            f"epoch={transfer['epoch']}",
+            f"train_paths={transfer['train_paths_count']}",
+            f"tensors={transfer['tensors_loaded']}",
+        )
     if float(args.geology_contrastive_weight) > 0.0 and not bool(args.geology_projection):
         raise ValueError('--geology_contrastive_weight > 0 requires --geology_projection to build the z_geo head.')
     if float(args.geology_uniformity_weight) > 0.0 and not bool(args.geology_projection):
@@ -2943,6 +3199,8 @@ def train(args):
                 f'active model base_ch {expected_base_ch}.'
             )
 
+        validate_resume_model_config(checkpoint.get('model_config'), model)
+
         state_dict = checkpoint['model_state_dict']
         load_result = model.load_state_dict(state_dict, strict=False)
         invalid_missing, invalid_unexpected = resume_state_dict_incompatibilities(
@@ -2955,6 +3213,7 @@ def train(args):
                 f'invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}'
             )
         checkpoint_epoch = checkpoint.get('epoch', None)
+        setattr(model, 'encoder_init_metadata', dict(checkpoint.get('encoder_init', {})))
         if isinstance(checkpoint.get('geology_metadata_calibration', None), dict):
             geology_metadata_calibration = checkpoint['geology_metadata_calibration']
             print('Loaded geology metadata calibration from resume checkpoint.')
@@ -2969,6 +3228,13 @@ def train(args):
         print(f"Resuming epoch numbering from {resume_completed_epochs + 1}")
 
     print(f"Using device: {device}")
+    print(
+        'Model architecture:',
+        f"config={model.model_config}",
+        f"parameters={sum(parameter.numel() for parameter in model.parameters())}",
+        f"encoder_parameters={sum(parameter.numel() for parameter in model.encoder.parameters())}",
+        f"decoder_parameters={sum(parameter.numel() for parameter in model.decoder.parameters())}",
+    )
     if float(args.geology_classifier_weight) > 0.0:
         classifier = cast(Any, model.geology_classifier)
         pos_weight = classifier.pos_weight.clone()
@@ -2987,6 +3253,14 @@ def train(args):
         )
     print(f"Training seed: {args.seed}")
     print(f"Batch size (B): {args.batch_size}, batches/epoch: {steps_per_epoch}, examples/epoch: {samples_per_epoch}")
+    print(
+        "Real seismic mixing:",
+        f"K={args.real_batch_count}",
+        f"recon_weight={args.real_recon_weight}",
+        f"train={args.real_data}",
+        f"validation={args.real_validation_data}",
+        f"test={args.real_test_data}",
+    )
     print(
         "Augmentations:",
         f"enabled={args.augment}",
@@ -3244,6 +3518,8 @@ def train(args):
 
             epoch_idx = resume_completed_epochs + epoch_offset
             epoch_number = epoch_idx + 1
+            if unfreeze_encoder_after_warmup(model, opt, epoch_idx, args):
+                print(f"Unfroze encoder after {args.freeze_encoder_epochs} completed epochs.")
 
             batch_sampler = getattr(dl, 'batch_sampler', None)
             set_epoch_fn = getattr(batch_sampler, 'set_epoch', None)
@@ -3304,6 +3580,8 @@ def train(args):
                 geology_classifier_label_smoothing=float(args.geology_classifier_label_smoothing),
                 geology_presence_strata=presence_strata,
                 epoch_stats=train_epoch_stats,
+                real_dataloader=real_dl,
+                real_recon_weight=float(args.real_recon_weight),
             )
             val_loss, val_lpips_loss, val_last_snapshot, geology_diagnostics = validate(
                 model,
@@ -3315,6 +3593,13 @@ def train(args):
                 lpips_loss_fn=lpips_loss_fn,
                 geology_metadata_calibration=geology_metadata_calibration,
                 geology_background_key_indices=geology_background_key_indices,
+            )
+            real_metric_steps = max(1, int(math.ceil(0.2 * steps_per_epoch)))
+            real_validation_mae = compute_real_mae(
+                model, args, args.real_validation_data, device, real_metric_steps
+            )
+            real_test_mae = compute_real_mae(
+                model, args, args.real_test_data, device, real_metric_steps
             )
             examples_this_epoch = samples_per_epoch
             cumulative_examples = epoch_number * samples_per_epoch
@@ -3369,6 +3654,10 @@ def train(args):
                 print(f"  geology_classifier_loss={train_epoch_stats.get('geology_classifier_loss', 0.0):.4f}")
             writer.add_scalar('validation/loss', float(val_loss), epoch_number)
             writer.add_scalar('validation/lpips_loss', float(val_lpips_loss), epoch_number)
+            if math.isfinite(real_validation_mae):
+                writer.add_scalar('real/validation_mae', real_validation_mae, epoch_number)
+            if math.isfinite(real_test_mae):
+                writer.add_scalar('real/test_mae', real_test_mae, epoch_number)
             if geology_diagnostics is not None:
                 writer.add_scalar('validation/geology_latent_pair_cosine_correlation', geology_diagnostics['pair_cosine_correlation'], epoch_number)
                 writer.add_scalar('validation/geology_latent_similar_cosine', geology_diagnostics['similar_latent_cosine'], epoch_number)
@@ -3502,6 +3791,8 @@ def train(args):
                 f"{train_lpips_loss:.6f}",
                 f"{val_loss:.6f}",
                 f"{val_lpips_loss:.6f}",
+                f"{real_validation_mae:.6f}" if math.isfinite(real_validation_mae) else '',
+                f"{real_test_mae:.6f}" if math.isfinite(real_test_mae) else '',
                 f"{kl_weight:.6f}",
                 f"{current_lr:.8f}",
                 f"{current_disc_lr:.8f}",
@@ -3567,6 +3858,8 @@ def train(args):
                     f"n@10={geology_diagnostics.get('neighbor_overlap_at_10', 0.0):.4f} "
                     f"n@20={geology_diagnostics.get('neighbor_overlap_at_20', 0.0):.4f}"
                 )
+            if math.isfinite(real_validation_mae) or math.isfinite(real_test_mae):
+                print(f"  Real seismic: validation_mae={real_validation_mae:.6f} test_mae={real_test_mae:.6f}")
             batch_sampler = getattr(dl, 'batch_sampler', None)
             get_sampler_stats_fn = getattr(batch_sampler, 'get_last_epoch_stats', None)
             if callable(get_sampler_stats_fn):
@@ -3602,6 +3895,11 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--patch_size', type=int, nargs='+', default=None, help='Patch size: one value for cubic or three values X Y Z. If omitted, infer from training dataset.')
     p.add_argument('--data', required=True)
+    p.add_argument('--real_data', type=str, default=None, help='Real-seismic training patch store appended to each synthetic batch.')
+    p.add_argument('--real_validation_data', type=str, default=None, help='Held-out real-seismic validation patch store.')
+    p.add_argument('--real_test_data', type=str, default=None, help='Real-seismic test patch store; guardrail metric only.')
+    p.add_argument('--real_batch_count', type=int, default=0, help='Real examples K appended to each synthetic batch without geology labels.')
+    p.add_argument('--real_recon_weight', type=float, default=1.0, help='Relative reconstruction weight for appended real examples.')
     p.add_argument('--batch_size', '--examples_per_batch', dest='batch_size', type=int, default=100)
     p.add_argument('--number_batches', type=int, default=None, help='Number of batches per epoch. If omitted, uses full dataloader length.')
     p.add_argument('--learning_rate', '--lr', dest='learning_rate', type=float, default=1e-4)
@@ -3661,6 +3959,17 @@ if __name__ == '__main__':
     p.add_argument('--kl_fixed', type=float, default=1e-3)
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
     p.add_argument('--residual_encoder', action='store_true', help='Use the residual encoder variant while keeping the external latent contract unchanged.')
+    p.add_argument('--encoder_arch', choices=['conv', 'residual', 'resnetv2'], default='conv')
+    p.add_argument('--encoder_hidden_dims', type=int, nargs='+', default=None)
+    p.add_argument('--encoder_depth_profile', choices=['baseline', 'deeper'], default='baseline')
+    p.add_argument('--encoder_stage_blocks', type=int, nargs='+', default=None)
+    p.add_argument('--encoder_norm', choices=['batch', 'instance', 'group'], default=None)
+    p.add_argument('--encoder_stem', choices=['pretrain_v2', 'light'], default='pretrain_v2')
+    p.add_argument('--encoder_input_axes', choices=['xyz', 'zxy'], default='xyz')
+    p.add_argument('--decoder_hidden_dims', type=int, nargs='+', default=None)
+    p.add_argument('--decoder_block', choices=['conv', 'res'], default='conv')
+    p.add_argument('--init_encoder_from', type=str, default=None, help='Pretrain-v2 checkpoint; loads EMA encoder tensors into an E2 ResNetV2 trunk.')
+    p.add_argument('--freeze_encoder_epochs', type=int, default=0, help='Freeze encoder for N completed epochs, then unfreeze it.')
     p.add_argument('--geology_projection', action='store_true', help='Add an MLP projection head g(mu)->z_geo (unit-norm) for the contrastive geology embedding used in retrieval.')
     p.add_argument('--geology_proj_hidden', type=int, default=128, help='Hidden width of the geology projection head.')
     p.add_argument('--geology_proj_dim', type=int, default=64, help='Output dimension of the geology projection embedding z_geo.')

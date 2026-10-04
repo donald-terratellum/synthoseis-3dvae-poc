@@ -796,9 +796,187 @@ def list_source_volumes(source, exclude_dirs=()):
     return vols
 
 
+def list_real_volumes(source, extra_volumes=()):
+    roots = [Path(source), *(Path(value) for value in extra_volumes or ())]
+    candidates = []
+    for root in roots:
+        if root.name.startswith("."):
+            continue
+        if root.is_file() or root.name.endswith(".real.zarr"):
+            candidates.append(root)
+            continue
+        candidates.extend(path for path in sorted(root.glob("*.real.zarr")) if not path.name.startswith("."))
+        zarr_stems = {path.name.removesuffix(".real.zarr") for path in candidates if path.name.endswith(".real.zarr")}
+        candidates.extend(
+            path for path in sorted(root.glob("*.npy"))
+            if not path.name.startswith(".") and path.stem not in zarr_stems
+        )
+    return list(dict.fromkeys(path.resolve() for path in candidates if path.exists()))
+
+
+def real_inline_origin_bounds(nx, patch_x, split, holdout_fraction=0.15, buffer=32):
+    nx = int(nx)
+    patch_x = int(patch_x)
+    if patch_x > nx:
+        raise ValueError("Real volume inline axis is smaller than patch_x.")
+    if split == "test":
+        return 0, nx - patch_x
+    holdout_start = int(math.floor(nx * (1.0 - float(holdout_fraction))))
+    if split == "validation":
+        low, high = holdout_start, nx - patch_x
+    elif split == "train":
+        low, high = 0, holdout_start - int(buffer) - patch_x
+    else:
+        raise ValueError("real_split must be one of: train, validation, test.")
+    if high < low:
+        raise ValueError(f"No valid {split} inline origins for nx={nx}, patch_x={patch_x}.")
+    return low, high
+
+
+def _open_real_volume(path, real_key):
+    path = Path(path)
+    if path.suffix == ".npy":
+        return np.load(path, mmap_mode="r"), {}
+    group = cast(Any, zarr.open_group(str(path), mode="r"))
+    if real_key not in group:
+        raise KeyError(f"Real Zarr '{path}' lacks array key '{real_key}'.")
+    return cast(Any, group[real_key]), dict(group.attrs)
+
+
+def _real_shape_xyz(volume, axes):
+    axes = str(axes).lower()
+    if len(axes) != 3 or set(axes) != set("xyz"):
+        raise ValueError("--real_axes must be a permutation of xyz.")
+    return tuple(int(volume.shape[axes.index(axis)]) for axis in "xyz")
+
+
+def _extract_real_patch(volume, origin_xyz, patch_size_xyz, axes):
+    axes = str(axes).lower()
+    origins = dict(zip("xyz", (int(v) for v in origin_xyz)))
+    sizes = dict(zip("xyz", (int(v) for v in patch_size_xyz)))
+    source_slices = tuple(slice(origins[axis], origins[axis] + sizes[axis]) for axis in axes)
+    patch_source = np.asarray(volume[source_slices], dtype=np.float32)
+    permutation = tuple(axes.index(axis) for axis in "xyz")
+    return np.transpose(patch_source, permutation)
+
+
+def sample_real_patch_store(args, patch_size, sampling_seed):
+    volumes = list_real_volumes(args.source, args.real_volume)
+    if not volumes:
+        raise ValueError(f"No .real.zarr or .npy volumes found for real source '{args.source}'.")
+
+    opened = []
+    sample_counts = []
+    for path in volumes:
+        volume, attrs = _open_real_volume(path, args.real_key)
+        axes = str(args.real_axes)
+        attr_axes = attrs.get("axis_order")
+        if attr_axes and args.real_axes == "xyz":
+            mapped = {"inline": "x", "crossline": "y", "z": "z"}
+            normalized = "".join(mapped.get(str(value).lower(), str(value).lower()) for value in attr_axes)
+            if set(normalized) == set("xyz"):
+                axes = normalized
+        shape_xyz = _real_shape_xyz(volume, axes)
+        real_inline_origin_bounds(
+            shape_xyz[0], patch_size[0], args.real_split,
+            holdout_fraction=args.real_holdout_fraction, buffer=args.real_buffer,
+        )
+        opened.append((path, volume, axes, shape_xyz))
+        sample_counts.append(int(np.prod(shape_xyz)))
+
+    weights = np.sqrt(np.asarray(sample_counts, dtype=np.float64))
+    exact = weights / weights.sum() * int(args.n_patches)
+    allocations = np.floor(exact).astype(np.int64)
+    for idx in np.argsort(-(exact - allocations))[: int(args.n_patches) - int(allocations.sum())]:
+        allocations[int(idx)] += 1
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dst = cast(Any, zarr.open_group(str(out), mode="w"))
+    chunks = (1,) + tuple(patch_size)
+    patches_dst = dst.create_array("patches", shape=(args.n_patches,) + tuple(patch_size), dtype="f4", chunks=chunks)
+    vec_chunks = (min(args.n_patches, 2048),)
+    is_real_dst = dst.create_array("is_real", shape=(args.n_patches,), dtype="u1", chunks=vec_chunks)
+    source_idx_dst = dst.create_array("source_volume_index", shape=(args.n_patches,), dtype="i4", chunks=vec_chunks)
+    source_volume_dst = dst.create_array("source_volume", shape=(args.n_patches,), dtype="i4", chunks=vec_chunks)
+    origin_arrays = {
+        axis: dst.create_array(f"origin_{axis}", shape=(args.n_patches,), dtype="i4", chunks=vec_chunks)
+        for axis in "xyz"
+    }
+
+    rng = np.random.default_rng(int(sampling_seed))
+    written = 0
+    rejected = {"std": 0, "zeros": 0, "clipped": 0}
+    for volume_index, ((path, volume, axes, shape_xyz), target_count) in enumerate(zip(opened, allocations)):
+        x_low, x_high = real_inline_origin_bounds(
+            shape_xyz[0], patch_size[0], args.real_split,
+            holdout_fraction=args.real_holdout_fraction, buffer=args.real_buffer,
+        )
+        accepted = 0
+        attempts = 0
+        max_attempts = max(100, int(target_count) * int(args.real_max_attempt_factor))
+        while accepted < int(target_count) and attempts < max_attempts:
+            attempts += 1
+            origin = (
+                int(rng.integers(x_low, x_high + 1)),
+                int(rng.integers(0, shape_xyz[1] - patch_size[1] + 1)),
+                int(rng.integers(0, shape_xyz[2] - patch_size[2] + 1)),
+            )
+            patch = _extract_real_patch(volume, origin, patch_size, axes)
+            patch_std = float(np.std(patch))
+            if not np.isfinite(patch_std) or patch_std < float(args.min_patch_std):
+                rejected["std"] += 1
+                continue
+            if float(np.mean(patch == 0)) > float(args.max_zero_fraction):
+                rejected["zeros"] += 1
+                continue
+            if float(np.mean(np.abs(patch) >= float(args.clip_abs))) > float(args.max_clipped_fraction):
+                rejected["clipped"] += 1
+                continue
+            patches_dst[written] = (patch / max(patch_std, 1e-8)).astype(np.float32)
+            is_real_dst[written] = np.uint8(1)
+            source_idx_dst[written] = np.int32(volume_index)
+            source_volume_dst[written] = np.int32(volume_index)
+            for axis, value in zip("xyz", origin):
+                origin_arrays[axis][written] = np.int32(value)
+            written += 1
+            accepted += 1
+        if accepted != int(target_count):
+            raise RuntimeError(f"Accepted only {accepted}/{target_count} patches from {path} after {attempts} attempts.")
+
+    dst.attrs.update({
+        "source_format": "real",
+        "source_volumes": [str(path) for path in volumes],
+        "source_axes": [axes for _, _, axes, _ in opened],
+        "split": str(args.real_split),
+        "patch_size": list(patch_size),
+        "sampling_seed": int(sampling_seed),
+        "holdout_fraction": float(args.real_holdout_fraction),
+        "inline_buffer": int(args.real_buffer),
+        "scaling_mode": "divide_by_std",
+        "scaling_mean": 0.0,
+        "scaling_std": 1.0,
+        "n_written": int(written),
+        "rejected_counts": rejected,
+    })
+    print(f"Wrote {written} real {args.real_split} patches to {out}; rejected={rejected}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True, help="directory that contains model_data.zarr folders")
+    p.add_argument("--source_format", choices=["synthetic", "real"], default="synthetic")
+    p.add_argument("--real_volume", action="append", default=[], help="Additional .real.zarr/.npy volume or directory (repeatable).")
+    p.add_argument("--real_key", default="volume")
+    p.add_argument("--real_axes", default="xyz", help="Source-axis order as a permutation of xyz.")
+    p.add_argument("--real_split", choices=["train", "validation", "test"], default="train")
+    p.add_argument("--real_holdout_fraction", type=float, default=0.15)
+    p.add_argument("--real_buffer", type=int, default=32)
+    p.add_argument("--min_patch_std", type=float, default=1e-6)
+    p.add_argument("--max_zero_fraction", type=float, default=0.05)
+    p.add_argument("--max_clipped_fraction", type=float, default=0.01)
+    p.add_argument("--clip_abs", type=float, default=32000.0)
+    p.add_argument("--real_max_attempt_factor", type=int, default=50)
     p.add_argument("--out", required=True)
     p.add_argument("--patch_size", type=int, nargs='+', default=[32], help="Patch size: one value for cubic or three values X Y Z")
     p.add_argument("--n_patches", type=int, default=5000)
@@ -891,6 +1069,10 @@ def main():
     # Separate stream so dip sampling never changes patch origins for a given seed.
     dip_rng = np.random.default_rng([sampling_seed, 1])
     print(f"Sampling seed: {sampling_seed}")
+
+    if args.source_format == "real":
+        sample_real_patch_store(args, patch_size, sampling_seed)
+        return
 
     class_quotas = parse_class_quotas(args.class_quotas) if args.class_quotas else dict(DEFAULT_CLASS_QUOTAS)
     shares = normalize_shares(class_quotas, args.background_fraction)

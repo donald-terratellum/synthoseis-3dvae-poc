@@ -226,7 +226,7 @@ Candidate encoders (all keep `latent_dim` 128):
 | E0 | conv | — | 16-32-32-64-64 | 1 each | 64×4×4×8 | 8,192 | current |
 | E1 | residual | — | 16-32-32-64-64 | 1 each | 64×4×4×8 | 8,192 | exists, not tested with geology losses |
 | E2 | resnetv2 | pretrain_v2 | 32 64 128 | deeper 3 5 8 | 512×2×2×4 | 8,192 | r006 layout; **weight transfer possible** |
-| E3 | resnetv2 | light | 32 64 128 | deeper 3 5 8 | 512×4×4×8 | 32,768 | more spatial detail; bigger FC (4.2 M each), or add a 1×1 conv to 128 ch first; stem not transferable |
+| E3 | resnetv2 | light | 32 64 128 | deeper 3 5 8 | 512×4×4×8 | 65,536 | more spatial detail; 8.39 M weights in each latent projection; stem not transferable |
 | E4 | resnetv2 | pretrain_v2 | 40 80 160 | deeper 3 5 8 | 640×2×2×4 | 10,240 | r004 layout, transfer possible |
 
 4-level pretrain-v2 encoders reduce 32×32×64 to 1×1×2, which is too small; they are not used
@@ -330,8 +330,10 @@ control rather than being dropped.
 with LPIPS on the existing vertical planes only and no valid-voxel masking. Per-component loss
 logging (`train_mae`, `train_tv`, `train_gdl`, etc.) also does not exist; only the combined
 `loss` value is logged. This was sufficient for P1 (no geometric augmentation was active, so
-there were no invalid edge voxels to mask), but WP2 is not fully built and should be finished
-before any run that needs `--lpips_planes orthogonal` or the valid-voxel mask (P5 onward).
+there were no invalid edge voxels to mask), but WP2 is not fully built. P5/P6 use the unchanged
+P0b MAE + vertical LPIPS recipe with phase rotation and stretch disabled, so they do not require
+orthogonal LPIPS or the geometric valid-voxel mask. Those WP2 features remain prerequisites for
+any later run that explicitly enables them.
 
 ---
 
@@ -579,14 +581,30 @@ on the frozen manifest.
   trip; tokenizer adapter loads each variant and returns the same `z_geo` as the training model;
   parameter count logged.
 
+**Implementation status (2026-10-01):** `VAE3D` supports conv, residual, and ResNetV2 trunks,
+configurable widths/depth/norm/stem/input axes, and a skip-free configurable decoder with conv or
+ResNetV2 residual refinement blocks. Old E0 defaults retain their state-dict layout. The tokenizer
+adapter reconstructs architecture-configured checkpoints. E1–E4 shape/latent/finite-forward tests,
+low-variance normalization, and adapter parity tests pass.
+
 ### WP6 — Pretrained encoder transfer
 
 - Section 3.2.
 - Tests: all `encoder.*` tensors from a synthetic pretrain-v2-style state dict are copied
   exactly; a shape mismatch raises; `zxy` input axes give the same output as manually permuting
   the input; frozen epochs leave trunk weights unchanged and the optimizer skips them.
-- Smoke test on a real pretrain-v2 checkpoint (r006 `best_val_epoch.pt`) on MPS: one forward /
-  backward at batch 12 + 2 real.
+
+**Implementation status (2026-10-01):** `--init_encoder_from` prefers `ema_state.shadow`, copies
+only `encoder.*` into `encoder.trunk.*`, and rejects missing, extra, or shape-mismatched tensors.
+The real r006 checkpoint loaded all 150 encoder tensors (epoch 84; 10 `train_paths`). `zxy`
+permutation, scheduled freezing/unfreezing, checkpoint provenance, and architecture-aware resume
+checks are implemented. A two-epoch MPS smoke run loaded r006, trained with `K=0`, froze for one
+epoch, unfroze, and completed; a second-stage resume also passed.
+
+P5/P6 runners are `scripts/p5_encoder_transfer_suite.sh` (P5a/P5b) and
+`scripts/p6_encoder_scratch_suite.sh`. They use the P0b recipe, disable phase rotation and
+stretch, omit real training data (`K=0`), and use real validation/test stores only for MAE
+guardrails. `PRINT_COMMANDS=1` renders commands without starting training.
 
 ### WP7 — Suite script and docs
 
@@ -625,8 +643,8 @@ sets, unless stated.
 | P2 | aug | P0b unchanged + phase rotation (p 1.0, triangular −60°/0°/40°) | WP3 | n@5 up; else drop |
 | P3 | aug | P0b unchanged + zoom-in stretch; keep dip policy `adjust`, omit rejected phase rotation | WP3 | n@5 up in two seeds; else drop |
 | P4 | real | Best accepted current-architecture recipe (P0b unless P3 wins) + real recon (K = 2) | WP4 | real MAE down with n@5 not worse |
-| P5 | arch | **E2 transfer**: two stages — recon (P1–P4 recipe, synthetic + real, 60–150 epochs, frozen trunk first 5) then geology fine-tune (Phase 2 + classifier, 40 epochs). P5a: stage 1 with classifier weight 0.05; P5b: stage 1 without | WP5, WP6 | n@5 > best so far in 2 seeds |
-| P6 | arch | E2 from scratch, same two stages (control for transfer, D1) | WP5 | explains transfer gain |
+| P5 | arch | **E2 transfer**: two stages — P0b reconstruction recipe on synthetic data (60–150 epochs, trunk frozen first 5), then Phase 2 + classifier (40 epochs); phase/stretch off, no real mixing. P5a: stage 1 classifier weight 0.05; P5b: stage 1 weight 0 | WP5, WP6 | n@5 > best so far in 2 seeds |
+| P6 | arch | E2 from scratch, same P0b two-stage recipe as P5a; phase/stretch off, no real mixing (control for transfer, D1) | WP5 | explains transfer gain |
 | P7 | arch | E1 residual and E3 light stem, best of the P5/P6 pipeline | WP5 | n@5 > best so far |
 | P8 | arch | E4 wider (40-80-160) transfer | WP5, WP6 | only if P5 wins |
 | P9 | decoder | Best so far + voxel geology decoder (Section 3.5) | WP8 | n@5 > best so far in 2 seeds; voxel mean Dice reported |
@@ -671,14 +689,37 @@ peaked at n@5 **0.0130** at epoch 30 (n@10 0.0207; macro AUROC 0.628), clearing 
 (n@10 0.0169; macro AUROC 0.629), below its P0b 0.0109. The best-per-run mean was 0.01081
 versus P0b 0.01146; the gain did not reproduce. Do not adopt or carry zoom-in stretch forward.
 
-**Next recommended step (as of 2026-09-30):** retain unchanged P0b as the current-architecture
-recipe. The P3 implementation and result are committed and pushed in `2d81e6b`. Implement WP4
-real-seismic sampling and mixed batching next: verify source axes and spatial hold-outs, write
-real train/validation/test patch stores, ensure real samples contribute only reconstruction loss,
-and enforce `12 synthetic + K real` batches. After smoke tests and real-split overlap checks,
-run P4 with `K=2` from P0b, phase rotation and zoom-in stretch off. Start one seed; replicate
-only if real MAE improves without worsening v2 n@5. Encoder work (P5–P8) remains gated on the
-P4 decision.
+**P4 status (2026-10-01): rejected after seed 1.** WP4 now supports axis-aware real sampling,
+square-root source allocation, quality rejection, per-patch standard-deviation scaling, and
+buffered inline train/validation splits. Training appends `K` uniformly sampled real examples
+to the unchanged synthetic batch and excludes their latent vectors from all geology and GAN
+losses. The full suite passes (226 tests). P4 seed `20260925`, with `K=2`, phase rotation off,
+and stretch off, peaked at n@5 **0.01094** and n@10 **0.01979** at epoch 20, below its P0b
+control (n@5 0.01198, n@10 0.02214 at epoch 30). Real validation MAE moved from 0.71325 at
+epoch 1 to a best of 0.70821; real test MAE moved from 0.67762 to a best of 0.67208. The real
+reconstruction gain does not clear the primary geology-retrieval gate, so do not replicate P4
+or carry real mixing into P5. Retain unchanged P0b as the current-architecture recipe.
+
+**P5/P6 status (2026-10-03): completed, seed 20260925 only; not adopted.** All three arms
+completed 60 reconstruction epochs, 40 geology epochs, and four frozen-manifest reports.
+P5a best n@5 was 0.011719 at epoch 40 (n@10 0.019661; classifier AUROC 0.7755).
+P5b best n@5 was 0.011198 at epoch 40 (n@10 0.020573; AUROC 0.7675).
+P6 best n@5 was 0.010938 at epoch 30 (n@10 0.023177; AUROC 0.7677).
+None beats P0b seed 20260925 n@5 0.011979. Best synthetic val losses were
+0.356375/0.356796/0.354272, versus P0b 0.218987 (62-63% worse); best real-test MAEs
+were 0.717662/0.710287/0.717474. These minima are not necessarily from retrieval-selected
+epochs. A matching P0b real-test baseline still needs evaluation. Classifier improvement
+does not qualify an arm for adoption. Retain P0b; pause replication and P8.
+
+**Next recommended step (2026-10-03):** execute Section 9.2 reconstruction diagnostics.
+P5/P6 changed the decoder as well as the encoder; do not attribute regression solely to
+encoder capacity or presume a bug. P7 E1/E3 is considered after the diagnostic decision;
+P8 still requires P5 to win. No long training run is authorized by this diagnostic package.
+
+**Previous recommendation (2026-10-01; superseded):** P1–P4 have not produced a repeatable n@5 gain.
+If continuing the transfer plan, proceed to the separately gated P5/P6 encoder comparison using
+the unchanged P0b recipe, without phase rotation, zoom-in stretch, or real mixing. Do not select
+P4 based on its real-MAE improvement because its primary frozen-manifest metric regressed.
 
 P1–P4 are cheap warm-start runs on the current architecture and give the loss and augmentation
 settings that P5–P8 then use. P5–P8 need a new reconstruction stage because the trunk changes;
@@ -718,43 +759,66 @@ uv run python scripts/sample_patches.py \
   --holdout_out data/real_val_32-32-64.zarr
 ```
 
-P5 stage 1 (reconstruction, transferred encoder):
+P5/P6 runner examples (two-stage, P0b recipe; real data is metrics-only):
 
 ```bash
-uv run python scripts/train.py \
-  --data data/synth_train_anchored_32-32-64.zarr \
-  --validation_data data/synth_val_v2_uniform_32-32-64.zarr \
-  --real_data data/real_train_32-32-64.zarr --real_batch_count 2 \
-  --real_validation_data data/real_val_32-32-64.zarr \
-  --real_test_data data/real_test_32-32-64.zarr \
-  --patch_size 32 32 64 --batch_size 12 --number_batches 450 --epochs 150 --seed 20260927 \
-  --encoder_arch resnetv2 --encoder_hidden_dims 32 64 128 --encoder_depth_profile deeper \
-  --encoder_norm instance --encoder_stem pretrain_v2 --encoder_input_axes zxy \
-  --decoder_block res \
-  --init_encoder_from /Volumes/CrucialX9/pretrain_v2_checkpoints/sweep_20260620_080306_r006_u3_h32-64-128_lp0p000_tv0p001/best_val_epoch.pt \
-  --freeze_encoder_epochs 5 --encoder_lr_mult 0.1 \
-  --augment --vertical_warp_prob 0.5 --phase_rotation_prob 1.0 --dip_label_policy mask \
-  --input_scaling divide_by_std \
-  --learning_rate 5e-4 --weight_decay 1e-4 \
-  --kl_schedule warmup --kl_start 0 --kl_end 1e-3 --kl_warmup_epochs 15 \
-  --reconstruction_loss multi_component --recon_mae_weight 0.995 --lpips_weight 0.005 \
-  --lpips_planes orthogonal \
-  --geology_classifier --geology_classifier_mode patch --geology_classifier_weight 0.05 \
-  --geology_classifier_loss focal --geology_classifier_focal_gamma 2.0 \
-  --lr_scheduler plateau --lr_scheduler_patience 6 --lr_scheduler_factor 0.5 --lr_scheduler_min_lr 1e-5 \
-  --early_stopping_patience 20 --save_epoch_checkpoints \
-  --out_dir checkpoints/pv2_transfer_e2_recon_20260927
+SEED=20260925 scripts/p5_encoder_transfer_suite.sh
+SEED=20260925 scripts/p6_encoder_scratch_suite.sh
 ```
 
-P5 stage 2 is the 2026-09-25 plan Section 8.3 command with `--resume <stage-1 best>
---resume_epoch 0`, the arch flags above, the P1–P4 loss/augmentation settings, and the v2
-validation set. Benchmark each saved epoch with
-`scripts/evaluate_geology_benchmark.py --use_geo_embedding --data data/synth_val_v2_32-32-64.zarr
---manifest docs/benchmarks/frozen_validation_manifest_v2.json` plus
-`scripts/evaluate_real_reconstruction.py`. The values in the command above (loss weights,
-`--vertical_warp_prob`, phase) are placeholders for the P1–P4 winners.
+Override `RECON_EPOCHS`, `GEOLOGY_EPOCHS`, `BATCHES`, `OUT_ROOT`, `PRETRAIN_CHECKPOINT`, or
+`PRINT_COMMANDS=1` as needed. P5 runs both classifier ablations; P6 matches P5a from scratch.
 
 ---
+
+### 9.2 Bounded P5/P6 reconstruction regression diagnostics (2026-10-03)
+
+Run `scripts/p5_p6_reconstruction_diagnostics.sh` from the repository root. The script
+uses `set -euo pipefail`, unbuffered Python, and `tee` to capture stdout and stderr in
+`logs/p5_p6_reconstruction_diagnostics.log`. It must fail on missing inputs or failed
+invariants and must not overwrite training checkpoints, the frozen manifest, or datasets.
+Reports are disposable experiment artifacts, not committed benchmark milestones.
+
+**Local hypothesis:** the changed skip-free decoder and/or insufficient reconstruction
+training explains the regression; latent sampling, KL, or axis handling may instead account
+for some of the measured gap. Existing shape tests alone cannot discriminate these causes.
+
+**Inputs and fixed budget:** P0b seed 20260925 epoch 30, P5a/P5b epoch 40, and P6 epoch 30;
+the v2 uniform validation store and existing real-test store. Use the same seed-selected
+32 synthetic and 32 real patches for every checkpoint, batch size 2, seed 20261003.
+Normalize with each store's declared scaling (never double-normalize normalized stores).
+Use CPU by default for reproducible bounded work; threads=2. Allow explicit device and
+sample/step overrides and record them. No augmentation or geology loss during evaluation.
+
+1. Audit all six training CSVs: early/late MAE + LPIPS + KL validation losses, learning
+  rates, minima and late trend. Report whether stage 1 was still improving at its end;
+  this is evidence about undertraining, not proof that more epochs will fix retrieval.
+2. Strictly load full reconstruction weights using saved architecture configuration.
+  Check input/target/output shapes and finiteness. Verify zxy encoder permutation and
+  the decoder inverse with an asymmetric coordinate fixture, not just equal shapes.
+3. On identical patches evaluate `decoder(mu)` and seeded `decoder(z)` independently;
+  report MAE, MSE, vertical LPIPS, per-example KL, reconstruction standard deviation,
+  and zero-output MAE. Report the current recipe total (MAE + 0.1 LPIPS + 0.001 KL).
+  Report synthetic/real deltas against P0b on these same patches; subset results are
+  diagnostics only, not official +2% guardrail certification or adoption evidence.
+4. Fit the existing checkpoint decoder for 40 steps on two fixed synthetic patches with
+  cached, detached mu. Use MAE only, Adam at 1e-3, no encoder updates or checkpoint writes.
+  Compare native P5a and P6 decoders with fresh legacy `Decoder` modules fed the same mu;
+  include the trained P0b decoder as a sanity control. Log initial, every 10 steps, and
+  final MAE and gradients. Compare learning progress, not just absolute endpoints: the
+  fresh legacy decoder and trained native decoder have different initial conditions.
+5. Emit a JSON report and a concise console summary. No definitive cause is inferred from
+  a small subset or short fit. Axis/load failures block further experiments; a dominant
+  sampled-minus-mean gap motivates a latent/KL investigation; poor native fitting relative
+  to a fresh legacy decoder motivates an independently initialized decoder ablation;
+  continuing late-stage improvement motivates a separately approved longer warmup.
+
+**Test gate:** fixture tests for axis inversion, component/total arithmetic, deterministic
+patch selection, and decoder-only fitting with encoder tensors unchanged; focused tests,
+then `.venv/bin/python -m unittest discover -s tests`. Execute the actual bash diagnostic
+and record its results in the session handoff. Do not start P7/P8 or modify production
+architecture/loss defaults automatically. Official full-set reconstruction evaluation and
+two-seed frozen-manifest retrieval gates remain required before adoption.
 
 ## 10. Decisions (answered 2026-09-27)
 

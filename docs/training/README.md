@@ -324,10 +324,23 @@ validation volumes) and list them in the `skipped_volumes_missing_labels` attr.
 | `--geology_strata_classes ...` | six classes, no sand | Classes used for presence strata |
 | `--geology_batch_class_quota CLASS=COUNT ...` | none | Minimum patches per batch containing each listed class |
 | `--no_geology_calibration_inclusion_weight` | weighting on | Turn off `inclusion_weight` weighting of the metadata calibration |
+| `--encoder_arch {conv,residual,resnetv2}` | `conv` | Select the E0/E1/E2-E4 encoder family |
+| `--encoder_hidden_dims ...` | architecture default | Per-stage encoder widths |
+| `--encoder_depth_profile {baseline,deeper}` | `baseline` | ResNetV2 block-depth schedule; `--encoder_stage_blocks` overrides it |
+| `--encoder_norm {batch,instance,group}` | architecture default | Encoder normalization |
+| `--encoder_stem {pretrain_v2,light}` | `pretrain_v2` | ResNetV2 7x7 + pool stem or light 3x3 stem |
+| `--encoder_input_axes {xyz,zxy}` | `xyz` | Permute inputs for pretrain-v2 encoder transfer |
+| `--decoder_hidden_dims ...` | inferred | Decoder widths from latent feature grid outward |
+| `--decoder_block {conv,res}` | `conv` | Conv block or ResNetV2-style residual refinement |
+| `--init_encoder_from CHECKPOINT` | none | Copy compatible pretrain-v2 EMA encoder weights into an E2 trunk |
+| `--freeze_encoder_epochs N` | 0 | Freeze encoder for N epochs, then unfreeze at `--encoder_lr_mult` |
 
 Checkpoints store `geology_classifier`, `geology_classifier_mode`, and
 `geology_classifier_hidden`. Warm-starting from a checkpoint without the classifier works.
 The tokenizer ignores the classifier weights.
+Architecture configuration and encoder initialization provenance are saved in checkpoints; the
+tokenizer adapter uses the saved config when rebuilding non-default models. P5/P6 runners are
+`scripts/p5_encoder_transfer_suite.sh` and `scripts/p6_encoder_scratch_suite.sh`.
 
 ### scripts/evaluate_geology_benchmark.py
 
