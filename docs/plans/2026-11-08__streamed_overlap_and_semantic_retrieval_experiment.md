@@ -17,14 +17,14 @@ Confirmed requirements:
 - Perform subsequent implementation and experiments on that new branch.
 - Stream crops directly from synthoseis source datasets; do not require a newly
   materialized training-patch corpus or load whole source cubes into memory.
-- Source root: `/Volumes/CrucialX9/fake_data`. Its `validation`, `test`, and planned
+- Source root: `/Volumes/CrucialX9/fake_data`. Its `validation`, `test`, and
   `test_synthoseis` subfolders are holdouts, not training sources. Exclude all three from recursive
   training discovery, including any optional real-data reconstruction path.
 - Maintain full-VAE reconstruction training alongside the paired-view objective.
 - Approximately 50% of pairs should be two views of the same source window, possibly
   translated; the other 50% should be different windows or volumes.
 - Same-source views should tolerate horizontal rotations, horizontal flips, X/Y
-  swapping, modest XYZ resizing, bandlimited noise, amplitude scaling, and translation.
+  swapping, modest XYZ resizing, bandlimited noise, and translation.
 - Predict overlap in [0, 1], including the stated 32-sample depth-offset example.
 - Evaluate tokenizer behavior during training, not just the auxiliary loss.
 - Predict a separate layering-match value that includes reservoir fluid fill. Gas sand
@@ -167,22 +167,20 @@ Required examples for shape (32, 32, 64):
 | Offset | Expected overlap |
 | --- | --- |
 | (0, 0, 0) | 1.0 |
-| (0, 0, 32) | 0.5 |
 | (8, 8, 16) | 0.421875 |
 | (32, 0, 0) | 0.0 |
 | (-8, 0, 0) | 0.75 |
 | Any offset, different volume IDs | 0.0 |
 
 Recommended first definition: calculate overlap from the canonical equal-sized source
-windows BEFORE nuisance transforms. Rotations, flips, resampling, noise, and gain do
-not alter this label. Thus the target is canonical overlap, not the geometric overlap
-of the final transformed voxel supports. This distinction needs user confirmation.
+windows BEFORE nuisance transforms. Rotations, flips, resampling, and noise do not
+alter this label. Thus the target is canonical overlap, not the geometric overlap of
+the final transformed voxel supports. This distinction needs user confirmation.
 
 For each batch, use half same-source pairs and half negative pairs; use an even batch
 size for an exact ratio. Same-source pairs include an explicit zero-shift subset.
 At a maximum shift of 25% along each axis, their overlap is at least 0.421875.
-The requested 50% depth shift is a mandatory validation case but is outside that
-training range. Expanding the training range requires an explicit decision.
+Expanding the training range requires an explicit decision.
 
 Negative policy must distinguish:
 
@@ -253,11 +251,10 @@ Do not flip Z unless separately approved.
 
 | Transform | Proposed range and cautions |
 | --- | --- |
-| Horizontal rotation | Continuous azimuth about Z, or 90-degree rotations as a simpler first ablation; confirm choice |
-| X/Y flips and swap | Reflections and horizontal axis exchange; confirm whether absolute strike direction should be ignored |
+| Horizontal rotation | Continuous azimuth about Z |
+| X/Y flips and swap | Reflections and horizontal axis exchange |
 | XYZ resize | 0.9-1.1, resampled to the fixed model input shape; Z changes wavelet/bed thickness and dip |
-| Bandlimited noise | -24 to -12 dB; define filter axes/band and reference RMS before implementation |
-| Amplitude gain | 0.9-1.1; positive scalar gain is mathematically canceled by per-patch std normalization |
+| Bandlimited noise | -30 to -12 dB; additive noise provides slight post-normalization variation; define filter axes/band and reference RMS before implementation |
 | Translation | Integer source-origin shift up to 25% of each dimension in the literal proposal |
 | Phase/polarity | Existing phase augmentation is available; inclusion is optional, not yet approved |
 
@@ -432,7 +429,7 @@ Tests must cover:
 - Streaming reads bounded by required context; no full-array conversion in training.
 - Worker seed uniqueness, deterministic manifests, cache limits, and resumed sampling.
 - Horizontal transforms without Z reversal, noise RMS/band, and no label-dependent artifacts.
-- Dense target versus extrema input normalization, gain cancellation, and invalid/empty crops.
+- Dense target versus extrema input normalization and invalid/empty crops.
 - Finite forward/backward losses; overlap gradients reach the primary encoder.
 - Pair symmetry, prediction bounds, embedding collapse diagnostics, and head/adapter parity.
 - Old checkpoint loading, resumed new checkpoint equivalence, and old CLI/default behavior.
@@ -468,7 +465,7 @@ long-running training job. The plan is saved; implementation is a separate next 
 
 The user clarified that the second predicted value should describe how much of A's
 layering is duplicated in B, including fluid fill. Gas sand versus the same horizon
-in a brine-filled aquifer is not a match. Thus rotation/shape robustness must not erase
+in a brine-filled aquifer is not a match. The same is true for gas vs oil, and oil vs brine. Thus rotation/shape robustness must not erase
 fluid-sensitive seismic information.
 
 Further confirmed requirements:
@@ -578,13 +575,13 @@ Use labeled synthetic tests and real-domain tests as complementary evidence.
 
 ## 14. New labeled synthetic test collection
 
-The user will generate additional synthoseis test datasets and proposed the folder
+Thirty additional synthoseis test datasets now exist in
 `/Volumes/CrucialX9/fake_data/test_synthoseis`.
 
-Recommended initial collection: **30 independently generated volumes**. This is a
-practical evaluation starting point, not a power calculation or a guarantee of narrow
-confidence intervals. Volume-level diversity and paired, source-volume-aware uncertainty
-matter more than large numbers of correlated crops.
+The collection has the recommended initial size of **30 independently generated
+volumes**. This is a practical evaluation starting point, not a power calculation or a
+guarantee of narrow confidence intervals. Volume-level diversity and paired,
+source-volume-aware uncertainty matter more than large numbers of correlated crops.
 
 Generation checklist:
 
