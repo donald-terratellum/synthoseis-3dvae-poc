@@ -17,7 +17,7 @@ retrieval manifest, and pick the best variant to carry forward.
 
 ## Key outcome / DECISION
 
-**Winner: Phase 2 epoch-20** — `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
+**Winner: Phase 2 epoch-20** — `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
 
 - It is the best model for the *actual* goal (rank retrieval of geologically similar
   patches). It is a complete, fully-trained checkpoint — ready to use now.
@@ -113,7 +113,7 @@ You may execute the following without further clarification. Read
 
 ### Immediate adoption (already-decided deliverable)
 
-- The chosen model is `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`.
+- The chosen model is `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`.
 - Verify it still benchmarks at n@5 ≈ 0.139 before wiring it into the app:
 
 ```bash
@@ -121,7 +121,7 @@ cd /Users/donaldpg/synthoseis-3dvae-poc
 .venv/bin/python scripts/evaluate_geology_benchmark.py \
   --data data/synth_val_32-32-64.zarr \
   --manifest docs/benchmarks/frozen_validation_manifest.json \
-  --checkpoint checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt \
+  --checkpoint /Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt \
   --use_geo_embedding \
   --metadata_keys meta_fault_fraction meta_fault_intersection_fraction \
     meta_channel_fraction meta_channel_core_fraction meta_flat_spot_fraction \
@@ -176,7 +176,7 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/train.py \
   --validation_data data/synth_val_32-32-64.zarr \
   --patch_size 32 32 64 --batch_size 12 --number_batches 450 \
   --epochs 40 --seed 20260826 \
-  --resume checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt --resume_epoch 0 \
+  --resume /Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt --resume_epoch 0 \
   --geology_metadata_keys meta_fault_fraction meta_fault_intersection_fraction \
     meta_channel_fraction meta_channel_core_fraction meta_flat_spot_fraction \
     meta_onlap_fraction meta_onlap_variability \
@@ -186,7 +186,7 @@ PYTHONUNBUFFERED=1 .venv/bin/python scripts/train.py \
   --geology_batch_hard_fraction 0.30 --encoder_lr_mult 0.1 \
   --augment --vertical_warp_prob 0.5 --mixup_augment_prob 0.0 \
   --early_stopping_patience 999 --save_epoch_checkpoints \
-  --out_dir checkpoints/geoaware_v3_phase2d_20260831 \
+  --out_dir /Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2d_20260831 \
   2>&1 | tee /tmp/geoaware_v3_phase2d.log
 ```
 
@@ -213,7 +213,7 @@ n@5 0.131 (epochs 20/30) and epoch 40 mildly overfit (0.123). The recipe has **c
 small *positive* `cosine_separation` (+0.004…+0.007 vs P2's −0.009), confirming more
 contrastive training firms up absolute contrast slightly, but not the ranking metric.
 
-**Final deliverable (unchanged): `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`.**
+**Final deliverable (unchanged): `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`.**
 To exceed 0.139, a structural change is required (harder negative mining, more/diverse data,
 bigger projection head, richer geology labels) — not more epochs. See
 `docs/training/2026-09-01_geo-aware_improvement_plan.md`.

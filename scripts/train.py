@@ -1532,7 +1532,7 @@ def clamp_float(value, lower, upper):
     return max(lower, min(upper, value))
 
 
-def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=None):
+def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=None, training_state=None):
     payload = {
         'model_state_dict': model.state_dict(),
         'patch_shape': [int(v) for v in model.patch_shape],
@@ -1552,6 +1552,8 @@ def build_checkpoint_payload(model, epoch=None, geology_metadata_calibration=Non
         payload['epoch'] = int(epoch)
     if geology_metadata_calibration is not None:
         payload['geology_metadata_calibration'] = geology_metadata_calibration
+    if training_state is not None:
+        payload['training_state'] = training_state
     return payload
 
 
@@ -2089,6 +2091,9 @@ def train_one_epoch(
         except StopIteration:
             batch_iter = iter(dataloader)
             batch = next(batch_iter)
+        record_consumed = getattr(getattr(dataloader, 'batch_sampler', None), 'record_consumed', None)
+        if callable(record_consumed):
+            record_consumed()
         geology_metadata_batch = None
         if isinstance(batch, (list, tuple)) and len(batch) == 3:
             inputs, targets, geology_metadata_batch = batch
@@ -2557,6 +2562,14 @@ def build_train_dataloader(
     geology_background_key_indices=(),
     presence_strata=None,
 ):
+    if bool(getattr(args, 'paired_sampling', False)):
+        from scripts.p7_control import PairedBatchSampler
+        if sample_weights is not None or bool(args.geology_batch_sampler):
+            raise ValueError('paired_sampling is for uniform reconstruction batches only')
+        batches = int(args.number_batches or (len(dataset) // args.batch_size))
+        sampler = PairedBatchSampler(len(dataset), int(args.batch_size), batches, int(args.seed))
+        generator = torch.Generator().manual_seed(int(args.seed))
+        return DataLoader(dataset, batch_sampler=sampler, generator=generator, num_workers=2)
     if bool(getattr(args, 'geology_batch_sampler', False)):
         if not getattr(dataset, 'include_metadata', False):
             raise ValueError('geology_batch_sampler requires metadata-enabled training dataset.')
@@ -3147,6 +3160,7 @@ def train(args):
     discriminator = build_discriminator(args)
     device = resolve_device(args.device)
     resume_completed_epochs = 0
+    resumed_training_state = None
 
     if args.resume is not None:
         ckpt_path = Path(args.resume)
@@ -3213,6 +3227,10 @@ def train(args):
                 f'invalid missing keys={invalid_missing}, invalid unexpected keys={invalid_unexpected}'
             )
         checkpoint_epoch = checkpoint.get('epoch', None)
+        if bool(getattr(args, 'resume_training_state', False)):
+            resumed_training_state = checkpoint.get('training_state')
+            if not isinstance(resumed_training_state, dict):
+                raise ValueError('--resume_training_state requires a checkpoint containing training_state')
         setattr(model, 'encoder_init_metadata', dict(checkpoint.get('encoder_init', {})))
         if isinstance(checkpoint.get('geology_metadata_calibration', None), dict):
             geology_metadata_calibration = checkpoint['geology_metadata_calibration']
@@ -3307,11 +3325,23 @@ def train(args):
         f"latent_dim={model.latent_dim}",
         f"base_ch={model.base_ch}",
     )
+    if args.reconstruction_loss == 'multi_component':
+        reconstruction_components = (
+            f"mae_weight={args.recon_mae_weight:.4f}",
+            f"tv_weight={args.recon_tv_weight:.4f}",
+            f"gdl_weight={args.recon_gdl_weight:.4f}",
+        )
+    elif args.reconstruction_loss == 'mae':
+        reconstruction_components = ('mae_weight=1.0000',)
+    else:
+        reconstruction_components = (
+            f"mse_weight={args.loss_mse_weight:.4f}",
+            f"pmse_weight={1.0 - args.loss_mse_weight:.4f}",
+        )
     print(
         'Reconstruction loss:',
         f"type={args.reconstruction_loss}",
-        f"mse_weight={args.loss_mse_weight:.4f}",
-        f"pmse_weight={1.0 - args.loss_mse_weight:.4f}",
+        *reconstruction_components,
         f"lpips_weight={args.lpips_weight:.4f}",
     )
     representative_percentiles = (
@@ -3494,6 +3524,22 @@ def train(args):
     if migrate_metrics_csv_if_needed(metrics_csv_path, METRICS_CSV_COLUMNS):
         print(f"Migrated metrics CSV schema at {metrics_csv_path}")
     csv_exists = metrics_csv_path.exists()
+    if bool(getattr(args, 'save_training_state', False)):
+        if args.use_discriminator or args.adaptive_sampling_by_mse or args.geology_batch_sampler or not args.paired_sampling:
+            raise ValueError('training-state checkpoints currently require paired uniform reconstruction without GAN/adaptive/geology sampling')
+    if bool(getattr(args, 'resume_training_state', False)):
+        if resumed_training_state is None:
+            raise ValueError('--resume_training_state requires --resume')
+        from scripts.p7_control import PairedBatchSampler, restore_training_state
+        settings = {key: getattr(args, key) for key in ('data', 'batch_size', 'number_batches', 'seed', 'paired_sampling', 'reconstruction_loss', 'lpips_weight', 'geology_classifier_weight')}
+        if resumed_training_state.get('settings') != settings:
+            raise ValueError('full training-state resume requires matching data, sampler and objective settings')
+        restore_training_state(resumed_training_state, opt, scheduler, getattr(dl, 'generator', None), early_stopping)
+        paired_sampler = dl.batch_sampler
+        if not isinstance(paired_sampler, PairedBatchSampler):
+            raise ValueError('full training-state resume requires the paired batch sampler')
+        paired_sampler.seen.update(resumed_training_state.get('sample_seen', []))
+        print('Restored optimizer, scheduler, CPU/MPS/Python/NumPy RNG, loader RNG, coverage and early-stopping state.')
     training_start_time = time.time()
     with metrics_csv_path.open('a', newline='') as csv_file:
         csv_writer = csv.writer(csv_file)
@@ -3644,6 +3690,10 @@ def train(args):
 
             current_lr = opt.param_groups[0]['lr']
             current_disc_lr = disc_opt.param_groups[0]['lr'] if disc_opt is not None else float('nan')
+
+            if args.reconstruction_diagnostic_interval > 0:
+                from scripts.diagnose_p5_p6_reconstruction import run_training_diagnostic
+                run_training_diagnostic(model, args, device, epoch_number, lpips_loss_fn)
 
             writer.add_scalar('train/loss', float(train_loss), epoch_number)
             writer.add_scalar('train/lpips_loss', float(train_lpips_loss), epoch_number)
@@ -3879,6 +3929,28 @@ def train(args):
                 if class_stats:
                     print('  sampler class stats: ' + ' '.join(f"{k[len('class_'):]}={v:.3f}" for k, v in class_stats.items()))
 
+            if bool(getattr(args, 'paired_sampling', False)):
+                from scripts.p7_control import write_sampling_audit
+                write_sampling_audit(dl.batch_sampler, args.data, Path(args.out_dir) / f'sampling_epoch{epoch_number}.json')
+            if bool(getattr(args, 'save_training_state', False)):
+                from scripts.p7_control import PairedBatchSampler, capture_training_state
+                training_state = capture_training_state(opt, scheduler, getattr(dl, 'generator', None), early_stopping)
+                training_state['settings'] = {key: getattr(args, key) for key in ('data', 'batch_size', 'number_batches', 'seed', 'paired_sampling', 'reconstruction_loss', 'lpips_weight', 'geology_classifier_weight')}
+                paired_sampler = dl.batch_sampler
+                if not isinstance(paired_sampler, PairedBatchSampler):
+                    raise ValueError('training-state save requires the paired batch sampler')
+                training_state['sample_seen'] = sorted(paired_sampler.seen)
+                payload = build_checkpoint_payload(model, epoch_number, geology_metadata_calibration, training_state)
+                destinations = [Path(args.out_dir) / f'vae_epoch{epoch_number}.pt'] if args.save_epoch_checkpoints else []
+                if improved:
+                    destinations.append(best_ckpt_path)
+                destinations.append(Path(args.out_dir) / 'vae_last.pt')
+                for destination in destinations:
+                    temporary = destination.with_suffix('.pt.tmp')
+                    torch.save(payload, temporary)
+                    temporary.replace(destination)
+                csv_file.flush()
+
             if early_stopping.epochs_without_improvement >= args.early_stopping_patience:
                 print(
                     f"Early stopping triggered after epoch {epoch_number} "
@@ -3902,6 +3974,9 @@ if __name__ == '__main__':
     p.add_argument('--real_recon_weight', type=float, default=1.0, help='Relative reconstruction weight for appended real examples.')
     p.add_argument('--batch_size', '--examples_per_batch', dest='batch_size', type=int, default=100)
     p.add_argument('--number_batches', type=int, default=None, help='Number of batches per epoch. If omitted, uses full dataloader length.')
+    p.add_argument('--paired_sampling', action='store_true', help='Independent seed/epoch uniform sample schedule with consumed-index coverage logging.')
+    p.add_argument('--save_training_state', action='store_true', help='Save epoch-boundary optimizer/scheduler/RNG state for paired reconstruction runs.')
+    p.add_argument('--resume_training_state', action='store_true', help='Restore full paired-reconstruction state rather than only model weights.')
     p.add_argument('--learning_rate', '--lr', dest='learning_rate', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-4)
     p.add_argument('--encoder_lr_mult', type=float, default=1.0, help='Multiplier applied to encoder LR relative to --learning_rate.')
@@ -3942,6 +4017,10 @@ if __name__ == '__main__':
     p.add_argument('--zero_cluster_max', type=int, default=12)
     p.add_argument('--resume', type=str, default=None, help='Path to a model checkpoint to resume training from.')
     p.add_argument('--resume_epoch', type=int, default=None, help='Override the completed epoch count used for resumed runs.')
+    p.add_argument('--reconstruction_diagnostic_interval', type=int, default=0, help='Optional fixed-patch component evaluation every N absolute epochs; 0 disables it.')
+    p.add_argument('--reconstruction_diagnostic_samples', type=int, default=32, help='Fixed patches per split for optional reconstruction diagnostics.')
+    p.add_argument('--reconstruction_diagnostic_modes', nargs='+', choices=['clean', 'extrema', 'tokenizer'], default=['clean'])
+    p.add_argument('--reconstruction_diagnostic_train', action='store_true', help='Include fixed training patches in optional component milestones.')
     p.add_argument('--validation_data', type=str, default='data/validation.zarr', help='Path to validation zarr patches.')
     p.add_argument(
         '--skip_data_location_checks',

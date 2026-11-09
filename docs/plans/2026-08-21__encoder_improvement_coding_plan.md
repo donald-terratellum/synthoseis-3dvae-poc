@@ -122,34 +122,33 @@ Acceptance criteria:
 
 ### Phase 2: Encoder-search sweep
 
-1. Create a controlled architecture-search process for the encoder side of the 3D VAE.
-2. Keep the decoder and latent contract as stable as possible.
-3. Search over a bounded set of encoder-side changes such as:
-   - encoder depth profile / block scheduling
-   - channel growth per stage
-   - residual structure vs plain blocks
-   - normalization choices
-   - activation choices
-   - placement of downsampling and feature routing
-   - optional lightweight encoder-side enhancement that does not alter the external latent contract
-4. Use a semi-random but constrained search loop with fixed seeds and a bounded parameter space.
-5. Prioritize changes that improve robustness under heavy augmentation and preserve geologic detail.
-6. Rank candidate architectures using a composite objective that includes:
-   - reconstruction quality
-   - stability under heavy augmentation
-   - latent separation on geology labels
-   - cosine similarity separation for same-vs-different geology examples
-   - tokenizer compatibility and inference stability
+grouped by columns E–H and K–P rather than selecting five repeated epoch rows.
+The initial E1 residual comparison and P5/P6 transfer-vs-scratch experiments did **not** vary
+encoder widths or residual stage counts. The five distinct architecture/loss recipes ranked by
+minimum BA in the upstream spreadsheet (deduplicated on E–H and K–P) have now been screened;
+results and provenance are recorded in [Section 9.11 of the pretrain-v2 transfer plan](2026-09-27__pretrain_v2_encoder_loss_augmentation_transfer_plan.md).
+
+The runner transferred each upstream ResNetV2 encoder into a fresh skip-free POC VAE, ran 60
+real-inclusive reconstruction-only epochs, and evaluated full-tokenizer reconstruction against
+same-seed P0b. All five candidates failed the +2% real-MAE gate. r006/r004 improved synthetic
+recipe total by 14–16% but regressed real MAE by about 5.7%; r007/r001/r011 regressed real MAE by
+about 9.3% and also missed the synthetic guardrail. Therefore no geology-aware stage or
+frozen-manifest retrieval benchmark ran, and this screen establishes no architecture uplift.
 
 Requirements:
+
 - Do not perform arbitrary global redesigns.
 - Do not change the external latent dimension or downstream interface unless absolutely necessary.
 - Follow the precedent from the upstream repo: stage the experiments, validate with tests, and keep the changes explicit and reproducible.
 
-Acceptance criteria:
-- Top 2–3 candidate encoder variants are identified.
-- Each candidate is benchmarked against the baseline.
-- The winner is chosen based on clear evidence, not anecdotal impression.
+Acceptance criteria for any future continuation:
+
+- Propose a new, single-factor hypothesis based on the recorded all-candidate real-MAE regression; do not rerun the same bundles with an arbitrary LR change.
+- Require reconstruction, real-seismic and tokenizer-contract gates before geology fine-tuning.
+- n@5 strictly exceeds the same-seed P0b reference; n@10 is only a tie-breaker.
+- Use a matched-loss P0b-encoder control and independent downstream-seed replication before making an architecture-specific adoption claim.
+
+**Current decision (2026-10-09):** retain P0b. No further architecture/loss run is queued; inspect per-volume tokenizer failures and real-reconstruction contribution before proposing another experiment.
 
 ---
 

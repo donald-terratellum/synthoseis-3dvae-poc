@@ -1,10 +1,32 @@
-# WP0–P6 Transfer Experiments — Verification and Next-Steps Handoff
+# WP0–P7 Transfer Experiments — Verification and Next-Steps Handoff
 
 Started: 2026-09-29
-Updated: 2026-10-03
+Updated: 2026-10-05
 Plan this belongs to: [docs/plans/2026-09-27__pretrain_v2_encoder_loss_augmentation_transfer_plan.md](../plans/2026-09-27__pretrain_v2_encoder_loss_augmentation_transfer_plan.md), Sections 8–9.
 
-## Current status (2026-10-01)
+Checkpoint-location update (2026-10-05): the user moved most archived checkpoint folders
+to `/Volumes/CrucialX9/3dvae-poc_checkpoints`; references to confirmed moved folders now
+use that location. P0a, both P0b folders, and P4 remain under local `checkpoints/` as verified
+on this date. This is a partial relocation, not a blanket root replacement. Historical log
+commands may still show original paths. Runtime runner paths were not changed by this
+documentation update; verify their inputs before rerunning older suites. Mount CrucialX9
+before accessing archived checkpoints.
+
+## Current status (2026-10-05)
+
+P5a/P5b/P6, the P5a extension, and P7's first-seed reconstruction comparison are complete.
+P7 finished both 150-epoch arms and both full-store evaluations, then stopped normally at
+the reconstruction gate. That original suite is no longer active. The separately approved
+E1 geology pilot is now running on MPS (40 epochs, mu128); no pilot retrieval result or
+second seed exists yet. E1 passes the extrema-input gate but both
+arms fail the clean-input gate; E0 also fails extrema. Retain P0b and do not silently override
+the gate, extend E2 duration, or launch P8. The next recommendation is the no-training
+tokenizer input-contract audit in plan Section 9.8 has completed, including all six probes
+and full-store evaluation. E1 passes that exact-input reconstruction comparison; no audit
+process remains. The user subsequently authorized the 40-epoch E1 geology pilot in Section
+9.9 under a prospective exact-tokenizer reconstruction protocol. The pilot is implemented
+and active (verification below), not adopted; the original P7 failed gate is retained.
+The audit alone did not authorize new training. See the October 5 entries below.
 
 The older verification instructions below are retained as provenance; all of their open items
 are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_size=5000`,
@@ -19,16 +41,16 @@ are complete. The frozen v2 manifest matches the 5,000-patch dataset (`dataset_s
 - P2 used `--phase_rotation_prob 1.0 --phase_range -60 0 40`, with each seed warm-started from
   its matching P0b best checkpoint. Best n@5 was 0.0091 and 0.0122 (mean 0.01065), below P0b's
   mean; phase rotation is rejected and must not be carried forward.
-- P2 checkpoints are under `checkpoints/p2_phase_seed20260925` and
-  `checkpoints/p2_phase_seed20260926`. Reports are
+- P2 checkpoints are under `/Volumes/CrucialX9/3dvae-poc_checkpoints/p2_phase_seed20260925` and
+  `/Volumes/CrucialX9/3dvae-poc_checkpoints/p2_phase_seed20260926`. Reports are
   `docs/benchmarks/p2_phase_seed<seed>_ep<10|20|30|40>_zgeo.json`; the combined log is
   `logs/p2_phase_suite.log`.
 - WP3 zoom-in stretch is implemented with label-consistent dip adjustment and no-padding
   enforcement. A real training-Zarr smoke check and all 222 tests pass.
 - P3 seed `20260925` improved to n@5 0.0130, but seed `20260926` regressed to 0.0086. The
   best-per-run mean was 0.01081 versus P0b 0.01146, so zoom-in stretch is rejected.
-- P3 checkpoints are under `checkpoints/p3_zoom_stretch_seed20260925` and
-  `checkpoints/p3_zoom_stretch_seed20260926`; reports follow
+- P3 checkpoints are under `/Volumes/CrucialX9/3dvae-poc_checkpoints/p3_zoom_stretch_seed20260925` and
+  `/Volumes/CrucialX9/3dvae-poc_checkpoints/p3_zoom_stretch_seed20260926`; reports follow
   `docs/benchmarks/p3_zoom_stretch_seed<seed>_ep<10|20|30|40>_zgeo.json`.
 - WP4 real patch stores contain 10,000 train, 2,500 spatial validation, and 5,000 test patches.
   Train/validation use Netherlands1–4 plus Penobscot3D; test uses CostaRica, Poseidon parts 1/2,
@@ -121,7 +143,7 @@ Interpretation:
   training is plausible, but neither a root cause nor a successful fix has been demonstrated.
 - Pylance syntax check, bash syntax, 14 focused tests, full 241-test suite, and diff checks pass.
 
-Recommended next approval: extend only P5a reconstruction warmup toward the plan's
+Previous recommendation (superseded by the completed October 4 extension): extend only P5a reconstruction warmup toward the plan's
 150-epoch ceiling, preserving original artifacts and checking component metrics on the
 same patches. Require a reconstruction gate before another geology stage. No new long
 training, P7/P8, or seed replication was launched during this diagnostic task.
@@ -130,6 +152,378 @@ Run again: `bash scripts/p5_p6_reconstruction_diagnostics.sh`.
 Observe: `tail -n 50 -F logs/p5_p6_reconstruction_diagnostics.log`.
 Overrides: `DEVICE`, `SAMPLES`, `FIT_STEPS`, `BATCH_SIZE`, `SEED`, `LOG_PATH`, `OUT_JSON`,
 and `PYTHON`. Default runner output replaces its diagnostic log/report, not training files.
+
+### Approved 150-epoch extension setup (2026-10-03)
+
+The user authorized P5a reconstruction training to 150 total epochs and external-drive
+checkpoint/log storage. `scripts/p5a_reconstruction_extension.sh` resumes stage-1 epoch 60
+for 90 additional epochs. No stage-2, P7/P8, or replication command is included.
+
+Verified limitation: source checkpoints contain no AdamW moments or scheduler/RNG state.
+The experiment continues weights with reset optimizer/scheduler and restored final learning
+rates (encoder 2.5e-5; decoder/heads 2.5e-4), not an exact uninterrupted continuation.
+Keep this confound in interpreting undertraining. Recipe/architecture and stage-1 classifier
+weight 0.05 are otherwise retained; the trunk is not frozen again.
+
+New checkpoints go to `/Volumes/CrucialX9/3dvae-poc_checkpoints/p5a_reconstruction_150_seed20260925`;
+the log goes to `/Volumes/CrucialX9/3dvae-poc_logs/p5a_reconstruction_150_seed20260925.log`,
+with a workspace symlink in `logs/`. Old artifacts stay in place. CrucialX9 has 886 GiB free,
+versus 54 GiB internal. The runner requires 15 GiB output-drive headroom and refuses overwrites.
+
+Before training: 32-patch comparison against P0b's reconstruction-best checkpoint.
+During training: component JSONs at absolute epochs 90/120/150.
+After training: full 5000 synthetic + 5000 real comparison for P0b, extension best-val, and
+epoch 150, with recorded reconstruction gate. No geology stage launches automatically.
+Reports and checkpoints are local experiment artifacts. All 243 tests and syntax gates pass.
+
+Monitor: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p5a_reconstruction_150_seed20260925.log`.
+
+Launch verified: detached `nohup bash scripts/p5a_reconstruction_extension.sh` runner PID
+98230; training child PID 98294. Preflight and baseline comparison completed, saved
+architecture weights loaded, and epoch numbering resumed at 61 with target 150 on MPS.
+The process was active at the October 3 launch verification; it has now finished. Additional
+launcher output is in the external log folder as `p5a_reconstruction_150_seed20260925.launch.log`.
+Current extension code/documentation changes are uncommitted; last pushed diagnostic commit
+remains `f872e13`. No original checkpoint/log was relocated.
+
+### Extension outcome and next step (2026-10-04)
+
+Completion verified in the external log: both epoch-150 training and the final full-store
+evaluation wrote COMPLETE markers. No training/evaluation/runner process remains. The
+extension CSV contains exactly 90 rows (epochs 61-150); all 90 epoch checkpoints exist.
+Epoch 150 is also the extension's best-val checkpoint, so the two final report arms are
+the same model, not independent results. No additional geology training was launched.
+
+| Full-store clean-input evaluation (5000 patches per split) | P0b recon-best | P5a epoch 150 | Change |
+|---|---:|---:|---:|
+| Synthetic sampled MAE | 0.254361 | 0.501105 | +97.01% |
+| Synthetic recipe total | 0.264555 | 0.519562 | about +96.4% |
+| Real sampled MAE | 0.713747 | 0.746218 | +4.55% |
+
+Both final report arms fail +2%. Report path:
+`/Volumes/CrucialX9/3dvae-poc_logs/p5a_reconstruction_150_seed20260925_full_reconstruction_gate.json`.
+
+Training-validation CSV loss improved from stage-1 epoch 60's 0.391624 to 0.333777 at
+epoch 150, but remains 52.42% above P0b's best 0.218987. The last-ten mean was 0.346810,
+versus 0.345549 for epochs 131-140 (0.36% worse), so there is no sustained late-window
+improvement. On the identical seed-selected 32 clean patches, epoch 60 -> 150 synthetic
+MAE improved only 3.39% (0.558373 -> 0.539430); real MAE improved 1.09%
+(0.753218 -> 0.745011). Do not compare those subset numbers with full-store numbers.
+
+**Evaluation caveat discovered and checked:** the diagnostics feed clean inputs, whereas
+`train.validate` defaults to extrema-only masking for this recipe. CSV validation also
+uses a fixed 1080-patch prefix rather than all 5000 examples. Therefore the final clean-input
+report does not reproduce the CSV validation protocol; do not present it as a full masked-input
+guardrail certificate. A focused paired check used the same 32 indices, original loader,
+extrema-only inputs, no augmentation, and identical seeded latent noise on MPS:
+- Synthetic recipe total: P0b 0.249360, P5a150 0.364212 (+46.06%).
+- Synthetic MAE: P0b 0.239615, P5a150 0.350843 (+46.42%).
+- Real MAE: P0b 0.705859, P5a150 0.757612 (+7.33%).
+Thus the regression also persists under matched masked inputs on this subset. This is
+not a full masked-store evaluation. Log:
+`/Volumes/CrucialX9/3dvae-poc_logs/p5a_reconstruction_150_input_parity_check.log`.
+
+**Decision:** extra reconstruction training with the documented optimizer/scheduler reset
+helped somewhat but did not rescue E2. Undertraining alone is not supported as a sufficient
+explanation; this does not establish a unique root cause or prove that E2 cannot work.
+No further duration-only extension, geology stage, replication, or P8 is recommended.
+
+**Next proposal:** make evaluation input mode explicit (`clean` versus `extrema`), with
+matching targets, scaling, selection and batch policy for every control/candidate. Then
+prepare P7 E1 residual with the original skip-free decoder, matched against a newly trained
+E0 reconstruction control on the same two-stage budget and data. P0b remains the acceptance
+reference but is not a fair from-scratch duration control. Gate reconstruction before any
+geology stage; replicate only a candidate that improves retrieval. E3 remains a later
+spatial-resolution experiment; P8 remains gated on a successful P5 result. These are
+proposals, not launched runs. This outcome review changed documentation only, did not
+rerun the full test suite, and did not commit or push the uncommitted extension changes.
+
+### Pre-P7 audit complete (2026-10-04)
+
+The interrupted validation was completed: 18 focused tests and all 245 tests pass; Python
+syntax, bash syntax and diff checks pass. Executed `bash scripts/pre_p7_readiness_audit.sh`;
+the log ends with COMPLETE and all four expected reports exist. No model training occurred.
+The script evaluates P0b recon-best and P5a epoch150 on 128 fixed synthetic train examples,
+128 fixed validation examples and 128 real-test examples, in both clean/extrema modes.
+Input mode is now explicit in evaluator flags/settings/dataset metadata; targets stay clean.
+
+| Synthetic sampled MAE | P0b | P5a150 |
+|---|---:|---:|
+| Train / clean | 0.286352 | 0.495011 |
+| Validation / clean | 0.267464 | 0.500459 |
+| Train / extrema | 0.274121 | 0.347024 |
+| Validation / extrema | 0.250555 | 0.344187 |
+
+The E2 regression appears on train and val, not simply a low-training/high-validation
+overfit pattern. Their sampling distributions differ, so these small probes are not a
+generalization certificate. Exposure arithmetic: 5400 examples/epoch, 810000 over 150,
+7.5 corpus-equivalent passes. Independent uniform shuffles would imply expected 99.9544%
+unique coverage, but actual historical indices/RNG are unavailable and the extension reseeded.
+Do not report this expectation as measured coverage.
+
+Log: `logs/pre_p7_readiness_audit_20261004.log`.
+Reports: `/Volumes/CrucialX9/3dvae-poc_logs/pre_p7_readiness_audit_20261004/{train,validation}_{clean,extrema}.json`.
+Monitor/review: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/pre_p7_readiness_audit_20261004.log`.
+Reruns require new LOG_PATH/REPORT_DIR because the script refuses overwriting these results.
+
+At audit completion P7 had NOT started and its suite did not exist; this is superseded by
+the implementation/launch entry below. The plan now has
+a concrete implementation/launch specification in Section 9.6 (matched fresh E0/E1,
+legacy decoder, mu128, 150 reconstruction epochs then separately gated 40 geology epochs,
+prospective sample coverage and exact-resume state). Section 9.7 describes a proposed
+128/256 x classifier-off/on factorial and the production-contract caveat; no larger-latent
+training or migration was launched. P0b classifier=0.1/SupCon=0.5 was verified in logs;
+it is not a reconstruction-only comparator. Code and documentation remain uncommitted.
+
+### P7 implementation and launch authorization (2026-10-04)
+
+The user authorized starting P7 when ready. Implemented `scripts/p7_e0_e1_suite.sh` and
+`scripts/p7_control.py`. E0/E1 share initial FC projections/decoder/heads, with the original
+decoder and mu128; parameter counts are 3502436/3793652. Stage 1 is 150 epochs each,
+450 batches of 12, run sequentially on MPS, no new data, phase/stretch/real mixing off.
+First seed is 20260925. Full 5000-example clean/extrema reconstruction comparisons against
+P0b and paired E0 gate both optional 40-epoch geology stages; no automatic seed replication.
+
+New opt-in flags preserve default training behavior: paired index/worker schedules,
+consumed-index/source-volume/cumulative coverage JSONs, both-mode train/val/real milestones,
+and full epoch-boundary optimizer/scheduler/RNG state. Use `--resume_training_state` only
+for same-arm paired reconstruction; geology stage deliberately warm-starts weights.
+Atomic epoch/best/last checkpoints contain resumable state after diagnostics and plotting.
+
+Validation: all 249 tests and 22 focused tests pass; syntax, diff, all-stage dry rendering,
+and real-data MPS smoke pass. One smoke failed on nonexistent latent/base CLI flags
+(removed; train.py hardcodes the required 128/16). Another showed GPU weight differences
+also present in two fresh runs, not a lost-RNG resume defect. Resumed/uninterrupted runs
+restore RNGs/group configuration exactly and reconstruction outputs within 0.0002 absolute
+tolerance; no bit-identical MPS weight claim. Successful log: `logs/p7_smoke_retry2_seed20260925.log`.
+
+New suite root: `/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e0_e1_seed20260925`.
+Aggregate log: `/Volumes/CrucialX9/3dvae-poc_logs/p7_e0_e1_seed20260925.log`, linked into
+workspace `logs/`. Separate E0/E1 reconstruction logs are in that external log folder.
+Command: `bash scripts/p7_e0_e1_suite.sh`; use nohup for independence from the chat.
+Monitor: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_e0_e1_seed20260925.log`.
+The implementation is validated and authorized; the launch verification below records
+the active process, not completion. Changes remain uncommitted and no artifacts are adopted.
+
+Launch verified: `nohup caffeinate -i bash scripts/p7_e0_e1_suite.sh`, detached launcher
+PID 30739, idle-sleep inhibitor PID 30760, active E0 MPS training child PID 30795.
+Preflight and both shared initializations completed. E0 stage 1 started at epoch 1/150;
+E1 has not started and is queued after E0. Full clean/extrema reconstruction gates then
+decide whether both geology stages run. No second-seed or larger-mu run is queued.
+Launcher output: `/Volumes/CrucialX9/3dvae-poc_logs/p7_e0_e1_seed20260925.launch.log`.
+Aggregate tail command above works through the workspace symlink. This launch verification
+does not claim any long-run result, completed epoch, or adoption. Latest code remains uncommitted.
+
+### P7 completed and stopped at reconstruction gate (2026-10-05)
+
+Verified aggregate log ends `P7 STOP: reconstruction gate failed; no geology or replication
+launched.` Both arms have exactly 150 CSV epoch rows and 150 epoch checkpoints. Both
+full-store clean/extrema reports and `reconstruction_gate.json` exist. No P7 process
+remains. E0 best CSV val_loss is 0.235184 at epoch 146; E1 is 0.226063 at epoch 149,
+versus P0b's historical best 0.218987. These CSV values use masked prefix validation,
+not the full-store recipe totals below. All values below are sampled-latent full-store
+evaluation of reconstruction-best checkpoints (5000 synthetic and 5000 real examples).
+
+| Input mode | Arm | Synthetic MAE | Synthetic recipe total | Delta total vs P0b | Real-test MAE | Delta MAE vs P0b |
+|---|---|---:|---:|---:|---:|---:|
+| Clean | P0b | 0.254361 | 0.264555 | reference | 0.713747 | reference |
+| Clean | E0 | 0.368546 | 0.386625 | +46.142% | 0.801460 | +12.289% |
+| Clean | E1 | 0.410400 | 0.425385 | +60.793% | 0.778106 | +9.017% |
+| Extrema | P0b | 0.240898 | 0.250742 | reference | 0.709170 | reference |
+| Extrema | E0 | 0.254816 | 0.264147 | +5.346% | 0.727720 | +2.616% |
+| Extrema | E1 | 0.244237 | 0.253900 | +1.259% | 0.714787 | +0.792% |
+
+The implemented gate requires both modes and both arms to pass. Decision JSON:
+`clean: e0=false/e1=false; extrema: e0=false/e1=true; geology_eligible=false`.
+E1 extrema recipe total improves 3.879% versus paired E0 and real MAE improves 1.777%.
+E1 clean recipe total is 10.025% worse than E0, while real MAE improves 2.914%.
+Residual encoding is therefore promising for the trained masked-input task but is not
+an adopted retrieval improvement. No n@5/n@10/AUROC stage-2 results exist for P7.
+
+Coverage was checked from every epoch JSON, not inferred: E0/E1 consumed the exact same
+indices for all 150 epochs, 5400 examples each epoch and 810000 exposures per arm.
+Both reached 107951/108000 unique patches (99.95463%), leaving 49 unseen; all 180 source
+volumes were represented in epoch 150. This removes inadequate corpus index coverage as
+a supported explanation for the P7 result, not inadequate optimization time or sampling
+distribution mismatch generally. Do not describe 150 partial epochs as 150 full passes.
+
+Artifacts: `/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e0_e1_seed20260925`, especially
+`reconstruction_clean.json`, `reconstruction_extrema.json`, `reconstruction_gate.json`, and
+`<e0|e1>/stage1_reconstruction/sampling_epochN.json`. The completed log remains at
+`logs/p7_e0_e1_seed20260925.log`; its tail will not show additional progress.
+
+**Next:** audit the actual tokenizer contract before more architecture/capacity training.
+`src/tokenizer/core/preprocess.py:preprocess_for_token` divides by each patch's standard
+deviation and then keeps extrema; indexing/search/UI use this preprocessor. Current
+reconstruction extrema reports mask the baked-in target without this additional per-patch
+normalization, so they are not a direct deployment-contract certificate. The clean gate
+remains failed and must not be dropped post hoc without explicit protocol approval.
+
+Plan Section 9.8 now specifies an evaluation-only, logged audit on P0b/E0/E1: exact tokenizer
+inputs, 128-patch probe, then all validation/real examples, target-scaling conventions,
+adapter/encoder parity, components, source-volume metrics and decision branches. No new
+training, gate change, second seed or adoption is authorized by recording that specification.
+If approved after the audit, a separate E1 geology pilot is more directly motivated by
+the current masked-task result than jumping to 512-dimensional mu. The 128/256 factorial
+in Section 9.7 remains a separate optional hypothesis test, not a demonstrated fix.
+
+This update concerns only experiment results and next-step instructions. It changes
+documentation only; diff validation passes, no full tests were rerun, no code committed
+or pushed, and no long experiment was launched by this status review.
+
+### Exact tokenizer contract audit launch history (2026-10-05; completed below)
+
+Implemented `--input_mode tokenizer` and `--contract_audit` in the existing reconstruction
+evaluator, reusing preprocess_for_token rather than recreating normalization. Targets remain
+clean baked-scaled patches; predictions are not rescaled. Reports record normalization
+divisors, source names/indices, MAE/MSE/LPIPS/KL, amplitude, per-volume and volume-balanced
+MAE. The evaluator verifies the search-engine default preprocessor and direct mu/z_geo
+parity with VaeLatentAdapter on already-prepared input. No retrieval-quality claim is made
+for P7 stage-1 projection heads.
+
+Runner: `bash scripts/p7_input_contract_audit.sh`. All 252 tests and 25 focused tests pass,
+with bash syntax, editor diagnostics and diff checks clean. The initial synchronous run
+stopped without a recorded Python exception after five probes; no result was inferred from
+the partial log. Added guarded `RESUME=1` reuse of reports only with identical settings,
+all three arms, and passing adapter parity. The audit resumed detached using nohup and
+caffeinate: runner PID 78535, full-store evaluator PID 78607 at verification.
+
+Six probes are complete (128 fixed train, val and real examples under clean/extrema/tokenizer).
+Provisional tokenizer-mode sampled metrics:
+
+| Probe | Arm | Synthetic MAE | Synthetic recipe total | Real MAE |
+|---|---|---:|---:|---:|
+| Train | P0b | 0.450784 | 0.467446 | 0.699098 |
+| Train | E0 | 0.462251 | 0.478489 | 0.718024 |
+| Train | E1 | 0.454629 | 0.470493 | 0.705327 |
+| Validation | P0b | 0.477099 | 0.495476 | 0.699098 |
+| Validation | E0 | 0.485818 | 0.503900 | 0.718024 |
+| Validation | E1 | 0.475830 | 0.493086 | 0.705327 |
+
+These probes favor considering E1, not adopting or launching it: the full 5000-example
+synthetic/real evaluation and `decision_summary.json` are still pending. Absolute synthetic
+errors rose for all models under per-patch-normalized input versus baked-scaled targets;
+this target/input convention must remain explicit in interpreting comparisons.
+
+Log: `logs/p7_input_contract_audit_20261005.log`.
+Observe: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_input_contract_audit_20261005.log`.
+Reports: `/Volumes/CrucialX9/3dvae-poc_logs/p7_input_contract_audit_20261005`.
+The bash script appends both stdout/stderr; it does not call train.py or edit P7's gate.
+At that progress checkpoint no E1 geology pilot, larger-mu experiment, replication, or P8 had been launched. The
+conditional E1 40-epoch training proposal is detailed in plan Section 9.9, requiring the
+completed audit and explicit prospective protocol approval first. Changes remain uncommitted.
+
+### Exact tokenizer contract audit completed and pilot recommendation (2026-10-05)
+
+Completion verified: log ends COMPLETE, `full_tokenizer.json` and `decision_summary.json`
+exist with full 5000-patch coverage in each split, and no audit/evaluator process remains.
+All three checkpoints passed exact mu/z_geo adapter parity (both maximum differences 0).
+Targets remained clean baked-scaled data; no output rescaling or model training occurred.
+
+| Checkpoint | Synthetic MAE | Synthetic recipe total | Real MAE | Volume-balanced real MAE |
+|---|---:|---:|---:|---:|
+| P0b | 0.469916 | 0.488331 | 0.709170 | 0.710936 |
+| E0 | 0.479050 | 0.497250 | 0.727720 | 0.728443 |
+| E1 | 0.470972 | 0.488592 | 0.714787 | 0.716571 |
+
+E1 versus P0b: synthetic recipe total +0.05344%, real MAE +0.79206% (both within +2%).
+E1 versus paired E0: synthetic total -1.74125%, real MAE -1.77715% (both improved).
+Decision summary marks `e1_contract_reconstruction_within_2pct=true`, while
+`original_clean_extrema_gate_changed=false` and `training_launched=false`.
+Real per-volume E1 MAEs: CostaRica 0.680891, Poseidon part1 0.724188, Poseidon part2
+0.729447, cn1 0.731758. All are slightly worse than P0b; this is guardrail parity, not
+a real-seismic reconstruction improvement. Volume-balanced diagnostics tell the same story.
+
+Learning: the clean-input rejection did not translate into a large relative reconstruction
+penalty under actual tokenizer inputs. Residual E1 is competitive with P0b and better than
+fresh E0 for this contract. This does not establish the cause of clean-mode behavior, prove
+a latent-capacity limit, or measure retrieval improvement. All models' synthetic absolute
+MAE is higher under normalized inputs versus baked targets; do not mix these units/modes
+with historical masked-prefix CSV metrics or silently redefine targets.
+
+Recommendation: explicitly approve the prospective exact-tokenizer reconstruction protocol
+and E1 40-epoch geology pilot specified in Section 9.9. Preserve historical clean/extrema
+failures and the original gate JSON. First-seed n@5 must exceed P0b 0.011979 with the
+approved reconstruction/real guardrails before second-seed replication; two seeds precede
+adoption. Keep mu128; defer 256/512 and P8. The pilot script still needs implementation,
+tests, command rendering and MPS smoke after that approval. Nothing new was trained or
+launched by this result review. Existing audit log is complete and will not advance.
+
+Artifacts: `/Volumes/CrucialX9/3dvae-poc_logs/p7_input_contract_audit_20261005/full_tokenizer.json`
+and `decision_summary.json`; completed progress log is `logs/p7_input_contract_audit_20261005.log`.
+This result update changes documentation only. Diff validation passes; implementation's
+252-test gate remains the last executable test run. Changes remain uncommitted.
+
+### E1 geology pilot authorized and validated (2026-10-05)
+
+The user requested execution of the recommended mu128 pilot, explicitly approving the
+prospective tokenizer-contract reconstruction guardrail. Implemented
+`scripts/p7_e1_geology_pilot.sh`: warm-start E1 reconstruction-best epoch149 with fresh
+AdamW/plateau state, number epochs reset to 1-40, residual encoder/original decoder,
+mu128, classifier0.1/SupCon0.5/T0.2, original presence sampler, canonical synthetic batch12,
+450 batches/epoch, no phase/stretch/real mixing. P7's original gate is not modified.
+
+Passed 25 focused tests, all 252 tests, bash syntax, print-only command rendering, editor
+diagnostics and real-data two-batch MPS smoke. Smoke met sampler presence quotas and
+wrote clean/extrema/tokenizer diagnostics. Smoke log:
+`logs/p7_e1_geology_pilot_smoke_seed20260925.log`. No smoke result qualifies for adoption.
+
+Checkpoint output: `/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e1_geology_pilot_seed20260925`.
+Log: `/Volumes/CrucialX9/3dvae-poc_logs/p7_e1_geology_pilot_seed20260925.log`, workspace
+symlink `logs/p7_e1_geology_pilot_seed20260925.log`. External drive had 799 GiB free at
+preflight. Script refuses existing output/logs and verifies source/audit/targets/provenance,
+manifest/control references and MPS. Original data/checkpoints/manifest/gate are preserved.
+
+After training, benchmark epoch10/20/30/40 z_geo and natural-prevalence classifier metrics,
+then full tokenizer reconstruction for all four epochs against P0b. `pilot_decision.json`
+filters reconstruction/real guardrails and strict n@5 improvement over the exact P0b epoch30
+reference, ranking by n@5/n@10 only. It does not launch a second seed or adopt a model.
+Warm-start checkpoints do not claim full geology optimizer/RNG continuation support.
+
+Observe: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_e1_geology_pilot_seed20260925.log`.
+Run: `bash scripts/p7_e1_geology_pilot.sh`; PRINT_COMMANDS=1 and SMOKE=1 are supported.
+Pilot completion and launch outcome are recorded below. No prior failed P7 result is erased.
+
+### E1 geology pilot completed; second-seed recommendation (2026-10-06)
+
+The first-seed 40-epoch pilot and post-training evaluation completed; no process remains.
+Epoch40 is the best n@5 checkpoint. Frozen-manifest eligible query_count=768.
+
+| Epoch | n@5 | n@10 | Macro AUROC | Macro F1 |
+|---:|---:|---:|---:|---:|
+| 10 | 0.010937 | 0.019141 | 0.6909 | 0.3350 |
+| 20 | 0.011458 | 0.017839 | 0.7218 | 0.3432 |
+| 30 | 0.011458 | 0.023698 | 0.7353 | 0.3555 |
+| 40 | **0.013802** | 0.023177 | 0.7412 | 0.3571 |
+
+Seed1 P0b epoch30 is n@5=0.011979/n@10=0.022135; epoch40 pilot gains are +15.21%/+4.71%.
+Seed2 P0b epoch30 reference is 0.0109375/0.0166667. The pilot has no bootstrap interval
+for n@5 itself. Available epoch40 precision@5 CI95 is [0.396589,0.435814] and NDCG@5
+CI95 [0.440451,0.476648], n=768; these are different metrics, not n@5 uncertainty.
+Macro AUROC 0.7412 misses the 0.75 sanity target by 0.0088 and must remain reported.
+
+All epoch10/20/30/40 checkpoints pass the full tokenizer reconstruction guardrail.
+At epoch40, synthetic recipe total 0.488592 vs P0b 0.488331 (+0.05344%); real MAE
+0.714787 vs 0.709170 (+0.79206%). E1 also improves over P7 E0 by 1.74125% synthetic
+recipe total and 1.77715% real MAE. Volume-balanced real MAE is 0.716571; all four
+source-volume MAEs are slightly worse than P0b. Thus guardrail parity passes, but this
+pilot does not improve real reconstruction and has not yet replicated.
+
+Recommendation: replicate the full E1 pipeline on fresh seed20260926, from scratch, rather
+than adopt, warm-start from seed1, jump to 256/512 mu, or proceed to P8. Same-seed P0b
+epoch30 reference exists (n@5 0.0109375/n@10 0.0166667). The second seed must get its own
+fresh E1 reconstruction stage and exact-tokenizer full-store gate before a geology stage;
+then use the same 40-epoch recipe and frozen manifest. Require each seed to beat its own
+P0b n@5 reference and pass reconstruction before considering adoption. This tests pipeline
+repeatability, not isolated E1 causality, because no matched E0 geology stage exists. If
+the second seed misses either gate, stop and retain P0b. Report AUROC sanity gap; do not
+replace n@5 with classifier score. No second seed has launched yet.
+
+The plan's Section 9.10 contains the detailed seed2 protocol, paths and gates. The current
+pilot script is fixed to seed20260925, so implement/validate a seed-parameterized replication
+runner before launch. Pilot artifacts: `/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e1_geology_pilot_seed20260925`;
+log/report paths are recorded in Section 9.9. No weights adopted. Documentation-only review;
+diff check passes; the 252-test implementation gate remains the last full test run.
 
 ### Previous next action (2026-10-01; superseded)
 
@@ -245,7 +639,7 @@ print('RESULT:', 'MATCH' if m['dataset_size'] == real_size else 'MISMATCH_STALE_
     --manifest docs/benchmarks/frozen_validation_manifest_v2.json \
     --benchmark_size 2048 \
     --seed 20260927 \
-    --checkpoint checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt \
+    --checkpoint /Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt \
     --use_geo_embedding \
     --metadata_keys meta_fault_fraction meta_fault_intersection_fraction \
       meta_channel_fraction meta_channel_core_fraction \

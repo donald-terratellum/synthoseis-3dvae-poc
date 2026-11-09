@@ -8,7 +8,7 @@
 ## Why
 
 The geology-aware training track selected a winning checkpoint
-(`checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`) whose geology projection head
+(`/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`) whose geology projection head
 produces a unit-norm `z_geo` embedding optimized for ranking geologically-similar patches
 (neighbor_overlap@5 0.139 vs 0.077 `mu` baseline). The `seismic_tokenizer` app, however, still
 defaulted to an old checkpoint and always used the raw VAE latent mean (`mu`) for similarity
@@ -19,7 +19,7 @@ search. This session wires the app to the winning checkpoint and routes similari
 
 ### 1. Default checkpoint + new `embedding_mode` config
 [src/tokenizer/config/defaults.py](../../src/tokenizer/config/defaults.py)
-- `DEFAULT_MODEL_PATH` → `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
+- `DEFAULT_MODEL_PATH` → `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
   (was `checkpoints_gan_vwarp2/vae_final.pt`).
 - Added `RuntimeConfig.embedding_mode: str = "z_geo"` plus validation that it is `"mu"` or
   `"z_geo"`.

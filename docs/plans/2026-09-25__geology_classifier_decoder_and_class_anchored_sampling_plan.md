@@ -16,7 +16,7 @@ with similar geology rank near each other by cosine similarity of `z_geo`, as us
 
 - **Primary metric:** `diagnostics.neighbor_overlap_at_5` (n@5) on the frozen 7-key manifest
   `docs/benchmarks/frozen_validation_manifest.json`, tie-broken by n@10.
-- **Current best:** Phase 2 epoch-20 `z_geo`, `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
+- **Current best:** Phase 2 epoch-20 `z_geo`, `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
   (n@5 0.139, n@10 0.227).
 - **Guardrail:** reconstruction `val_loss` must not regress materially (Section 7).
 - **Target:** n@5 in the 0.18–0.25 band.
@@ -377,7 +377,7 @@ available). All commands use `uv run`.
 
 ### 8.1 What the v1b metrics say about parameters
 
-Source: `checkpoints/synth_geoaware_v1b/training_metrics.csv` (858 epochs, 3,600 examples per
+Source: `/Volumes/CrucialX9/3dvae-poc_checkpoints/synth_geoaware_v1b/training_metrics.csv` (858 epochs, 3,600 examples per
 epoch = `--batch_size 12 --number_batches 300`, MAE + 0.1 LPIPS, KL 1e-3, plateau scheduler
 patience 4, factor 0.5, repeated resumes).
 
@@ -471,7 +471,7 @@ uv run python scripts/train.py \
   --number_batches 450 \
   --epochs 40 \
   --seed 20260925 \
-  --resume checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt --resume_epoch 0 \
+  --resume /Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt --resume_epoch 0 \
   --augment --vertical_warp_prob 0.5 --mixup_augment_prob 0.0 \
   --input_scaling divide_by_std \
   --learning_rate 5e-4 --weight_decay 1e-4 --encoder_lr_mult 0.1 \

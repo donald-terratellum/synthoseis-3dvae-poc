@@ -2,14 +2,17 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from scripts import train as train_script
 from scripts import diagnose_p5_p6_reconstruction as diagnostics
+from scripts import p7_control
 from src.model import VAE3D
 from src.tokenizer.core.model_adapter import VaeLatentAdapter
+from src.tokenizer.core.preprocess import preprocess_for_token
 
 
 class EncoderArchitectureTests(unittest.TestCase):
@@ -244,6 +247,206 @@ class EncoderArchitectureTests(unittest.TestCase):
         self.assertEqual(len(set(indices)), 12)
         with self.assertRaises(ValueError):
             diagnostics.select_indices(10, 11, 1)
+
+    def test_explicit_extrema_input_preserves_clean_targets(self):
+        targets = torch.tensor([1.0, 3.0, 2.0, -1.0, 0.0, 4.0, 2.0, 1.0]).reshape(1, 1, 1, 1, 8)
+        before = targets.clone()
+        masked = diagnostics.evaluation_inputs(targets, 'extrema')
+        expected = train_script.keep_trace_extrema_only(targets[0, 0].numpy())
+        np.testing.assert_array_equal(masked[0, 0].numpy(), expected)
+        torch.testing.assert_close(targets, before)
+        self.assertIs(diagnostics.evaluation_inputs(targets, 'clean'), targets)
+
+    def test_tokenizer_inputs_match_production_and_preserve_target_rng(self):
+        generator = torch.Generator().manual_seed(22)
+        typical = torch.randn(1, 32, 32, 64, generator=generator)
+        targets = torch.stack((typical, typical * 1e-9, torch.zeros_like(typical)))
+        before = targets.clone()
+        rng = torch.get_rng_state().clone()
+        actual = diagnostics.evaluation_inputs(targets, 'tokenizer')
+        expected = np.stack([preprocess_for_token(cube[0].numpy()) for cube in targets])[:, None]
+        np.testing.assert_array_equal(actual.numpy(), expected)
+        self.assertTrue(actual.is_contiguous())
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(actual).all())
+        torch.testing.assert_close(targets, before)
+        torch.testing.assert_close(torch.get_rng_state(), rng)
+
+    def test_tokenizer_adapter_parity_uses_prepared_inputs_once(self):
+        model = VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8), geology_projection=True).eval()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'checkpoint.pt'
+            torch.save(train_script.build_checkpoint_payload(model), destination)
+            adapter = VaeLatentAdapter(destination, device='cpu')
+            result = diagnostics.verify_tokenizer_adapter_parity(adapter, torch.randn(2, 1, 8, 8, 8))
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['preprocessing_count'], 1)
+
+    def test_contract_evaluation_reports_volume_balanced_mae(self):
+        model = VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8)).eval()
+        targets = torch.randn(3, 1, 8, 8, 8)
+        result = diagnostics.evaluate(model, targets, torch.device('cpu'), 2, 10, None,
+                                      'tokenizer', [0, 0, 1], ['first', 'second'])
+        grouped = result['per_volume']['mean']
+        self.assertEqual(grouped['volumes']['0']['count'], 2)
+        self.assertEqual(grouped['volumes']['1']['count'], 1)
+        self.assertAlmostEqual(grouped['volume_balanced_mae'],
+                               (grouped['volumes']['0']['mae'] + grouped['volumes']['1']['mae']) / 2)
+
+    def test_sampler_exposure_is_not_full_epochs_or_observed_coverage(self):
+        result = diagnostics.exposure_summary(108000)
+        self.assertEqual(result['examples_per_epoch'], 5400)
+        self.assertEqual(result['total_exposures'], 810000)
+        self.assertEqual(result['corpus_equivalent_passes'], 7.5)
+        self.assertIn('unknown', result['actual_historical_index_coverage'])
+
+    def test_p7_sample_schedule_is_independent_and_tracks_consumed_only(self):
+        control = p7_control.PairedBatchSampler(100, 4, 3, 10)
+        candidate = p7_control.PairedBatchSampler(100, 4, 3, 10)
+        control.set_epoch(2)
+        candidate.set_epoch(2)
+        schedule = list(control)
+        torch.randn(1000)
+        self.assertEqual(schedule, list(candidate))
+        control.record_consumed()
+        self.assertEqual(control.consumed, schedule[0])
+        self.assertEqual(len(control.consumed), 4)
+
+    def test_p7_state_round_trip_restores_rng_optimizer_and_scheduler(self):
+        parameter = torch.nn.Parameter(torch.ones(2))
+        optimizer = torch.optim.AdamW([parameter], lr=0.01)
+        parameter.sum().backward()
+        optimizer.step()
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+        scheduler.step(0.5)
+        generator = torch.Generator().manual_seed(12)
+        early = SimpleNamespace(best_val_loss=0.5, epochs_without_improvement=2)
+        state = p7_control.capture_training_state(optimizer, scheduler, generator, early)
+        expected = torch.rand(3)
+        expected_numpy = np.random.random(3)
+        expected_python = p7_control.random.random()
+        expected_loader = torch.rand(3, generator=generator)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'state.pt'
+            torch.save(state, destination)
+            loaded = torch.load(destination, weights_only=True)
+        optimizer.param_groups[0]['lr'] = 0.5
+        early.best_val_loss = 99
+        p7_control.restore_training_state(loaded, optimizer, scheduler, generator, early)
+        torch.testing.assert_close(torch.rand(3), expected)
+        np.testing.assert_array_equal(np.random.random(3), expected_numpy)
+        self.assertEqual(p7_control.random.random(), expected_python)
+        torch.testing.assert_close(torch.rand(3, generator=generator), expected_loader)
+        self.assertEqual(optimizer.param_groups[0]['lr'], 0.01)
+        self.assertEqual(early.best_val_loss, 0.5)
+
+    def test_p7_shared_initialization_retains_original_decoder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'initial'
+            p7_control.prepare_initializations(root, 10)
+            control = torch.load(root / 'e0_initial.pt', weights_only=True)
+            candidate = torch.load(root / 'e1_initial.pt', weights_only=True)
+            for key, value in control['model_state_dict'].items():
+                if key.startswith(('encoder.fc_', 'decoder.', 'geology_head.', 'geology_classifier.')):
+                    torch.testing.assert_close(value, candidate['model_state_dict'][key], rtol=0, atol=0)
+            self.assertIsNone(candidate['model_config']['decoder_hidden_dims'])
+
+    def test_p7_gate_blocks_regression_and_subset_reports(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {'reconstruction_gate': {'full_dataset_coverage': True}, 'arms': {}}
+            for arm, error in [('p0b', 1.0), ('e0', 1.0), ('e1', 1.03)]:
+                report['arms'][arm] = {'evaluation': {
+                    'synthetic': {'sampled': {'recipe_total': error}},
+                    'real': {'sampled': {'mae': 1.0}},
+                }}
+            for mode in ('clean', 'extrema'):
+                (root / f'reconstruction_{mode}.json').write_text(json.dumps(report))
+            self.assertFalse(p7_control.reconstruction_gate(root)['geology_eligible'])
+            report['reconstruction_gate']['full_dataset_coverage'] = False
+            (root / 'reconstruction_clean.json').write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, 'full dataset'):
+                p7_control.reconstruction_gate(root)
+
+    def test_same_seed_tokenizer_gate_requires_full_coverage_and_respects_two_percent(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'evaluation.json'
+            report = {'settings': {'input_mode': 'tokenizer', 'contract_audit': True},
+                      'reconstruction_gate': {'full_dataset_coverage': True}, 'arms': {}}
+            for arm, factor in [('p0b', 1.0), ('e0', 1.03), ('e1', 1.019)]:
+                report['arms'][arm] = {'evaluation': {
+                    'synthetic': {'sampled': {'recipe_total': 2.0 * factor}},
+                    'real': {'sampled': {'mae': 1.0 * factor}},
+                }}
+            path.write_text(json.dumps(report))
+            result = p7_control.tokenizer_reconstruction_gate(path)
+            self.assertTrue(result['passed'])
+            self.assertTrue((Path(directory) / 'tokenizer_reconstruction_gate.json').exists())
+            report['arms']['e1']['evaluation']['real']['sampled']['mae'] = 1.021
+            path.write_text(json.dumps(report))
+            self.assertFalse(p7_control.tokenizer_reconstruction_gate(path)['passed'])
+            report['reconstruction_gate']['full_dataset_coverage'] = False
+            path.write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, 'full dataset'):
+                p7_control.tokenizer_reconstruction_gate(path)
+
+    def test_seed2_tokenizer_gate_uses_same_seed_control_not_seed1(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'seed2.json'
+            arms={}
+            for arm,value in [('p0b',1.0),('e0',1.03),('e1',1.01)]:
+                arms[arm]={'evaluation':{'synthetic':{'sampled':{'recipe_total':value}},
+                                         'real':{'sampled':{'mae':value}}}}
+            path.write_text(json.dumps({'settings':{'input_mode':'tokenizer','contract_audit':True},
+                                        'reconstruction_gate':{'full_dataset_coverage':True},'arms':arms}))
+            result=p7_control.tokenizer_reconstruction_gate(path,candidate='e1',control='p0b')
+            self.assertTrue(result['passed'])
+            self.assertEqual(result['control'],'p0b')
+            arms['e1']['evaluation']['real']['sampled']['mae']=1.021
+            path.write_text(json.dumps({'settings':{'input_mode':'tokenizer','contract_audit':True},
+                                        'reconstruction_gate':{'full_dataset_coverage':True},'arms':arms}))
+            self.assertFalse(p7_control.tokenizer_reconstruction_gate(path,candidate='e1',control='p0b')['passed'])
+
+    def test_tokenizer_gate_accepts_single_candidate_against_control(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'candidate.json'
+            arms={}
+            for arm,value in [('p0b',1.0),('r006',1.01)]:
+                arms[arm]={'evaluation':{'synthetic':{'sampled':{'recipe_total':value}},
+                                         'real':{'sampled':{'mae':value}}}}
+            path.write_text(json.dumps({'settings':{'input_mode':'tokenizer','contract_audit':True},
+                                        'reconstruction_gate':{'full_dataset_coverage':True},'arms':arms}))
+            result=p7_control.tokenizer_reconstruction_gate(path,candidate='r006',control='p0b')
+            self.assertTrue(result['passed'])
+
+    def test_training_diagnostic_is_disabled_or_skips_nonmilestones(self):
+        model = self._e2()
+        self.assertIsNone(diagnostics.run_training_diagnostic(model, SimpleNamespace(), torch.device('cpu'), 90, None))
+        self.assertIsNone(diagnostics.run_training_diagnostic(model, SimpleNamespace(reconstruction_diagnostic_interval=30), torch.device('cpu'), 61, None))
+
+    def test_training_milestone_preserves_weights_mode_and_rng(self):
+        model = VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8)).train()
+        targets = torch.randn(2, 1, 8, 8, 8)
+        before = {key: value.clone() for key, value in model.state_dict().items()}
+        rng_before = torch.get_rng_state().clone()
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(reconstruction_diagnostic_interval=30, reconstruction_diagnostic_samples=2,
+                                   validation_data='fixture', real_test_data=None, out_dir=directory,
+                                   reconstruction_diagnostic_modes=['tokenizer'])
+            with patch.object(diagnostics, 'load_patches', return_value=(targets, {'indices': [0, 1]})):
+                result = diagnostics.run_training_diagnostic(model, args, torch.device('cpu'), 90, None)
+            self.assertTrue((Path(directory) / 'reconstruction_diagnostic_epoch90.json').exists())
+            self.assertEqual(result['epoch'], 90)
+            self.assertEqual(result['input_mode'], 'tokenizer')
+            self.assertIn('tokenizer', result['evaluation']['synthetic']['metrics_by_input_mode'])
+        self.assertTrue(model.training)
+        torch.testing.assert_close(torch.get_rng_state(), rng_before)
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
     def test_diagnostic_recipe_matches_training_kl_normalization(self):
         targets = torch.ones(2, 1, 8, 8, 8)

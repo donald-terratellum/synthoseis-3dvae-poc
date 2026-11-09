@@ -6,6 +6,12 @@ Parent plans:
 [2026-09-01_geo-aware_improvement_plan.md](../training/2026-09-01_geo-aware_improvement_plan.md) (parent-plan lever D2, bigger encoder)
 Source repo: `/Users/donaldpg/synthoseis-pretrain-v2` (reconstruction-only 3D ResNetV2 U-Net)
 
+Checkpoint-location update (2026-10-05): most archived checkpoint folders now live under
+`/Volumes/CrucialX9/3dvae-poc_checkpoints`. References to confirmed moved folders in the
+planning/session docs have been updated; P0a, both P0b controls, and P4 are still local.
+Do not mechanically replace every `checkpoints/` path. Runtime scripts were not modified
+by this documentation migration; preflight their inputs before rerunning old suites.
+
 This plan is written so a Copilot agentic model can implement it autonomously, one work
 package (WP) at a time, with a test gate and a benchmark gate after each. Decisions made with
 the user on 2026-09-27 are recorded in Section 10.
@@ -22,7 +28,7 @@ the user on 2026-09-27 are recorded in Section 10.
   on (WP0, decision D2): `docs/benchmarks/frozen_validation_manifest_v2.json`. The old manifest
   is kept for historical comparison only. A result must hold for **two seeds** before it is
   adopted.
-- **Current adopted model:** `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
+- **Current adopted model:** `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`
   (old manifest: n@5 0.1385, n@10 0.2269). Best leak-free experimental: R2 seed 1 epoch 30
   (old manifest: n@5 0.1346). Both are re-benchmarked on the new manifest in WP1 and those
   values become the baselines.
@@ -54,34 +60,40 @@ are extended (Section 3.5).
 
 ### 2.1 Best pretrain-v2 runs (`/Volumes/CrucialX9/pretrain_v2_checkpoints/epoch_component_metrics3a.xlsx`)
 
-2,333 epoch rows from 60 run folders. Column **AY** = rank of the sum of per-component ranks on
-train + validation (synthetic plus a few real patches); column **BA** = the same rank on the
-**real-seismic test** set (CostaRica, Poseidon part 1/2, cn1). Lower is better. BA exists only
-for the later epochs (after the test loader was added).
+The workbook contains 2,333 epoch rows from 60 run folders. Column **AY** is the rank of
+summed per-component ranks on train/validation; **BA** is the corresponding real-seismic-test
+rank (CostaRica, Poseidon parts 1/2, cn1); lower BA is better. BA is numeric on 1,425 rows.
+Those rows collapse to 10 distinct architecture/loss recipes. I grouped on **E–H** (levels,
+hidden dims, kernel schedule, encoder blocks) plus **K–P** (MSE, PMSE, MAE, LPIPS, TV, GDL),
+then ranked each recipe by its minimum BA across epochs. **I** is the learning rate at that
+epoch and **J** is derived parameter count; neither defines a distinct architecture/loss recipe.
+This avoids counting repeat epochs of one recipe as separate candidates. The five best unique
+recipes are:
 
-| Run (short) | Levels | Hidden dims | Encoder blocks | Params (M) | Loss weights | Best AY (epoch) | Best BA (epoch) | Val MAE | Test MAE |
-|---|---:|---|---|---:|---|---:|---:|---:|---:|
-| r011 (0622) | 4 | 32 64 128 256 | baseline 3 4 6 3 | 58.9 | MAE 0.99 + GDL 0.01 | **1** (29) | 7 (96) | 0.269 | **0.323** |
-| r001 (0621) | 4 | 40 74 138 256 | deeper 3 4 8 4 | 72.1 | MAE 0.995 + LPIPS 0.005 | **2** (55) | 5 (54) | 0.268 | 0.327 |
-| r001 (0619) | 4 | 40 74 138 256 | deeper 3 4 8 4 | 72.1 | MAE 0.995 + LPIPS 0.005 + TV 0.001 | 3 (28) | 10 (60) | 0.273 | 0.331 |
-| r006 (0620) | 3 | 32 64 128 | deeper 3 5 8 | **17.0** | MAE 0.995 + LPIPS 0.005 | 4 (25) | **1** (51), **2** (56) | 0.272 | 0.327 |
-| r007 (0621) | 4 | 40 74 138 256 | deepest 3 5 8 5 | 74.6 | MAE 0.999 + GDL 0.001 | 4 (28) | 3 (86) | 0.271 | 0.325 |
-| r004 (0620) | 3 | 40 80 160 | deeper 3 5 8 | 26.6 | MAE 0.995 + LPIPS 0.005 + TV 0.001 | 15 (55) | 3 (56) | 0.271 | 0.331 |
-| copilot_2 | 3 | 40 88 176 | deeper 3 5 8 | 31.4 | MAE 0.995 + LPIPS 0.005 + TV 0.001 | 7 (71) | — | 0.268 | — |
+| Candidate / workbook row | Best BA rank (epoch) | C run id | E levels | F hidden dims | G kernel schedule | H encoder blocks | I LR | J params (M) | K:P weights (MSE, PMSE, MAE, LPIPS, TV, GDL) | VAE source snapshot |
+| --- | ---: | --- | ---: | --- | --- | --- | ---: | ---: | --- | ---: |
+| r006 / 1275 | 1 (51) | `sweep_20260620_080306_r006_u3_h32-64-128_lp0p000_tv0p001` | 3 | 32 64 128 | 3 3 3 | deeper 3 5 8 | 1.4e-5 | 17.01 | 0, 0, 0.995, 0.005, 0, 0 | epoch 50 |
+| r004 / 1330 | 3 (56) | `sweep_20260620_035309_r004_u3_h40-80-160_lp0p000_tv0p001` | 3 | 40 80 160 | 3 3 3 | deeper 3 5 8 | 1.4e-5 | 26.57 | 0, 0, 0.995, 0.005, 0.001, 0 | epoch 55 |
+| r007 / 2251 | 3 (86) | `sweep_20260621_232252_r007_u4_h40-74-138-256_lp0p000_tv0p001` | 4 | 40 74 138 256 | 3 3 3 3 | deepest 3 5 8 5 | 1.4e-5 | 74.58 | 0, 0, 0.999, 0, 0, 0.001 | epoch 85 |
+| r001 / 1260 | 5 (54) | `sweep_20260621_104613_r001_u4_h40-74-138-256_lp0p000_tv0p010` | 4 | 40 74 138 256 | 3 3 3 3 | deeper 3 4 8 4 | 2.6405e-5 | 72.09 | 0, 0, 0.995, 0.005, 0, 0 | epoch 50 |
+| r011 / 2331 | 7 (96) | `sweep_20260622_085428_r011_u4_h32-64-128-256_lp0p000_tv0p010` | 4 | 32 64 128 256 | 3 3 3 3 | baseline 3 4 6 3 | 1.4e-5 | 58.92 | 0, 0, 0.99, 0, 0, 0.01 | epoch 95 |
+
+The source snapshot is the nearest saved five-epoch checkpoint at or before the best-BA row;
+the workbook's best-BA epoch itself is not necessarily checkpointed. Row 1275/1336 and other
+repeat epochs are the same r006 architecture/loss recipe, not additional candidates. BA ranks
+3 are tied; row order is only a stable display order, not a tie-break performance claim.
 
 Findings:
 
-1. **MAE carries almost all of the weight (0.99–0.999).** The helpers are tiny: LPIPS 0.005,
-   TV 0.001, or GDL 0.001–0.01. MSE and PMSE are 0 in every top run. The sweep also tried LPIPS
-   0.01–0.10; none of those reached the top.
-2. **"Deeper" profiles beat "baseline"** in 6 of 7 top runs. The one baseline winner (r011) uses
-   GDL 0.01.
-3. **The smallest model generalizes best to real seismic.** r006 (3 levels, 32-64-128, deeper,
-   17.0 M) holds BA ranks 1 and 2. Larger 4-level models do not win on real test data.
-4. The **kernel schedule** is `3 3 3(3)` in every row. In pretrain-v2 it only changes the decoder
-   refinement blocks, so it is not a useful search axis here.
-5. LR at the best epochs is about 1e-5 to 3e-5 (Adam, poly decay, base 1e-5 or 5e-5).
-6. Real-test MAE (~0.323–0.331) is about 0.06 above synthetic val MAE (~0.27): a domain gap.
+1. MAE is 0.99–0.999; MSE/PMSE are zero. Helpers are LPIPS 0.005, TV 0.001, or GDL 0.001–0.01.
+2. The distinct top five include three- and four-level models, three depth schedules, and widths
+  from 32-64-128 through 40-74-138-256.
+3. The upstream kernel schedule is 3 in every level for these five recipes, so kernel size is
+  held fixed rather than treated as an extra search variable.
+4. The best-BA LR values are 1.4e-5 to 2.64e-5 under upstream Adam/poly scheduling. POC VAE
+  training uses its established AdamW schedule; column I is captured evidence, not copied as
+  the new VAE decoder's LR.
+5. Real-test MAE (~0.323–0.331 in the upstream comparison) remains a domain-shift guardrail.
 
 ### 2.2 The two repos side by side
 
@@ -711,10 +723,15 @@ were 0.717662/0.710287/0.717474. These minima are not necessarily from retrieval
 epochs. A matching P0b real-test baseline still needs evaluation. Classifier improvement
 does not qualify an arm for adoption. Retain P0b; pause replication and P8.
 
-**Next recommended step (2026-10-03):** execute Section 9.2 reconstruction diagnostics.
+**Next step (2026-10-05):** P7's first-seed reconstruction comparison completed and
+stopped at its gate: both clean modes fail; E1 passes extrema but E0 fails it. No P7 geology
+stage, retrieval result, or replication exists. Before another training run, implement the
+no-training tokenizer input-contract audit in Section 9.8. Do not silently relax the existing
+gate or treat the masked-input reconstruction result as retrieval adoption evidence.
 P5/P6 changed the decoder as well as the encoder; do not attribute regression solely to
 encoder capacity or presume a bug. P7 E1/E3 is considered after the diagnostic decision;
-P8 still requires P5 to win. No long training run is authorized by this diagnostic package.
+P8 still requires P5 to win. Do not run another geology stage or duration-only extension
+from the failed epoch-150 result.
 
 **Previous recommendation (2026-10-01; superseded):** P1–P4 have not produced a repeatable n@5 gain.
 If continuing the transfer plan, proceed to the separately gated P5/P6 encoder comparison using
@@ -841,6 +858,666 @@ launch P7/P8 or replication. The full diagnostic test gate passes 241 tests.
 Progress command: `tail -n 50 -F logs/p5_p6_reconstruction_diagnostics.log`.
 Report: `logs/p5_p6_reconstruction_diagnostics.json` (local artifact, not committed).
 
+### 9.3 Approved P5a reconstruction extension to 150 total epochs
+
+Runner: `bash scripts/p5a_reconstruction_extension.sh`. Resume stage-1 epoch 60, not
+stage 2, for 90 additional epochs (absolute epochs 61-150). Preserve E2 architecture,
+MAE + LPIPS 0.1, KL 0.001, stage-1 classifier weight 0.05, synthetic batch 12,
+450 batches/epoch, and original augmentations. Phase/stretch and real mixing remain off.
+Do not refreeze or initialize the transferred trunk again. No geology-stage command exists
+in the runner, even if reconstruction passes.
+
+**Resume limitation verified:** the original epoch-60 checkpoint has model weights only,
+not optimizer, scheduler, or RNG state. Exact continuation is impossible. This experiment
+is explicitly a weight continuation with fresh AdamW moments and plateau history, using
+the recorded last encoder LR 0.000025 and inferred decoder/head LR 0.00025 (base LR
+0.00025, encoder multiplier 0.1). Epoch numbering continues; random seeds restart.
+Interpret improvements as evidence about additional training with that reset, not a pure
+uninterrupted-duration ablation. Existing checkpoints are never overwritten.
+
+The user approved new checkpoint/log folders on CrucialX9 (886 GiB free at preflight):
+- Checkpoints: `/Volumes/CrucialX9/3dvae-poc_checkpoints/p5a_reconstruction_150_seed20260925`.
+- Stdout/stderr: `/Volumes/CrucialX9/3dvae-poc_logs/p5a_reconstruction_150_seed20260925.log`.
+- Workspace log symlink: `logs/p5a_reconstruction_150_seed20260925.log`.
+
+The runner checks the source epoch, last CSV LR, data shapes/scaling, MPS availability,
+and at least 15 GiB free on the output drive; it refuses existing outputs/logs. It does not
+move old checkpoints or logs. Module execution avoids stdlib shadowing.
+
+Before training, compare P0b `vae_best.pt` (reconstruction-selected control) and P5a
+stage-1 epoch 60 on the same 32 seed-selected synthetic/real patches. Optional component
+evaluation during training (`--reconstruction_diagnostic_interval 30`) writes diagnostic
+JSONs at epochs 90/120/150, preserving model weights, RNG state, and training mode.
+After training, compare P0b with the extension's best-val checkpoint and epoch 150 on all
+5000 synthetic and 5000 real-test patches, using identical seeded latent noise per model.
+The external log folder receives `_baseline.json` and `_full_reconstruction_gate.json`.
+The full report records dataset coverage and the +2% synthetic recipe-total/real-MAE gate.
+Full-store metrics are not the old 1080-patch CSV validation prefix. Never adopt without
+the separate two-seed retrieval gate; review reconstruction findings before any geology run.
+
+Validation before launch: 16 focused architecture/diagnostic tests, full 243-test suite,
+Python syntax, bash syntax, and print-only command inspection pass. `PRINT_COMMANDS=1`
+renders the training command without creating outputs. `OUT_DIR`, `LOG_PATH`, and `PYTHON`
+are optional overrides; default logging stays on CrucialX9.
+
+Observe: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p5a_reconstruction_150_seed20260925.log`.
+The run is multi-hour: launch independently of the chat and confirm preflight/baseline
+completion and epoch-61 training startup. Completion is reported only after both the
+training process and final full-store evaluation finish.
+
+**Completion (2026-10-04):** training and final evaluation both finished; no runner or
+training/evaluation process remains. CSV rows and checkpoints cover every epoch 61-150.
+The best-val extension checkpoint is epoch 150. Synthetic CSV val_loss reached 0.333777,
+still 52.42% above P0b 0.218987. Last-ten mean loss was 0.346810 versus previous-ten
+0.345549, not a sustained late gain. On identical 32 clean patches, epoch 60 -> 150 MAE
+improved only 3.39% synthetic and 1.09% real; additional duration did not rescue E2.
+
+Full-store **clean-input** metrics (5000 examples per split):
+
+| Metric | P0b reconstruction-best | P5a epoch 150 / extension best | Delta |
+|---|---:|---:|---:|
+| Synthetic sampled MAE | 0.254361 | 0.501105 | +97.01% |
+| Synthetic recipe total | 0.264555 | 0.519562 | about +96.4% |
+| Real sampled MAE | 0.713747 | 0.746218 | +4.55% |
+
+Both final report arms fail +2%; they are the same epoch-150 model, not independent trials.
+No geology stage was launched. Optimizer/scheduler reset remains a duration confound.
+
+### 9.4 Evaluation parity and controlled P7 proposal after failed extension
+
+**Important protocol correction:** historical `diagnose_p5_p6_reconstruction.py` reports used clean inputs.
+The evaluator now supports explicit `--input_mode {clean,extrema}` (default clean), recorded
+in settings and dataset metadata. Historical reports are not retroactively changed.
+`train.validate` defaults to extrema-only inputs for this recipe, and its CSV metric covers
+a 1080-patch prefix. Clean full-store recipe totals are not equivalent to masked-prefix
+CSV val_loss. Make input mode explicit in future evaluation flags and report metadata;
+always pair controls/candidates on identical inputs, targets, scaling and index/batch policy.
+Do not silently change training defaults to clean inputs to match the diagnostic.
+
+A focused matched-extrema check (32 identical indices, MPS, no augmentation, same noise)
+confirmed regression: synthetic recipe total 0.249360 -> 0.364212 (+46.06%), synthetic
+MAE 0.239615 -> 0.350843 (+46.42%), real MAE 0.705859 -> 0.757612 (+7.33%).
+This subset check does not certify a full masked-store gate. Its log is
+`/Volumes/CrucialX9/3dvae-poc_logs/p5a_reconstruction_150_input_parity_check.log`.
+
+**Decision:** retain P0b; do not extend E2 duration again, run its geology stage, replicate,
+or proceed to P8 on this evidence. Additional training produced modest improvements but
+undertraining alone is not a sufficient explanation demonstrated by this experiment.
+Neither the uniquely responsible module nor an architecture fix has been established.
+
+**Next separately approved experiment:** P7 E1 residual encoder with the original decoder.
+Prepare a same-budget, from-scratch E0 control so a trained E1 versus long-pretrained P0b
+comparison is not misinterpreted as an encoder-only causal result. Keep latent_dim 128,
+patch size, decoder, loss, augmentations, scaling, seeds and batches identical between E0/E1.
+Use reconstruction component checks and matched input modes before a geology stage;
+retain P0b's reconstruction and retrieval acceptance references. Two seeds are required
+before adoption, not before deciding a failed first-seed arm should stop. E3 light stem
+remains a later candidate; P8 remains gated on P5 success. No P7/P8 job was launched
+by the outcome review. Extension code/documentation are still uncommitted.
+
+### 9.5 Pre-P7 readiness audit (implemented and completed 2026-10-04)
+
+Execute `bash scripts/pre_p7_readiness_audit.sh` from the repo root. It uses
+`set -euo pipefail`, unbuffered module execution, and stdout/stderr capture to
+`logs/pre_p7_readiness_audit_20261004.log`. It refuses existing log/report paths; reruns
+must set new `LOG_PATH` and `REPORT_DIR`. Optional overrides: `DEVICE` (default mps),
+`SAMPLES` (128), and `PYTHON`. Observe with:
+
+```bash
+tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/pre_p7_readiness_audit_20261004.log
+```
+
+The audit compares P0b reconstruction-best and external P5a epoch 150 on 128 fixed
+synthetic training examples and 128 fixed v2 uniform validation examples, under clean and
+extrema inputs. Targets, scaling, indices, batch size 2, and seed 20261003 are identical
+between models and modes. It also evaluates the same 128 real-test examples in each
+report. No augmentation, geology objective, fitting, or checkpoint writing occurs.
+Four JSON reports are under `/Volumes/CrucialX9/3dvae-poc_logs/pre_p7_readiness_audit_20261004`.
+
+Completed results (sampled-latent synthetic MAE):
+
+| Split / input mode | P0b | P5a150 |
+|---|---:|---:|
+| Train / clean | 0.286352 | 0.495011 |
+| Validation / clean | 0.267464 | 0.500459 |
+| Train / extrema | 0.274121 | 0.347024 |
+| Validation / extrema | 0.250555 | 0.344187 |
+
+The regression persists on training examples, not only validation. This is not the usual
+low-train-error/high-val-error overfit pattern in this probe, but class-anchored training
+and uniform validation have different distributions; 128 examples cannot establish a
+generalization diagnosis. Do not use subset gates as adoption evidence.
+
+Sampler code uses a full-dataset shuffled loader for these reconstruction runs, then consumes
+450 batches of 12 per epoch: 5400 examples, 810000 exposures over 150 epochs, or 7.5
+corpus-equivalent passes. Independent uniform shuffles would yield expected unique coverage
+99.9544%; this is theoretical, not measured. Historical indices/RNG were not saved and the
+extension reset the seed. Actual coverage cannot be reconstructed or certified from logs.
+For P7, record actual consumed indices/unique counts and source-volume counts prospectively.
+Both unit and full gates pass: 18 focused tests, 245 full tests, Python/bash syntax and diff checks.
+
+### 9.6 Controlled P7 E0/E1 execution specification (implemented 2026-10-04)
+
+**Approved training package:** `scripts/p7_e0_e1_suite.sh` implements strict shell handling,
+print-only rendering, preflight, separate arm logs, overwrite protection and explicit gates.
+The user authorized launch after validation on 2026-10-04. Execute sequentially on MPS,
+never concurrent training jobs. No P7 model is adopted by launching the suite.
+
+| Arm | Encoder flag | Decoder | Latent | Initialization |
+|---|---|---|---:|---|
+| P7 control | `--encoder_arch conv` | original `Decoder` | 128 | fresh, no trained checkpoint |
+| P7 candidate | `--encoder_arch residual` | original `Decoder` | 128 | fresh, no trained checkpoint |
+
+Use base_ch=16, default encoder widths, batch normalization, xyz axes, patch 32x32x64,
+and `--decoder_block conv`; OMIT `--decoder_hidden_dims` to retain the legacy decoder.
+Copy equal-shaped initial `encoder.fc_mu.*`, `encoder.fc_logvar.*`, `decoder.*`,
+`geology_head.*` and `geology_classifier.*` weights from a seed-specific untrained E0
+initialization into E1. Assert equality for these modules; encoder trunks differ by design.
+If using generated initialization checkpoints, save epoch=0 and resume_epoch=0, not a
+trained checkpoint. This is shared random initialization, not pretraining or transfer.
+
+First seed 20260925; second seed 20260926 is gated on an eligible first-seed candidate.
+Stage 1: 150 epochs, 450 batches/epoch, synthetic batch=12, uniform shuffled loader,
+no real mixing, no trunk freezing, AdamW base LR 5e-4, encoder multiplier 0.1, decay 1e-4,
+plateau patience 6/factor 0.5/min LR 1e-5, clipping per current default, no early stop before
+the fixed budget except errors. MAE=1, vertical LPIPS=0.1, KL=0.001. Classifier focal gamma=2,
+smoothing=0.05, weight=0.05; projection hidden=128/output=64; SupCon and uniformity=0.
+Keep original paired augmentation: augment on, vertical warp=0.5, dip policy=adjust,
+mixup=0, phase=0, stretch=0; input extrema=1/sparse=0/decimate=0. Explicitly set
+`--validation_extrema_only`; do not change input scaling or regenerate data.
+
+Use the canonical 108000-patch training store, 5000-patch v2 uniform validation store,
+and existing real validation/test stores. Verify provenance disjointness and baked scaling.
+Use an independent seed-specific loader generator so E0/E1 trunk initialization and
+latent noise consumption do not alter the paired sample schedule. Log actual consumed
+indices/counts per epoch, not prefetched-but-unused rows. Save optimizer, scheduler, epoch
+and RNG state for future exact same-arm continuation; never reset state silently.
+
+Outputs: `/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e0_e1_seed<seed>/<e0|e1>/stage1_reconstruction`
+and separate logs in `/Volumes/CrucialX9/3dvae-poc_logs`, with workspace `logs/` symlinks.
+Require 15 GiB output-drive headroom. No benchmark/report artifacts are committed by default.
+At epochs 30/60/90/120/150 evaluate fixed seed-selected train/val patches in both explicit
+input modes; before the final decision evaluate all validation and real-test patches.
+P0b is an acceptance reference, not a matched fresh-training control. Gate E1 reconstruction
+within +2% versus paired E0 and P0b under matched protocols; real test is a guardrail only.
+If E0 itself fails badly versus P0b, investigate the shared training budget/pipeline before
+calling the encoder comparison conclusive. Do not automatically lengthen either arm.
+
+Only after a passing reconstruction gate, train a separate 40-epoch geology stage from
+the arm's reconstruction-best checkpoint: classifier=0.1, SupCon=0.5/T=0.2, uniformity=0,
+original geology sampler background=0.05/hard=0.30 with the existing presence quotas.
+Keep the other recipe flags identical. Benchmark epochs 10/20/30/40 on the unchanged
+v2 manifest using z_geo, reporting AUROC and bootstrap intervals. Require n@5 > paired E0
+and the same-seed P0b reference before second-seed replication; adoption requires both seeds.
+Stop failed arms, leave P8 gated, and do not bundle E3 or a latent-size change into P7 E1.
+
+Test gate before launch: original decoder key/shape identity in both arms; shared initial
+weights; independent paired sample schedule; exact resume state round-trip; explicit input
+mode and target preservation; no real samples in geology paths; focused then full suite,
+print-only commands, and a two-batch MPS smoke run in disposable external output folders.
+
+Implementation gate passed: 22 focused tests, all 249 tests, syntax/diff checks, all-stage
+command rendering and real-data MPS smoke. Shared initializations have 3502436 (E0) and
+3793652 (E1) parameters, retaining the original decoder. `--paired_sampling` uses an
+independent seed+epoch batch schedule and worker generator; `sampling_epochN.json` records
+consumed indices, unique/cumulative coverage and source-volume counts. `--save_training_state`
+writes atomic epoch/best/last checkpoints after epoch diagnostics/plots; explicit
+`--resume_training_state` restores optimizer/scheduler, RNGs, loader state, coverage and
+early stopping. These flags default off and currently support uniform paired reconstruction
+only, not GAN/adaptive/geology sampler resumes. The geology stage intentionally warm-starts
+weights with a fresh optimizer. Historical checkpoints still lack resumable state.
+
+MPS qualification: two fresh runs already differed in some pre-normalization convolution
+bias weights (up to 0.00031 after one epoch), while logged losses matched. Full-state resume
+versus uninterrupted training restored RNGs/groups exactly and deterministic reconstructions
+within 0.0002 absolute tolerance. Do not claim bit-identical GPU parameter evolution; CPU
+state round-trip tests and real MPS behavioral checks both pass. Failed smoke attempts are
+preserved; successful smoke log is `logs/p7_smoke_retry2_seed20260925.log`.
+
+Run: `bash scripts/p7_e0_e1_suite.sh`. `PRINT_COMMANDS=1` is a no-write dry render;
+`SMOKE=1` uses two batches/epoch and exercises both arms plus split/uninterrupted E0 resume.
+`SEED`, `OUT_ROOT`, `LOG_ROOT`, `LOCAL_LOG_PATH` and `PYTHON` are overrides; existing
+outputs/logs are rejected. The first-seed suite does not launch a second seed automatically.
+
+Aggregate progress (workspace symlink to CrucialX9):
+`tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_e0_e1_seed20260925.log`.
+External arm logs: `p7_e0_seed20260925_reconstruction.log`,
+`p7_e1_seed20260925_reconstruction.log`, and conditional `p7_<arm>_seed20260925_geology.log`.
+Both 5000-example clean/extrema gate reports and the gate decision remain under the suite
+checkpoint root. On gate failure the suite prints P7 STOP and launches neither geology arm.
+
+Launch verified 2026-10-04: detached suite launcher PID 30739 and E0 MPS training child
+PID 30795, with `caffeinate -i` inhibiting idle sleep. E0 stage 1 starts at 1/150; E1 is
+queued, not concurrent. Startup confirms P7 is executing, not that an epoch or gate passed.
+No 256/512-mu experiment or seed replication is launched by this suite.
+
+**P7 completion (2026-10-05; supersedes launch status):** both arms trained 150 epochs,
+both full-store evaluations completed, and the suite logged P7 STOP normally. No process
+remains. Best CSV val_loss: E0 0.235184/epoch146, E1 0.226063/epoch149. These are prefix
+validation values, not the full-store recipe metric. Best checkpoints were evaluated on
+5000 synthetic and 5000 real examples under each input mode:
+
+| Mode | Arm | Synthetic recipe total | Delta vs P0b | Real MAE | Delta vs P0b |
+|---|---|---:|---:|---:|---:|
+| Clean | P0b | 0.264555 | reference | 0.713747 | reference |
+| Clean | E0 | 0.386625 | +46.142% | 0.801460 | +12.289% |
+| Clean | E1 | 0.425385 | +60.793% | 0.778106 | +9.017% |
+| Extrema | P0b | 0.250742 | reference | 0.709170 | reference |
+| Extrema | E0 | 0.264147 | +5.346% | 0.727720 | +2.616% |
+| Extrema | E1 | 0.253900 | +1.259% | 0.714787 | +0.792% |
+
+Gate decision: clean e0/e1=false; extrema e0=false/e1=true; geology_eligible=false.
+E1's extrema synthetic recipe total is 3.879% better than E0, with real MAE 1.777% better.
+Its clean synthetic total is 10.025% worse than E0. No geology-stage n@5/n@10/AUROC
+results were produced; do not claim P7 retrieval failure or success from reconstruction alone.
+Actual consumed schedules match for every epoch. Both arms saw 107951/108000 unique
+patches (99.95463%) over 810000 exposures; epoch150 covered all 180 source volumes.
+Index coverage is measured, not the prior theoretical estimate. Preserve the failed gate;
+consider protocol-specific follow-up only after the explicit contract audit below.
+
+### 9.7 Larger-mu capacity hypothesis (proposed, not a production contract change)
+
+P0b is NOT reconstruction-only: classifier weight 0.1 and SupCon 0.5 are active. P6
+stage 1 uses classifier 0.05/SupCon=0; stage 2 uses 0.1/0.5. All use mu=128.
+P5b's stage-1 classifier=0 did not rescue E2 reconstruction. Thus classification sharing
+128 dimensions is plausible as an interaction but is not established as the cause of the gap.
+Training history, normalization/downsampling and decoder changes remain alternative factors.
+
+Capacity parameter counts verified by constructing the actual models (classifier/projection on):
+
+| Architecture | mu=128 | mu=256 | mu=512 |
+|---|---:|---:|---:|
+| E0 | 3502436 | 6697572 | 13087844 |
+| E2 P5 decoder | 15957668 | 19152804 | 25543076 |
+
+For E0/E2 flat_dim=8192, 128 -> 256 adds about 3.20 M weights across latent projections,
+decoder FC and heads; 128 -> 512 adds about 9.59 M. Trunk depth/width is unchanged.
+Improvement would not by itself isolate vector capacity from these additional parameters.
+KL sums over latent dimensions before voxel normalization: hold beta fixed initially and
+report both unweighted and weighted KL; do not claim equal rate-distortion pressure.
+
+After the P7 audit/controlled baseline, a separately approved L-mu pilot may replace the
+next architecture arm: pick ONE fixed architecture/decoder, then train a 2x2 factorial:
+mu in {128,256}, stage-1 classifier weight in {0,0.05}. SupCon stays zero in this diagnostic
+stage; all four arms instantiate the same head modules, with zero-weight heads disabled
+from the objective. Use the same 150-epoch budget, sample schedule, augmentations, losses,
+normalization and reconstruction evaluation as Section 9.6. Do not resize/copy trained FC
+weights or compare to an old checkpoint as the sole control; latent projections are new.
+Compare the classification-induced MAE penalty at each latent size. A benefit specific to
+the joint arm supports the multitask hypothesis; similar benefits in both arms suggest a
+more general capacity/parameter-count effect. Worse train and val at both sizes suggests
+looking beyond latent size. These are hypotheses, not definitive causal diagnoses.
+
+Keep z_geo dimension=64 and classifier labels/output sizes unchanged; wider mu/logvar/z
+and decoder input are experimental. First test checkpoint/adapter round trips, latent shapes,
+memory/time and classifier/projection outputs at 256; do not change VAE or tokenizer defaults.
+The production 128-D mu contract remains out of scope unless explicitly approved for migration.
+Tokenizer downstream shape assumptions/caches/index versions must be audited before adoption.
+Try 512 only after a reproducible 256 benefit and resource check, not an unconditional sweep.
+Reconstruction improvement alone cannot qualify a new latent size: the same retrieval,
+reconstruction/real guardrails and two-seed adoption requirement still apply.
+
+### 9.8 Next package: exact tokenizer input-contract audit (no training)
+
+**Why before another multi-day run:** E1 meets extrema-only reconstruction limits but fails
+clean inputs. Actual tokenizer input is neither clean nor simply baked-amplitude extrema:
+`src/tokenizer/core/preprocess.py:preprocess_for_token` normalizes each patch by std with
+eps=1e-6, then calls keep_trace_extrema_only. Indexing/search/token picker/UI use this path.
+The current evaluator's extrema mode omits that extra per-patch normalization. Existing
+results are valid for their stated modes, not an exact tokenizer deployment certificate.
+
+**Implementation surface and hypotheses:** extend `scripts/diagnose_p5_p6_reconstruction.py`
+with opt-in `--input_mode tokenizer`, reusing the actual preprocessor; defaults remain
+unchanged. Hypothesis H1: input/amplitude distribution shift, rather than missing mu capacity,
+accounts for mode-dependent reconstruction. A paired three-mode comparison can disconfirm
+this hypothesis but cannot uniquely identify optimization, architecture or loss weighting.
+No model parameters, checkpoint configuration or production preprocessing are changed.
+
+Create `scripts/p7_input_contract_audit.sh` with set -euo pipefail, module execution,
+unbuffered output, explicit missing-input/shape/finiteness checks, no-overwrite log/report
+paths, and tee for stdout/stderr. It must not call training or modify the frozen manifest.
+Default device=mps, batch=2, seed=20261003; selectable cpu fallback. Log:
+`logs/p7_input_contract_audit_20261005.log`, reports on CrucialX9 under
+`/Volumes/CrucialX9/3dvae-poc_logs/p7_input_contract_audit_20261005`.
+Planned observation command (log does not exist until implementation runs):
+`tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_input_contract_audit_20261005.log`.
+
+**Fixed checkpoints:** P0b seed20260925 reconstruction-best `vae_best.pt`, paired P7 E0
+and E1 reconstruction-best checkpoints (epochs146/149) under the existing external suite
+root. Require their saved latent_dim=128, patch_shape=32x32x64 and finite strict state load.
+Do not use an untrained stage-1 projection head as a retrieval adoption benchmark.
+
+**Execution order:**
+1. Unit-test exact tokenizer input equality against preprocess_for_token on asymmetric,
+  low-variance and typical patches. Check contiguous float32 (B,1,32,32,64), clean target
+  unchanged, finite mu/logvar/reconstruction, and no global RNG or model-state mutation.
+  Ensure importing the real preprocessor does not change clean/extrema output behavior.
+2. Use 128 seed-selected training patches, 128 v2 uniform validation patches and 128 real
+  test patches, identical between all three checkpoints. Evaluate clean, extrema, tokenizer
+  modes with identical seeded latent noise for each model/mode. Record indices, dataset
+  size, device, input-mode function, and per-patch normalization factors. Report target
+  amplitude/std and prediction amplitude/std, MAE/MSE/LPIPS/KL and current recipe total.
+3. Targets remain the clean, baked-scaled store patches for all modes. Per-patch input
+  normalization in tokenizer mode is intentional preprocessing, not another division by
+  the store's baked scaling_std. Do NOT rescale outputs post hoc to improve MAE. These
+  decoder metrics measure response to deployment inputs against the current training
+  target convention; do not redefine the target or mix these totals with CSV validation.
+4. Verify direct model.encoder(tokenizer_input).mu/z_geo equals VaeLatentAdapter outputs
+  on the exact same already-preprocessed array. Adapter takes prepared cubes and must
+  not normalize/mask a second time. Check the indexing/search call sites' preprocessing
+  route, not merely the standalone helper. Report parity tolerances and any differences.
+5. After focused tests and full suite pass, evaluate all 5000 v2 uniform validation and
+  5000 real-test examples in tokenizer mode with the same targets/index/noise conventions.
+  Report deltas E0/E1 versus P0b and versus each other. Group MAE by source_volume_index
+  and source name; give volume-balanced means as diagnostics. Do not treat patches from
+  one volume as independent geology evidence. Never choose model epochs using real test.
+6. Write a concise JSON/console decision summary and append results to the session handoff.
+  Existing clean/extrema failures are retained; no original gate JSON is edited.
+
+**Decision branches and authorization:**
+- If E1 passes +2% synthetic recipe/real MAE versus P0b and paired E0 under exact tokenizer
+  inputs, propose an explicitly approved E1 40-epoch geology pilot. Clean remains a reported
+  failure. Using the deployed input contract as the primary reconstruction gate is a new
+  protocol decision, not retrospective adoption of P7. Define that decision before training;
+  the current suite's clean-and-extrema gate is NOT automatically relaxed.
+- If tokenizer mode also fails, do not start that pilot. Inspect input scaling/normalization
+  and shared E0 training history before choosing a separately approved 128/256 factorial
+  or E3 experiment. This audit does not authorize a 256/512 production contract change.
+- A geology pilot still requires frozen-manifest retrieval, classifier sanity and post-stage
+  reconstruction guardrails. Repeat a retrieval winner in seed20260926 before adoption.
+  No further epochs, geology run, second seed or P8 is launched automatically by this audit.
+
+**Readiness (2026-10-05):** implemented and completed. All 252 tests (25 focused) pass,
+with syntax/editor/diff checks clean. Six fixed 128-patch probes completed and adapter
+parity passed; the detached full-store MPS evaluator finished and no audit process remains.
+The initial synchronous run stopped without a recorded Python exception, so it was resumed
+with guarded `RESUME=1` settings/parity checks; the log is appended, not overwritten.
+The runner defaults to no-overwrite; use new LOG_PATH/REPORT_DIR for a fresh device/config.
+Completed results are recorded below; no training permission or adoption is implied.
+
+Tokenizer validation probe: P0b/E0/E1 sampled synthetic recipe total
+0.495476/0.503900/0.493086; real MAE 0.699098/0.718024/0.705327. These 128-patch
+values support waiting for the full comparison, not changing gates or adopting E1.
+`decision_summary.json` is written only after `full_tokenizer.json` verifies complete
+5000-example coverage. It reports E1 deltas versus both references and does not call training.
+
+**Completed full-store result:** all three adapters passed with mu/z_geo max deltas 0.
+Exact-tokenizer sampled synthetic recipe totals: P0b 0.488331, E0 0.497250, E1 0.488592;
+real MAEs: P0b 0.709170, E0 0.727720, E1 0.714787. E1 versus P0b is +0.05344%
+synthetic total/+0.79206% real MAE; versus E0 it is -1.74125%/-1.77715%. Thus E1
+passes +2% against both references under this contract. Volume-balanced real MAEs are
+0.710936/0.728443/0.716571; all E1 source-volume real MAEs are slightly worse than P0b.
+This is reconstruction parity, not a real-data improvement or a retrieval result.
+The log and `decision_summary.json` confirm completion, no training, and unchanged P7 gate.
+Proceed only to the separately approved pilot below; mu128 remains unchanged. The result
+supports testing retrieval, not attributing earlier clean-mode regression uniquely to
+input scaling or deciding that a larger mu is required. Do not compare normalized-input
+absolute MAE against historical masked-prefix validation as though the protocols were equal.
+
+### 9.9 Approved E1 geology pilot (implemented 2026-10-05)
+
+**Approved next training:** the E1-only 40-epoch geology pilot. The user requested execution
+on 2026-10-05, approving the prospective exact-tokenizer reconstruction protocol below. The
+completed exact-tokenizer audit passes +2% reconstruction/real-MAE against P0b and E0.
+This is more directly motivated by E1's masked-input result than adding 256/512 latent
+dimensions now. If the audit fails, do not run the pilot: inspect input/target units and
+normalization alignment before proposing a same-architecture latent-capacity factorial.
+
+**Protocol decision recorded before launch:** the user approved a prospective protocol where
+exact tokenizer-input reconstruction is primary and historical clean-input failure remains
+reported. Preserve `p7_e0_e1_seed20260925/reconstruction_gate.json` unchanged. The original
+P7 comparison stopped legitimately. A new pilot is not an automatic continuation or
+retroactive relaxation of that experiment. Passing the audit alone is not adoption.
+
+Implemented `scripts/p7_e1_geology_pilot.sh` with strict shell handling,
+print-only commands, preflight, no-overwrite output/log protection, and stdout/stderr tee.
+Resume weights from the external E1 reconstruction-best checkpoint (epoch149), using
+`--resume_epoch 0`, fresh AdamW and 40 epochs. Do NOT use --resume_training_state here:
+full-state restoration currently supports uniform paired reconstruction only. Do not refreeze
+the trunk, initialize from another model, change decoder widths, or copy resized latent FCs.
+
+Recipe: residual encoder, original decoder (omit decoder_hidden_dims), base_ch16/mu128,
+batch normalization, xyz axes, 32x32x64, seed20260925, batch12, 450 batches/epoch.
+Use the existing canonical training, v2 uniform validation and real metric stores; no new
+sampling, no real mixing. Keep MAE=1, vertical LPIPS=0.1, KL=0.001, AdamW base LR5e-4,
+encoder multiplier0.1, weight decay1e-4, grad clip2, plateau patience6/factor0.5/min1e-5.
+Classifier focal gamma2/smoothing0.05/weight0.1; projection hidden128/output64;
+SupCon0.5/temperature0.2; uniformity0. Presence sampler background0.05/hard0.30,
+minimum negative strata2, presence_labels, quotas fault_x=1/flat_spot=1/channel=1.
+Augment on, vertical_warp0.5, dip_policy=adjust, phase/stretch/mixup off, extrema input1,
+validation_extrema_only on; preserve baked scaling and original validation behavior.
+Token preprocessing is for the separate explicit audit metrics, not a silent new train loss.
+
+Use `/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e1_geology_pilot_seed20260925` and a
+workspace `logs/p7_e1_geology_pilot_seed20260925.log` (external log symlink allowed).
+Before launch run focused/full tests, command rendering and a two-batch MPS resume smoke.
+Verify the source checkpoint and required label/dip arrays, provenance, drive availability
+and headroom. The runner must neither overwrite P7 stage1 artifacts nor run a second seed.
+
+At epochs10/20/30/40 benchmark z_geo using the unchanged frozen v2 manifest and seven
+metadata keys, with classifier evaluation on natural-prevalence v2 uniform data. Report
+n@5/n@10, bootstrap intervals and macro AUROC. Evaluate reconstruction at these checkpoints
+under the prospective tokenizer contract and retain clean/extrema diagnostics; compare to
+the completed P0b audit numbers on identical data/noise. Real test is never epoch selection.
+No paired E0 geology result currently exists: do not call E1 versus P0b an isolated
+encoder-only causal comparison. It is a candidate retrieval experiment with different history.
+
+First-seed continuation gate: best n@5 > P0b seed20260925 0.011979, tie-break n@10,
+with +2% reconstruction/real guardrails under the approved protocol. Report AUROC >=0.75
+as sanity, not a replacement for retrieval. If no eligible checkpoint, stop. If eligible,
+request/record the matching seed20260926 reconstruction+pilot replication before adoption;
+do not warm-start seed2 from seed1 or claim two seeds from checkpoint sampling. Preserve
+the production tokenizer latent contract and leave P8 gated. No pilot was authorized by
+the audit alone; authorization is the subsequent explicit user execution request.
+
+Launch readiness passed: 25 focused tests, all 252 tests, Python editor diagnostics,
+bash syntax/command rendering, and a two-batch MPS smoke from the actual epoch149
+checkpoint. Smoke log: `logs/p7_e1_geology_pilot_smoke_seed20260925.log`. It exercised
+SupCon/classifier objectives, required presence quotas, dip adjustment, and clean/extrema/
+tokenizer milestones. These are startup/correctness checks, not evidence of retrieval gains.
+
+Run `bash scripts/p7_e1_geology_pilot.sh`; `PRINT_COMMANDS=1` renders the training
+command without writes, `SMOKE=1` uses one epoch/two batches and separate smoke outputs.
+`OUT_DIR`, `LOG_PATH`, `LOCAL_LOG_PATH`, `PYTHON` are optional path overrides; existing
+output/log paths are refused. Production defaults use the external checkpoint/log folders,
+with the progress log linked under workspace `logs/`. Preflight checks the passing exact
+contract audit, epoch149/mu128/legacy decoder, source path, required target/dip arrays,
+disjoint provenance, frozen-manifest size, P0b references, MPS and 15 GiB headroom.
+
+At epochs10/20/30/40, in-training diagnostics use 32 fixed patches in all three input modes.
+After all 40 epochs, the runner evaluates each saved epoch on the frozen retrieval manifest,
+then performs full 5000-example tokenizer reconstruction comparisons against P0b for all
+four checkpoints. `pilot_decision.json` records n@5/n@10/AUROC and reconstruction eligibility,
+using the exact P0b epoch30 benchmark value rather than a rounded threshold. Rank eligible
+milestones by n@5/n@10, not real-test error; real test only vetoes failed guardrails.
+No second seed or adoption is executed by the script; original P7 gate remains untouched.
+Geology checkpoints are warm-start weights only; full reconstruction optimizer continuation
+is intentionally not used and geology exact-resume support is not claimed.
+
+Observe: `tail -n 50 -F /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_e1_geology_pilot_seed20260925.log`.
+Completion means both training and post-training retrieval/reconstruction evaluation have
+finished, not merely epoch40. Launch verification is recorded in the session handoff.
+
+Launch verified 2026-10-05 local date: detached launcher PID82664, active MPS training
+child PID82719, preflight passed and epoch149 source loaded. Pilot runs epochs1-40 with
+mu128. No retrieval milestone, guardrail success, replication or adoption is implied by
+startup. Original failed P7 gate remains unchanged; the new pilot uses its approved
+prospective contract and separate output folder.
+
+#### 9.9.1 Seed-1 result and second-seed trigger (2026-10-06)
+
+The pilot completed all 40 epochs, four frozen-manifest benchmarks and full tokenizer-mode
+reconstruction guardrails. No process remains. Epoch40 is the best retrieval checkpoint:
+
+| Epoch | n@5 | n@10 | Macro AUROC | Macro F1 |
+|---:|---:|---:|---:|---:|
+| 10 | 0.010937 | 0.019141 | 0.6909 | 0.3350 |
+| 20 | 0.011458 | 0.017839 | 0.7218 | 0.3432 |
+| 30 | 0.011458 | 0.023698 | 0.7353 | 0.3555 |
+| 40 | **0.013802** | 0.023177 | 0.7412 | 0.3571 |
+
+P0b seed20260925 epoch30 reference: n@5=0.011979, n@10=0.022135. The seed1 pilot
+improves n@5 by 15.21% and n@10 by 4.71%. P0b seed20260926 epoch30 reference is
+n@5=0.0109375/n@10=0.016667; that cross-seed comparison is context, not replication.
+Macro AUROC 0.7412 is below the 0.75 sanity target. Report it; retrieval remains primary.
+Benchmark eligible query_count=768. Bootstrap reports precision@5 CI95 [0.396589,
+0.435814] and NDCG@5 [0.440451,0.476648], n=768. These are NOT an interval for the
+n@5 neighbor-overlap metric; don't claim statistical significance from them.
+
+Tokenizer-mode guardrails pass all pilot checkpoints. Epoch40 synthetic recipe total
+0.488592 vs P0b 0.488331 (+0.05344%); real MAE 0.714787 vs 0.709170 (+0.79206%).
+E1 is also -1.74125% synthetic total/-1.77715% real MAE versus P7 E0. Source-volume
+balanced real MAE is 0.716571. Per-volume E1 real MAE is CostaRica 0.680891,
+Poseidon part1 0.724188, Poseidon part2 0.729447, cn1 0.731758; each is slightly worse
+than P0b. This clears the stated numerical guardrail, not a real-data improvement.
+Checkpoint/report/log paths are in the session handoff and external pilot directory.
+
+**Decision:** seed1 merits a fresh seed20260926 replication, not adoption. The audit's
+tokenizer reconstruction protocol was prospectively approved; retain P7 clean/extrema
+failures in records and do not alter the old gate JSON. Bootstrap output omits an n@5
+interval. The seed2 run is the repeatability check. If it misses primary n@5 or guardrails,
+stop and do not adopt. AUROC remains a sanity report, not a replacement n@5 gate.
+
+### 9.10 Seed-2 E1 replication and adoption protocol (completed; E1 not adopted)
+
+Use **seed20260926**, never seed1 weights. A matching P0b baseline already exists:
+`docs/benchmarks/geoaware_p0b_r2_seed20260926_r2_ep30_zgeo.json`, n@5=0.0109375,
+n@10=0.0166667; P0b epoch40 n@5=0.0106771. Its training CSV best val_loss is 0.218169.
+The seed-specific P0b checkpoint and epoch30 benchmark were verified in preflight; the full
+5000-synthetic/5000-real exact-tokenizer evaluation includes P0b, E0 and E1 before geology.
+
+Run E1 reconstruction fresh from shared E0/E1 seed20260926 initialization using Section
+9.6's paired schedule, identical 150-epoch stage1 recipe, consumed-index/source-volume
+audits and resumable state. The existing P7 suite already accepts `SEED=20260926`; verify
+the moved E0/E1 outputs, P0b control path and all external input paths in preflight. This
+is a second seed, not a continuation or copied FC/encoder from seed1.
+
+Apply the approved exact-tokenizer full reconstruction +2% synthetic recipe-total and
+real-MAE gate against same-seed P0b before any geology training. Preserve/report clean and
+extrema results and the original P7 gate unchanged. If reconstruction fails, stop; no
+geology stage. If it passes, run E1 geology for 40 epochs from its own best reconstruction
+checkpoint with exactly Section 9.9's recipe and fresh optimizer. Benchmark epochs 10/20/30/40
+on the same frozen manifest, reporting n@5/n@10, eligible-query count, precision@5/NDCG@5
+bootstrap intervals (explicitly not n@5 CIs), macro AUROC and tokenizer reconstruction
+guardrails. Never select on the test set.
+
+**Adoption requires both independent seeds** to have a checkpoint with n@5 greater than
+as tie-breaker, and reconstruction/real guardrails satisfied. Report mean/per-seed deltas
+and AUROC; the <0.75 sanity target remains disclosed. Since there is no E0 geology-stage
+control, characterize this as repeatability of an E1 pipeline, not proof of isolated
+residual-block causality. If either seed fails, retain P0b and do not adopt E1.
+
+Implementation: `scripts/p7_e1_seed2_replication.sh` used strict Bash mode, fresh paired
+E0/E1 initialization, preflight, print-only rendering, a unique output directory,
+`logs/` symlink, and a conditional E1 geology stage. The reconstruction gate required full
+tokenizer coverage and checked synthetic recipe total and real MAE within +2% of same-seed
+P0b. The focused 27-test suite, shell syntax/dry-run and one-epoch MPS smoke passed. The full
+run launched 2026-10-06 under `caffeinate -i` and completed all stages on 2026-10-07.
+
+Seed-2 full-tokenizer reconstruction passed: E1 synthetic recipe total 0.497442 vs P0b
+0.493197 (+0.86%); real MAE 0.714574 vs 0.710047 (+0.64%). E0 failed the real-MAE +2%
+guardrail. E1 geology completed 40 epochs; frozen-manifest results:
+
+| Epoch | n@5 | n@10 | Macro AUROC | Precision@5 CI95 | NDCG@5 CI95 |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 0.008073 | 0.016536 | 0.6829 | [0.3530, 0.3895] | [0.3801, 0.4134] |
+| 20 | 0.010417 | 0.018099 | 0.7072 | [0.3674, 0.4040] | [0.4001, 0.4295] |
+| 30 | 0.010937500 | 0.020182 | 0.7126 | [0.3750, 0.4100] | [0.4038, 0.4347] |
+| 40 | 0.008594 | 0.018099 | 0.7037 | [0.3655, 0.4091] | [0.3970, 0.4319] |
+
+All reports have 768 eligible queries. The seed-2 P0b epoch-30 reference is n@5
+0.010937501 and n@10 0.016667. E1 epoch 30 is fractionally below P0b on n@5
+(-9.31e-10), so it does not satisfy the required strict improvement; higher n@10 is only a
+tie-breaker. The precision@5/NDCG@5 intervals are not n@5 confidence intervals. No milestone
+is eligible, and all E1 macro AUROC values remain below the 0.75 sanity target. Seed 1 passed
+its same-seed P0b n@5 gate, but both independent seeds are required for adoption.
+
+**Decision (2026-10-07): do not adopt E1; retain P0b.** The replication did not meet its
+primary retrieval gate despite passing reconstruction. No third seed, further E1 training,
+P8 or mu256/512 run is queued. Any renewed work requires a new explicit hypothesis and plan.
+The completed reports and machine-readable decision are under
+`/Volumes/CrucialX9/3dvae-poc_checkpoints/p7_e1_seed20260926_replication/`; monitor/log:
+
+```sh
+tail -f /Users/donaldpg/synthoseis-3dvae-poc/logs/p7_e1_seed20260926_replication.log
+```
+
+### 9.11 Top-five pretrain-v2 architecture/loss screen (completed; no candidate passed)
+
+**Goal:** test the five distinct upstream architecture/loss recipes ranked in Section 2.1,
+not five epoch rows. BA groups are unique on workbook columns E–H and K–P, ranked by the
+minimum BA across each recipe's epochs. The POC implementation and exact upstream encoder
+snapshot compatibility were verified for all five candidates on 2026-10-07; each loaded
+150–196 encoder tensors and produced a finite 32×32×64 reconstruction with `mu` shape
+`(1, 128)`. This was a CPU compatibility check, not model training.
+
+**Transfer decision:** upstream checkpoints contain a U-Net decoder with skip connections,
+which bypasses the VAE bottleneck and cannot be used as the tokenizer's reconstruction decoder.
+Load only each checkpoint's matching `encoder.*` tensors using `--init_encoder_from`; initialize
+the VAE `fc_mu`, `fc_logvar`, skip-free decoder, and heads in this repo. First adapt the complete
+VAE on reconstruction only, including real patches. Then fine-tune that VAE with geology
+classification and SupCon. Real patches remain reconstruction-only in both phases; the real
+sample mask excludes them from classification/contrastive objectives.
+
+The five recipes ran sequentially with downstream seed `20261008`, synthetic batch 12,
+450 batches/epoch, and `K=2` real patches appended per step. Stage 1 ran 60 epochs, with geology
+heads instantiated for checkpoint compatibility but classifier/SupCon/uniformity weights zero.
+Use the workbook MAE/LPIPS/TV/GDL weights exactly; KL remains the VAE-specific 0.001 term.
+Use the existing POC AdamW schedule (base LR 2.5e-4, encoder multiplier 0.1), not the upstream
+column-I Adam/poly LR: column I is recorded as upstream evidence and does not control this new
+VAE decoder's adaptation. The upstream LPIPS coefficient is preserved, though the POC LPIPS
+implementation uses its existing slice planes and is not bit-identical to upstream's three-plane
+loss. Save only stage-1 best/last checkpoints to limit storage.
+
+After each stage 1, exact-tokenizer full evaluation ran on 5,000 synthetic and 5,000 real patches
+against seed-2 P0b. All evaluations had full contract audit and dataset coverage. The +2% gate
+required both synthetic recipe total and real MAE within tolerance. Every candidate failed, so no
+geology-aware fine-tuning or frozen-manifest retrieval benchmark ran.
+
+The retrieval acceptance rule (unused in this run because no candidate passed stage 1) is strict
+n@5 greater than seed-2 P0b epoch 30 (0.0109375), with n@10 as tie-breaker. A future geology
+benchmark must report eligible-query count, precision@5/NDCG@5 bootstrap intervals (not n@5 CIs),
+macro AUROC, and reconstruction guardrails. No single seed adopts a model. A winning
+architecture/loss bundle must first be compared with a matched-loss control using the current P0b
+encoder before claiming architecture-specific uplift, then replicated with an independent
+downstream initialization before adoption.
+
+Runner: `scripts/pretrain_v2_top5_arch_loss_suite.sh`. The full screen completed 2026-10-09.
+All candidate encoders loaded successfully; the runner stopped each candidate at its full-coverage
+tokenizer gate and wrote a suite-level decision with no eligible winner. The earlier r006 one-epoch
+MPS smoke remains a wiring check only, not a model result. Captured output:
+
+- Checkpoints/reports: `/Volumes/CrucialX9/3dvae-poc_checkpoints/pretrain_v2_top5_arch_loss_seed20261008`
+- Durable log: `/Volumes/CrucialX9/3dvae-poc_logs/pretrain_v2_top5_arch_loss_seed20261008/pretrain_v2_top5_arch_loss_seed20261008.log`
+- Workspace follow link: `logs/pretrain_v2_top5_arch_loss_seed20261008.log`
+
+Full-tokenizer gate results (P0b synthetic recipe total `0.493197`; P0b real MAE `0.710047`):
+
+| Candidate | Stage-1 best synthetic val loss (epoch) | Tokenizer synthetic recipe total (delta vs P0b) | Tokenizer real MAE (delta vs P0b) | Gate / geology / retrieval |
+| --- | ---: | ---: | ---: | --- |
+| r006 | 0.389590 (59) | 0.424017 (-14.03%) | 0.750956 (+5.76%) | fail / skipped / not run |
+| r004 | 0.376074 (57) | 0.415439 (-15.77%) | 0.750653 (+5.72%) | fail / skipped / not run |
+| r007 | 0.468412 (58) | 0.512175 (+3.85%) | 0.776562 (+9.37%) | fail / skipped / not run |
+| r001 | 0.481408 (57) | 0.520795 (+5.60%) | 0.775895 (+9.27%) | fail / skipped / not run |
+| r011 | 0.465316 (57) | 0.512488 (+3.91%) | 0.776366 (+9.34%) | fail / skipped / not run |
+
+For each candidate, full tokenizer real MAE regressed on all four source-volume groups; this is
+not a single-volume outlier. r006/r004 traded substantially better synthetic reconstruction for
+real-MAE regressions beyond tolerance. r007/r001/r011 regressed on both measures. Their clean-input
+epoch-60 real-test MAEs were respectively 0.714349, 0.709430, 0.754813, 0.757485, and 0.755391;
+these are fixed-subset guardrails, not the full-tokenizer gate or upstream AC metric.
+
+**Decision (2026-10-09): no-go for all five bundles; retain P0b.** No POC geology stage ran, so
+this screen provides no geology retrieval n@5/n@10 evidence and no candidate qualifies for another
+seed or adoption. Do not rerun these bundles with an arbitrary LR change. The next step is a
+diagnostic-only review of the per-volume tokenizer reports, data/input contract, and real-recon
+contribution before proposing a single-factor follow-up. If training is proposed, first define a
+matched P0b control and an explicit hypothesis; no further run is queued by this result.
+
+```sh
+tail -F /Users/donaldpg/synthoseis-3dvae-poc/logs/pretrain_v2_top5_arch_loss_seed20261008.log
+```
+
 ## 10. Decisions (answered 2026-09-27)
 
 | ID | Decision | Answer |
@@ -896,12 +1573,20 @@ Report: `logs/p5_p6_reconstruction_diagnostics.json` (local artifact, not commit
 
 **Risks and mitigations**
 
-| Risk | Mitigation |
-|---|---|
-| Pretrained encoder trained on 128³ patches does not suit 32×32×64 | frozen-trunk warm-up; E3 light stem; P6 from-scratch control |
-| InstanceNorm unstable on 2×2×4 maps | test; `--encoder_norm group` fallback |
-| Larger encoder overwhelms the 128-d bottleneck (information lost in FC) | compare E2 vs E3; optional 1×1 channel-reduction before flatten |
-| Real data shifts the latent away from synthetic geology | `real_batch_count` small (2 of 14); n@5 gate |
-| Augmentations make dip targets noisy | dip label policy `mask`/`adjust` |
-| Old validation overlap with pretrain-v2 training | new v2 validation volumes (runs 5000–5024) and v2 manifest (WP0) |
-| Many runs; n@5 noise with 52 queries | two seeds; one variable per run; stop an arm after no gain |
+| Risk | Evidence from completed top-five screen | Revised mitigation / status |
+| --- | --- | --- |
+| Upstream 128³ U-Net encoder does not transfer cleanly into a 32×32×64 VAE bottleneck with a fresh decoder | All five encoders load and train; all fail the full-tokenizer real-MAE gate. r006/r004 improve synthetic recipe total but worsen real MAE by ~5.7%; the wider/deeper bundles worsen it by ~9.3%. | Keep P0b. First run no-training per-volume/activation and real train/validation/test contract diagnostics. If transfer remains the hypothesis, propose a matched r006 architecture pair with pretrained versus scratch encoder initialization; preserve the same VAE decoder, recipe, sampler, and gate. Do not jump directly to geology fine-tuning. |
+| Real reconstruction contribution shifts representations or does not bridge the field-data gap | Every candidate's tokenizer real MAE regresses across all four real-test volume groups despite `K=2` real patches per batch. No geology stage ran, so latent/geology displacement is unmeasured. | Measure per-volume real-train/validation/test scaling and error; any training follow-up must isolate real mixing (`K=0` vs `K=2`) as one factor and pass the full tokenizer gate before geology. |
+| Upstream AC and POC real MAE are mistaken for the same scale | Upstream AC uses masked 128³ U-Net crops, global-volume scaling and skip connections; POC gate uses 32×32×64 patches, patch scaling, a VAE bottleneck and a skip-free decoder. | Do not use absolute AC-vs-POC MAE to tune LR or choose an architecture. Compare within the frozen POC protocol; Section 9.11's cross-metric audit is complete. |
+| InstanceNorm unstable on 2×2×4 maps | Candidate transfer/forward checks were finite; the five-run screen does not establish a distinct normalization benefit. | Keep `--encoder_norm group` as an unrun fallback only if diagnostics expose non-finite/collapsed features; do not add it to the failed recipes post hoc. |
+| Larger encoder overwhelms the 128-d bottleneck | r007/r001/r011 missed synthetic and real reconstruction guardrails; no geology retrieval signal was measured. | Keep latent dimension 128 for compatibility. Do not infer a width/depth cause from bundled architecture+loss outcomes; use matched-loss controls if a future screen is proposed. |
+| Augmentations make dip targets noisy | The top-five screen's real reconstruction gate failed before geology objectives were enabled. | Preserve current dip policy; this risk remains untested by the screen and is not a reason to relax the reconstruction gate. |
+| Old validation overlaps pretrain-v2 training | New v2 validation volumes and manifest were used by the POC gate. | No change; retain the frozen v2 manifest and disjoint validation protocol. |
+| Many runs; noisy retrieval metrics | None of the five candidates reached geology/retrieval; there is no new n@5 evidence. | Stop this family here. If a new hypothesis is approved, run a single controlled comparison first, then replicate a retrieval winner; no third seed or automatic continuation is authorized. |
+
+**Follow-up plan (diagnostic only; no training run queued):**
+
+1. Review each saved tokenizer report by source volume and compare target/input standard deviations, reconstruction output spread, and P0b-versus-candidate error. The current evidence says the real regression is present on all four volumes, not one isolated region.
+2. Audit how the 10,000 real-training patches are selected and distributed across five source volumes; compare that support with the held-out real-validation split and the four-volume test set. Verify the masking and scaling contract end-to-end.
+3. Only if the audit yields a falsifiable transfer or real-mixing hypothesis, propose one matched-control POC run (pretrained versus scratch for the same r006 VAE architecture, or `K=0` versus `K=2`, not both factors at once). Keep the full-tokenizer +2% gate; geology fine-tuning remains conditional on passing it.
+4. Do not change LR, relax the real-MAE gate, launch geology stages, or start a new seed based solely on upstream AC values. Any follow-up requires an explicit user-approved run plan and fresh non-overwriting output/log paths.

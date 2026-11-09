@@ -17,7 +17,7 @@ patches with similar geology should rank near each other by cosine similarity.
 
 - **Primary metric:** neighbor overlap at 5 (n@5) on the frozen 7-key validation manifest
   (`docs/benchmarks/frozen_validation_manifest.json`), tie-broken by n@10.
-- **Current best:** `checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`, n@5 0.139 and
+- **Current best:** `/Volumes/CrucialX9/3dvae-poc_checkpoints/geoaware_v3_phase2_20260831/vae_epoch20.pt`, n@5 0.139 and
   n@10 0.227 (the `mu` baseline is 0.077). The recipe is supervised contrastive loss on
   `z_geo` with a geology-aware batch sampler.
 - **Why a new plan:** the parent plan found that the current recipe has plateaued at about
