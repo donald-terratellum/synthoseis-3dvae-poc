@@ -3122,7 +3122,7 @@ def train(args):
         in_ch=1,
         out_ch=1,
         base_ch=16,
-        latent_dim=128,
+        latent_dim=args.latent_dim,
         patch_shape=args.patch_size_xyz,
         deep_supervision=args.deep_supervision,
         residual_encoder=args.residual_encoder,
@@ -3364,6 +3364,8 @@ def train(args):
 
     if args.learning_rate <= 0:
         raise ValueError('--learning_rate must be positive.')
+    if args.latent_dim <= 0:
+        raise ValueError('--latent_dim must be positive.')
     if args.grad_clip <= 0:
         raise ValueError('--grad_clip must be positive.')
     if args.weight_decay < 0:
@@ -4037,6 +4039,7 @@ if __name__ == '__main__':
     p.add_argument('--kl_warmup_epochs', type=int, default=15)
     p.add_argument('--kl_fixed', type=float, default=1e-3)
     p.add_argument('--deep_supervision', action='store_true', help='Enable MONAI-style decoder deep supervision with auxiliary heads during training.')
+    p.add_argument('--latent_dim', type=int, default=128, help='Dimension of mu/logvar/z. Defaults to the production 128-D tokenizer contract.')
     p.add_argument('--residual_encoder', action='store_true', help='Use the residual encoder variant while keeping the external latent contract unchanged.')
     p.add_argument('--encoder_arch', choices=['conv', 'residual', 'resnetv2'], default='conv')
     p.add_argument('--encoder_hidden_dims', type=int, nargs='+', default=None)

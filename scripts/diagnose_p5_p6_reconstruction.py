@@ -137,7 +137,8 @@ def evaluate(model, patches, device, batch_size, seed, lpips_fn, input_mode='cle
                         values = volume_records[name].setdefault(int(index), [0.0, 0])
                         values[0] += float(error)
                         values[1] += 1
-            print(f'    evaluated {min(start + batch_size, len(patches))}/{len(patches)}', flush=True)
+            if start%250 == 0:
+                print(f'    evaluated {min(start + batch_size, len(patches))}/{len(patches)}', flush=True)
     result = {name: {key: (max(values[key] for size, values in batches) if key.endswith('_abs_max') else
                           sum(size * values[key] for size, values in batches) / len(patches))
                      for key in batches[0][1]} for name, batches in records.items()}
@@ -313,6 +314,7 @@ def main():
     parser.add_argument('--evaluation_only', action='store_true', help='Skip historical CSV audit and decoder fitting')
     parser.add_argument('--input_mode', choices=['clean', 'extrema', 'tokenizer'], default='clean')
     parser.add_argument('--contract_audit', action='store_true', help='Verify adapter parity, fixed contract and per-source reconstruction metrics without training')
+    parser.add_argument('--allow_experimental_latent_dim', action='store_true', help='Allow non-128 latent widths in an explicit contract audit; does not change the production tokenizer default.')
     parser.add_argument('--audit_training_data', help='Record theoretical reconstruction sampler exposure and 128/256/512 parameter counts')
     parser.add_argument('--out_json', default='logs/p5_p6_reconstruction_diagnostics.json')
     args = parser.parse_args()
@@ -359,9 +361,17 @@ def main():
         payload = torch.load(checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(payload['model_state_dict'], strict=True)
         del payload
-        if args.contract_audit and (model.latent_dim != 128 or tuple(model.patch_shape) != (32, 32, 64)):
-            raise ValueError('P7 contract audit requires latent_dim=128 and patch_shape=32x32x64')
+        if args.contract_audit and (
+            (not args.allow_experimental_latent_dim and model.latent_dim != 128)
+            or model.latent_dim <= 0
+            or tuple(model.patch_shape) != (32, 32, 64)
+        ):
+            raise ValueError(
+                'contract audit requires patch_shape=32x32x64 and latent_dim=128 unless '
+                '--allow_experimental_latent_dim is explicitly set'
+            )
         arm_report = {'checkpoint': checkpoint, 'model_config': model.model_config,
+                      'latent_dim': model.latent_dim,
                       'encoder_parameters': sum(parameter.numel() for parameter in model.encoder.parameters()),
                       'decoder_parameters': sum(parameter.numel() for parameter in model.decoder.parameters()),
                       'axis_audit': axis_audit(model, device), 'evaluation': {}, 'decoder_fit': {}}

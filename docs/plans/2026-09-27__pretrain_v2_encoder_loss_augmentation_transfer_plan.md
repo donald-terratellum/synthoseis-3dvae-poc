@@ -1518,6 +1518,166 @@ matched P0b control and an explicit hypothesis; no further run is queued by this
 tail -F /Users/donaldpg/synthoseis-3dvae-poc/logs/pretrain_v2_top5_arch_loss_seed20261008.log
 ```
 
+### 9.12 Proposed P9 latent-width scaling follow-up (mu=512 and 2048)
+
+**Status:** this is a bounded specification for a new Copilot implementation. This plan-writing
+change does not implement the model/scripts/tests or launch training. The implementation must
+pass its stated validation and preflight before the multi-day suite is launched.
+
+**Why this is a new hypothesis:** the P7 E1 geology pilot's seed-1 epoch 40 was the best
+single-run retrieval result recorded so far (n@5 0.013802), but the independent seed-2
+replication did not exceed its same-seed P0b reference. E1 was not adopted. The P5/P6 extension
+and all five pretrain-v2 architecture/loss candidates also failed their reconstruction gates;
+none establishes a reproducible winning architecture. P0b remains the adopted reference. The
+recorded session summaries available in this plan support testing latent capacity as a new,
+single-factor hypothesis, but do not support describing E1 as a robust winner.
+
+Use the **E1 residual-encoder geology recipe** from Sections 9.6 and 9.9 as the strongest
+single-run candidate recipe, not as an adopted model. Compare `latent_dim=512` and
+`latent_dim=2048` against the matched E1 `latent_dim=128` control from the completed seed-2
+replication. Verify that control's full config and artifacts first; retrain the 128-D control
+with the same settings only if they do not match. The historical P0b checkpoint is an external
+guardrail/reference, not a same-recipe control. Hold the E1 architecture, patch shape,
+reconstruction/geology objectives, sampler, augmentations, data, schedule, and evaluation
+protocol fixed; latent dimension is the only planned variable. Train arms sequentially, not
+concurrently.
+
+#### P9.1 Model and checkpoint support
+
+1. Add `--latent_dim` to `scripts/train.py`, a positive integer defaulting to 128, pass it to
+   `VAE3D`, and persist it in checkpoint metadata/config so resume, diagnostics, and tokenizer
+   reconstruction instantiate the correct model. Default behavior, old checkpoint loading, and
+   the production tokenizer contract must remain 128-D.
+2. Keep the geology embedding at 64 dimensions and classifier targets/output sizes unchanged.
+   `mu`, `logvar`, and sampled `z` use the selected width; all projection/classifier inputs and
+   decoder input dimensions must be wired from that same width. Do not resize or copy trained
+   128-D latent projection, log-variance, decoder-FC, classifier, or projection-head weights into
+   wider arms. Initialize each arm independently from the same seed-specific E1 encoder recipe.
+3. Before training, construct each model and assert finite outputs, correct reconstruction
+   shape, `mu`/`logvar` shape `(batch, latent_dim)`, `z_geo` shape `(batch, 64)`, classifier
+   output shapes, strict checkpoint save/load round-trip, and tokenizer adapter loading. Measure
+   parameter count, one-batch elapsed time, and peak device memory for each size. If 2048 does
+   not fit the selected device with the required training batch, fail preflight with the
+   measured resource evidence; do not silently lower batch size or change the experiment.
+
+#### P9.2 Tests
+
+Add focused tests for both 512 and 2048 dimensions. Cover reconstruction forward/backward
+(finite reconstruction loss and finite gradients), checkpoint round-trip and legacy 128-D
+compatibility, plus a geology-training step using the E1 heads/objectives: classifier loss and
+SupCon on `z_geo` must be finite and backpropagate through the wider `mu`. Also exercise the
+metadata-to-latent geology-similarity objective if it is enabled in the tested training path.
+The tests must use small synthetic patch tensors and avoid external data/checkpoints. Keep the
+default 128-D regression tests. Run focused model/training tests, then the full existing test
+suite before any experiment launch.
+
+#### P9.3 Controlled experiment protocol
+
+1. **Arms and control:** `e1_mu128`, `e1_mu512`, `e1_mu2048`. Use seed20260926 for the
+   screening because its P0b and E1 128-D controls already exist. Reuse the E1 128-D
+   reconstruction/geology artifacts only after verifying their complete config, data, schedule,
+   seed, and evaluation protocol match this section; otherwise rerun the 128-D arm with the
+   same settings as the wider arms. Train each wide arm from scratch at seed20260926; never
+   warm-start its latent projections, log-variance, decoder FC, or geology heads from a 128-D
+   checkpoint. Retain the same-seed P0b checkpoint/report as an external reconstruction and
+   retrieval reference. If a wider candidate is eligible, repeat that candidate at seed20260925
+   against the already-recorded seed-1 P0b/E1 references before any adoption decision.
+2. **Training:** reproduce the E1 reconstruction stage from Section 9.6 (150 epochs, 450
+   batches/epoch and the same paired E0/E1 data/schedule policy) separately for each latent
+   width. Apply the exact tokenizer-mode full reconstruction guardrail against the same-seed
+   P0b before starting geology training. Only passing arms proceed to the Section 9.9 E1
+   40-epoch geology recipe, with fresh optimizer state, milestones at epochs 10/20/30/40,
+   unchanged frozen manifest, and no real-test-based epoch selection. Preserve the existing
+   exact-tokenizer protocol and report clean/extrema diagnostics without changing historical
+   gate files.
+3. Keep the documented E1 settings unchanged: residual encoder, original decoder, patch
+   32x32x64, `z_geo=64`, batch 12, seed-specific schedules, MAE/LPIPS/KL weights, AdamW,
+   classifier focal settings, SupCon settings, geology sampler/quotas, augmentation, scaling,
+   validation, and real-data policy. Hold beta/KL weights fixed; record unweighted and weighted
+   KL separately because their relative pressure changes with latent dimension. Do not attribute
+   a result solely to vector width if parameter count, optimizer state, or capacity changes.
+4. Evaluate full tokenizer reconstruction on the same 5,000 synthetic validation and 5,000
+   real-test examples, same target/input conventions, and full coverage as Section 9.9. Evaluate
+   retrieval on the unchanged frozen v2 manifest and classifier sanity on natural-prevalence
+   validation data. Report n@5, n@10, eligible-query count, bootstrap intervals only for
+   precision@5/NDCG@5 (not n@5), macro AUROC, and the same-seed P0b deltas. Real test remains a
+   guardrail only, never a selection metric.
+5. Apply existing +2% tokenizer reconstruction/real-MAE eligibility checks before geology
+   training and for final candidate acceptance. A wider arm must also strictly exceed its
+   same-seed P0b n@5 reference, with n@10 only as a tie-breaker. A screening winner is
+   hypothesis-generating only. Run its independent seed through the same complete protocol
+   before adoption; both seeds must pass. If no wider arm passes, retain P0b and stop without
+   trying extra epochs or changing unrelated parameters.
+
+#### P9.4 Implementation deliverables and run safety
+
+- Add a strict `scripts/p9_mu_scaling_suite.sh` runner for the 128/512/2048 arms. It must
+  support `PRINT_COMMANDS=1` and a separately isolated short smoke mode; preflight all data,
+  checkpoints, manifest, disk/device resources, output/log paths, and latent-size round-trips;
+  run arms sequentially; refuse output overwrites; capture stdout/stderr; and stop dependent
+  stages when an arm fails a required gate. Default outputs should be under a unique
+  `/Volumes/CrucialX9/3dvae-poc_checkpoints/p9_mu_scaling_<seed>` directory with durable logs
+  under `/Volumes/CrucialX9/3dvae-poc_logs/` and a workspace `logs/` link, following the
+  existing P7 runner pattern. Never overwrite P0b/P7/P5/P6 artifacts or frozen manifests.
+- Preserve each arm's native `training_metrics.csv` and TensorBoard event files under
+  `<arm>/tensorboard`, using the existing training writer and tags. Record retrieval and
+  full-tokenizer evaluation metrics in a suite-level `latent_size_comparison.csv` with one row
+  per arm/checkpoint/seed and explicit `phase`, `epoch`, `latent_dim`, `parameter_count`,
+  synthetic tokenizer recipe total and delta, real tokenizer MAE and delta, n@5, n@10,
+  eligible-query count, macro AUROC, weighted/unweighted KL, gate status, and checkpoint path.
+  Keep missing/not-run values empty rather than zero. Include a machine-readable suite decision
+  JSON; do not alter historical CSVs.
+- Print the TensorBoard command for the suite root after successful training, e.g.
+  `uv run tensorboard --logdir <suite-output-root>`. Preserve each arm as a separate run so
+  `tensorboard --logdir` can compare all sizes and prior metric tag semantics remain intact.
+- Document commands, expected duration/resource gates, outputs, stop conditions, and
+  interpretation limits in this section and in the runner's `--help`/usage text. Validate with
+  shell syntax, print-only rendering, smoke mode, focused/full tests, CSV schema checks, and
+  checkpoint/evaluator dry runs before requesting training authorization.
+
+**Branch decision:** before this documentation change, the worktree was clean on the
+plan-associated `geology-classifier-2026-09-25` branch. Keep this plan-only addendum on that
+branch rather than creating a second planning branch. Implement the future model, tests, and
+runner on a dedicated experiment branch before launching training.
+
+#### P9.5 Implementation and preliminary 2048-D memory result (2026-11-09)
+
+Implemented on branch `experiment/mu512-latent-scaling`:
+
+- `scripts/train.py --latent_dim` now controls the VAE bottleneck; it defaults to 128, rejects
+  non-positive values, and uses the existing checkpoint `latent_dim` metadata. The tokenizer
+  adapter already reconstructs the model from that checkpoint field. The reconstruction
+  evaluator retains its default 128-D contract audit and has an explicit opt-in for experimental
+  latent widths.
+- `scripts/p9_mu_scaling.py` creates a 512-D E1 seed-2 initialization by copying only the
+  compatible, untrained residual-encoder trunk from the E1 128-D initialization. Latent
+  projections, decoder, and geology heads are freshly initialized; no trained 128-D weights are
+  resized or copied. It also profiles a full precision batch-12 MPS training step with the
+  reconstruction, LPIPS, classifier, and SupCon losses, and writes the comparison CSV/decision
+  after full evaluation.
+- `scripts/p9_mu512_experiment.sh` runs the sequential reconstruction stage, exact-tokenizer
+  gates against both same-seed P0b and E1 128-D controls, and only then the geology stage and
+  frozen-manifest/full-tokenizer milestone evaluations. It preserves native training CSV and
+  TensorBoard runs, has isolated smoke and print-only modes, and refuses existing outputs.
+- `tests/test_latent_width_experiments.py` verifies reconstruction/geology backpropagation,
+  classifier/SupCon/metadata similarity losses, checkpoint and tokenizer-adapter round-trips,
+  positive width validation, matched-control gating, and CSV finalization for both 512 and 2048.
+
+Validation on 2026-11-09: 5 focused tests pass; the full unittest suite passes (259 tests);
+runner shell syntax and complete dry-run rendering pass; the isolated one-epoch MPS smoke
+completed both 512-D training stages and a frozen-manifest benchmark. The smoke bypassed all
+full-dataset gates and is not a model result.
+
+**2048-D preliminary fit check:** on this 24-GiB machine, MPS reports a 19.07-GB
+(17.76-GiB) recommended working-set limit. A synthetic batch of 12 with 32x32x64 patches, full-precision E1 model,
+AdamW, LPIPS, classifier, and SupCon completed a forward/backward/optimizer step for both
+widths. The 2048-D model has 51,720,692 parameters (about 197 MiB of FP32 parameters), sampled
+peak MPS driver allocation was 2.31 GB, and estimated headroom to the recommended MPS limit
+was 16.76 GB, above the 20% reserve rule. Zarr patches are streamed; only the current batch is
+resident. This is a preliminary single-process fit result, not a guarantee under other system
+load or a validation of long-run stability. Keep 2048-D training gated on the 512-D result and
+repeat the memory preflight immediately before any 2048-D run.
+
 ## 10. Decisions (answered 2026-09-27)
 
 | ID | Decision | Answer |

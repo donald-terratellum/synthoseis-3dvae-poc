@@ -333,6 +333,8 @@ class VAE3D(nn.Module):
         super().__init__()
         self.base_ch = int(base_ch)
         self.latent_dim = int(latent_dim)
+        if self.latent_dim <= 0:
+            raise ValueError('latent_dim must be positive.')
         self.patch_shape = _normalize_patch_shape(patch_shape)
         self.deep_supervision = bool(deep_supervision)
         resolved_encoder_arch = 'residual' if residual_encoder and encoder_arch == 'conv' else str(encoder_arch)
