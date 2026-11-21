@@ -1,6 +1,6 @@
 # Streamed overlap and fluid-aware semantic retrieval: execution plan
 
-Updated: 2026-11-11, following the mu512 extension and the user's clarification interview.
+Updated: 2026-11-21, with the owner's revised observable-event target.
 
 ## 1. Authority, scope, and approval gates
 
@@ -10,12 +10,38 @@ to production tokenizer defaults. Do not launch training from this planning requ
 The [GitHub handoff](2026-11-11__streamed_overlap_copilot_implementation.md) contains
 the paste-ready prompt, cloud/local division, and ordered implementation tasks.
 
+### Current bounded local milestone
+
+**2026-11-21 source update:** The owner reports that all SynthoSeis datasets have
+been updated. This has not yet been verified by a fresh source audit. The
+November 15 recent-store check and concrete next-agent instructions are in the
+[target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-regeneration-check-and-copilot-instructions).
+At that time the owner identified updated training runs 1041-1214; see the proposal's
+[channel/closure follow-up](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-channelclosure-follow-up)
+for three full-label scans and the corrected generator working-tree evidence.
+The recent training cohort has not passed seismic/label alignment verification or
+channel-fluid synthesis consistency review; no recently updated validation store
+was available under the user's 48-hour criterion at that snapshot. These are historical
+observations, not findings about the newly updated datasets. Reinventory training and
+validation and re-run the required checks against a stable, explicitly identified cohort.
+Gate 1 remains closed, as does the separate training-launch approval gate.
+
+The owner subsequently authorized local implementation/audit only, ending at a
+target-contract proposal, with **no production training**. The audit runner and fixture
+tests are implemented; the local training/validation inventory and bounded examples
+are documented in the [unapproved target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md).
+Gate 1 remains closed. The runner implements audit and explicit owned TensorBoard
+start/status/stop; later training/CSV/resume and automatic trainer/service integration
+in this plan are requirements, not claims
+that those features already exist. See the proposal for the exact reproduction command,
+measurements, missing validation labels and revised lithology/closure interpretation.
+
 Proceed autonomously on the approved decisions below. Do not repeatedly ask about
 settled choices. Only stop for an unresolved scientific contract, failed safety or
 resource prerequisite, conflicting user changes, or an explicit approval gate:
 
 1. **Local target-contract approval:** audit source schemas and label examples locally,
-   propose exact semantic correspondence rules and evaluation thresholds, then obtain
+   propose remaining event-detection rules and evaluation thresholds, then obtain
    the user's approval. Array names are not sufficient evidence. Do not invent the
    remaining rules, replace missing labels, or enable semantic training before approval.
 2. **Local training-launch approval:** after implementation, tests, and local smoke pass,
@@ -71,58 +97,67 @@ Consequences for this experiment:
 
 ## 3. Approved scientific contract
 
-### Three questions, not one score
+### Two outputs
 
-1. Physical overlap: what fraction of two canonical source windows is shared?
-2. Same-realization semantics: what fraction of A's distinct ordered layers occurs
-   in B with compatible fluid fill?
-3. Cross-volume analog semantics: what fraction of A's ordered layer pattern has
-   an analogous fluid-compatible counterpart in B?
+1. Physical overlap: the fraction of the canonical 3D source windows shared, not
+   an overlap map.
+2. Directional, fluid-adjusted **observable seismic-event coverage**: the proportion
+   of A's peaks and troughs in the shared region, discounted for differences in
+   fluid proportions. A is the reference. This replaces the earlier equal-weight
+   distinct-layer and cross-volume analog definitions.
 
-Report questions 2 and 3 separately. Same numeric geological-age values in independently
-generated volumes do not establish physical horizon identity. Do not set semantic
-match to zero merely because windows are disjoint or have different volume IDs.
+An event is not necessarily a geological layer: thin layers may be unresolvable,
+and channels can replace host layers. This target is an observable-event proxy,
+not an exact count of matching layers or a direct waveform-similarity measurement.
+Because all disjoint and different-source pairs score zero, this objective does not
+reward geological similarity between non-overlapping windows or independent volumes.
+The signal defines the events; integer age values do not define event identities.
 Source coordinates and geology labels generate targets; they are not predictor inputs.
 
-### Directional common-layer coverage
+### Event coverage and fluid adjustment
 
-Approved meaning: equal weight per distinct layer of A. Missing A layers lower A-to-B
-coverage. Extra B layers do not. Thickness changes are tolerated; net-to-gross (NTG)
-differences are measured separately, not penalized in common-layer coverage.
+Use the original, unaugmented dense seismic and canonical source coordinates:
 
-Example with compatible fluids:
+- For the same source, intersect A and B in XYZ. If there is no 3D intersection,
+  the directional target is zero. Different-source pairs also have target zero;
+  numeric age values across independent volumes do not identify common horizons.
+- In the shared XY footprint, detect peaks and troughs along each full A trace first.
+  Sum events in A's shared XYZ region for the numerator, and sum events over the
+  full A depth for those same traces for the denominator. The ratio is directional.
+  A zero denominator for an overlapping pair is unavailable, with an explicit reason.
+  The overlap-boundary must not create artificial extrema.
+- In the shared XYZ region, average `geologic_age_faulted` at its shallowest and
+  deepest Z indices, across the shared XY footprint. Use these two values as the
+  age-range bounds. For each *full* A and B window, select voxels within this
+  range using the verified seismic-to-label alignment.
+- For each window, compute oil and gas fractions from `oil_closures > 0.5` and
+  `gas_closures > 0.5`, divided by **all** selected voxels, not just sand. At voxels
+  where both masks are positive, count one half toward each. Let `other = 1 - oil - gas`.
+  This mathematical remainder includes shale and water as well as brine-bearing sand;
+  it does not classify all those voxels as brine.
+- Multiply the event ratio by
+  `1 - 0.5 * (abs(oil_A-oil_B) + abs(gas_A-gas_B) + abs(other_A-other_B))`.
+  Thus full oil versus full gas has factor 0, and 10% oil versus no oil or gas
+  has factor 0.9. This is a deliberately coarse, window-level proxy: it can miss
+  differences when fluid distributions swap between layers, and is not per-layer
+  correspondence or a measured amplitude difference.
+- Treat reservoir sand outside oil/gas closures as brine **only if the updated
+  generator's synthesis policy is verified**. Do not infer this from masks alone.
+  Missing, unaligned, non-finite or otherwise unusable labels, or an empty selected
+  age-range support, must yield an explicit unavailable reason, not a zero target.
 
-- A has layers 1-10, B has layers 3-12: A-to-B coverage is 8/10.
-- A has layers 1-10, B has layers 3-14: A-to-B is 8/10; B-to-A is 8/12.
-- Different thicknesses do not alone remove a valid layer correspondence.
-- A gas-filled reservoir portion must not match an oil- or brine-filled portion.
-  Partial credit is permitted for fluid-compatible reservoir portions; mismatched
-  portions never contribute compatible credit.
+Detect events and calculate both labels before rotation, flips, scaling or added
+noise; augment A and B independently afterward. Audit how canonical support and
+transformed views relate, including sufficient real context. Do not leak source IDs,
+coordinates or labels to the predictors.
 
-Label construction must preserve vertical ordering and lateral 3D structure. Do not
-replace it with an unordered class histogram or one central trace. Use
-`geologic_age_faulted` as a candidate within-realization stratigraphic source, together
-with lithology and gas/oil/brine arrays. Audit the age encoding before defining layer
-boundaries; do not assume flooring or rounding continuous age values yields valid IDs.
-
-The following are intentionally **not decided** and must be proposed together at gate 1:
-
-- Which distinct layers enter the denominator, including non-reservoir shale layers,
-  partial boundary layers, thin/unresolvable layers, erosion, faults and channels.
-- Lateral support and fluid-compatible fractional-credit aggregation within a layer;
-  how mixed fluids, no-reservoir pairs, unknown masks and conflicting masks are handled.
-- Exact cross-volume ordered-pattern correspondence, allowable gaps and tolerances,
-  one-to-one matching, and safeguards against counting a B layer multiple times.
-- How geometry is compared while tolerating thickness, NTG and horizontal orientation.
-- Which field values identify gas/oil/brine and whether closure masks cover all relevant
-  reservoir sand. Neither outside gas/oil masks nor above-seabed water means brine.
-- Exact primary relevance formula, eligible query/candidate rules, cohort thresholds,
-  adoption effect size and uncertainty requirements.
-
-Use a written, versioned target contract with fixed rules and synthetic examples.
-Ground truth is computed from approved geology rules, not from a model learning its
-own label definition. Masked/unavailable targets must have explicit validity and reason
-fields; they must never become successful zero-valued labels.
+Still to be established at gate 1: the exact event detector, prominence/noise and
+boundary rules, valid age/support handling, seismic-to-label alignment and synthesis
+provenance, noise filter contract, and evaluation eligibility and thresholds. Propose
+these from the refreshed training/validation audit, using reviewed examples and
+explicitly reporting target yield. Do not reinterpret older observations as new-source
+validation. Version the complete target with fixed rules and synthetic examples; the
+owner's decisions above are not approval of unspecified settings.
 
 ## 4. Model and objectives
 
@@ -136,7 +171,7 @@ fields; they must never become successful zero-valued labels.
   the same view mixture in all matched arms.
 - Physical overlap predictor: calibrated cosine on mu,
   `sigmoid(a * cosine(mu_A, mu_B) + b)`, with positive `a`.
-- Directional semantic predictor: a small ordered pair head on mu_A and mu_B. Preserve
+- Directional event-coverage predictor: a small ordered pair head on mu_A and mu_B. Preserve
   argument order; a construction using only absolute difference/product is symmetric
   and cannot implement the requested directional target. Reuse existing head patterns,
   persist the head configuration, and test A/B order sensitivity with an asymmetric
@@ -156,7 +191,7 @@ the initial implementation into spatial alignment or a larger bottleneck.
 A,B -> shared encoder -> mu_A,logvar_A,mu_B,logvar_B
 mu_A,logvar_A -> sampled z_A -> decoder -> reconstructed dense A
 mu_A,mu_B -> calibrated cosine -> physical overlap
-ordered(mu_A,mu_B) -> semantic head -> directional fluid-aware coverage
+ordered(mu_A,mu_B) -> semantic head -> directional fluid-adjusted event coverage
 
 L = MAE_A + 0.1 * LPIPS_A + 0.001 * KL_A
     + 0.1 * MSE_overlap
@@ -231,9 +266,9 @@ Apply independently to each view, with identical distributions across pair categ
 
 | Transform | Approved contract |
 |---|---|
-| Horizontal rotation about Z | Uniform 0-360 degrees |
+| Horizontal rotation about Z | Every view; uniform 0-360 degrees |
 | X flip, Y flip, X/Y swap | Each with probability 0.5 |
-| XYZ scaling | Each axis independently uniform 0.9-1.1 |
+| XYZ scaling | Every view; each axis independently uniform 0.9-1.1 |
 | Noise | Depth-only, probability 0.5; added-noise SNR uniform 12-30 dB |
 | Z flip, phase rotation, polarity reversal | Disabled |
 
@@ -301,13 +336,12 @@ Produce a bounded local audit report and proposed target contract:
 
 1. Source IDs/splits, seismic keys, axes, shapes, dtype/chunks, parameter-file mapping,
    generator provenance, age/fluid encodings and label alignment.
-2. Layer/fluid coverage, missing labels, conflicts and unknown categories; explicit
-   handling proposals rather than invented brine or zero-label fallbacks.
-3. Visual/numeric examples from training and validation only: missing top layers,
-   extra bottom layers, thickness variation, NTG variation, fluid contacts, faults,
-   channels, no-reservoir cases and cross-volume analogous patterns.
-4. Proposed common-layer formula, denominator, correspondence and partial-credit rules,
-   aggregation across lateral locations, relevance and eligibility definitions.
+2. Fluid coverage, mask overlaps, missing labels and generator evidence for brine
+   outside hydrocarbon closures; explicit invalid reasons for unverified sources.
+3. Visual/numeric training and validation examples of peaks/troughs, event boundaries,
+   thickness/NTG variation, fluid contacts, faults, channels and no-reservoir cases.
+4. Proposed event detection and age-range validity rules, relevance and eligibility
+   definitions, and the yield and limitations of the approved window-level correction.
 5. Noise metadata/filter contract and actual bounded-crop memory/throughput measurements.
 6. Exact validation selection/adoption thresholds and cohort safeguards.
 
@@ -367,17 +401,20 @@ and embedding configuration: report P0b/mu512 deployed z_geo results separately 
 mu results, never label different embedding modes as a matched representation test.
 Do not evaluate an untrained projection head as a learned retrieval representation.
 
-Primary selection: directional semantic NDCG@10, with same-realization and cross-volume
-analogs reported separately and reservoir/fluid cohort safeguards. Gate 1 must approve
-the aggregation across those slices, relevance/gain definitions, tie-breaking, effect
-size, uncertainty and cohort regression thresholds. Without that contract, report
-metrics but do not declare a winner or infer adoption.
+Primary selection: directional pair-head NDCG@10, using the approved fluid-adjusted
+event target as relevance; report mu-cosine ranking separately. Different-volume
+pairs are zero-target negatives, not a cross-volume analog task. Gate 1 must approve
+relevance/gain definitions, eligibility, tie-breaking, effect size, uncertainty
+and cohort regression thresholds. Without that contract, report metrics but do not
+declare a winner or infer adoption.
 
 Report physical-overlap MAE/RMSE/bias by overlap bin and pair category; compare constant
-and waveform baselines. Report semantic coverage error, NTG differences, fluid mismatch,
+and waveform baselines. Report event-coverage error, NTG differences, fluid mismatch,
 thin layers and no-reservoir cases. Compute actual mu-cosine ranking NDCG separately
-from pair-head ranking NDCG; name which one is selected. The approval must choose the
-deployment-relevant primary ranking if the two disagree.
+from the primary pair-head ranking NDCG; do not describe head success as cosine success.
+Compare ranking baselines only with explicitly defined, valid scorers. S1, S2 and
+historical checkpoints do not have a trained semantic head; do not score an untrained
+head as their pair-head baseline or claim their cosine score is the same kind of scorer.
 
 Historical n@5/n@10, supported precision/NDCG, hard-negative rate and reconstruction
 remain secondary continuity evidence. n@5 is exact metadata-neighbor overlap, not
@@ -497,11 +534,16 @@ Implement `scripts/streamed_overlap_experiment.sh`, with documented modes:
 --mode train
 --mode resume
 --mode evaluate
+--mode tensorboard
+--mode tensorboard-status
+--mode tensorboard-stop
 --print-commands
 ```
 
-Names above are the required user-facing interface, to be implemented, not commands
-already available. Reuse repository helpers rather than introduce a second trainer.
+Audit and TensorBoard lifecycle modes are implemented; train/resume/smoke/evaluate
+remain explicitly blocked pending target approval and trainer integration. See the
+[handoff's runnable commands](2026-11-11__streamed_overlap_copilot_implementation.md).
+Reuse repository helpers rather than introduce a second trainer.
 
 Runner requirements:
 
@@ -593,8 +635,9 @@ Required focused tests:
 - Canonical overlap numeric examples, symmetry, touching/disjoint supports and boundaries.
 - Source exclusion through symlinks, axis/offset alignment, schema/parameter errors,
   unknown masks and bounded reads; no full-volume array conversion.
-- Layer-count directionality, missing/extra end layers, thickness/NTG tolerance,
-  fluid partial credit, ambiguous/no-reservoir labels, ordered 3D and cross-volume cases.
+- Directional event counts on multiple traces, overlap boundaries, zero event count,
+  disjoint and cross-volume zero targets, age-range selection, distinct fluid fractions,
+  sampled mask overlap, proxy limitations and unavailable-source reasons.
 - Every approved nuisance transform, context sufficiency, shared label/view geometry,
   noise band/sample spacing/Nyquist, RMS and negligible-energy handling.
 - Fresh independent epoch sampling, worker uniqueness, bounded caches, arm-matched

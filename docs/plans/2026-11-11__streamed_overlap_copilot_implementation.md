@@ -1,6 +1,118 @@
 # Copilot handoff: streamed overlap and directional semantic retrieval
 
-Updated: 2026-11-11.
+Updated: 2026-11-21.
+
+## Local implementation status
+
+The owner reports all SynthoSeis datasets have now been updated. Reinventory and
+audit the current training and validation sources; completion is reported, not yet
+independently verified. The November 15 audit identified updated training runs
+1041-1214, superseding the earlier 48-hour-only cohort rule for that snapshot. Apply the
+[regeneration-check instructions](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-regeneration-check-and-copilot-instructions)
+and read the [channel/closure follow-up](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-channelclosure-follow-up)
+before making claims about updated data. As of that historical snapshot, updated training
+data has unresolved alignment and synthesis/label questions, and no validation
+sources met that recency criterion. Older validation observations are not proof about
+updated validation. Do not treat those historical findings as a current inventory.
+The owner's November 21 decisions replace the old layer/analog target with directional
+fluid-adjusted observable-event coverage; the remaining target details and the launch
+approval remain separate gates.
+
+Local implementation is on `experiment/streamed-overlap-retrieval`, based on planning
+commit `1e7e642`. The owner authorized audit tooling and local training/validation
+inspection only, ending with the [unapproved target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md).
+The portable audit fixtures and actual bounded local audit passed. Gate 1 remains
+closed: this is **not** approval to implement guessed semantic labels or run training.
+The shell runner now supports audit plus owned TensorBoard start/status/stop.
+M2 targets, M3 trainer/recovery and M4 evaluation/completed-step CSV and automatic
+training/TensorBoard integration remain subsequent work. Train/resume/smoke/evaluate
+remain blocked; monitoring support is not production-training readiness.
+
+The owner clarified that channel labels `> 0.5` override background lithology as sand;
+closure masks indicate trap/fill geometry, not exhaustive lithology. The revised
+proposal and schema-2 audit separate corrected facies, closure context and final-fluid
+consistency. Channels retain identity; oil/gas closures modify fill within sand,
+including channels. Do not invalidate non-trapping sand because closure masks are
+absent or adopt the neighboring generator's late brine-channel override as the target
+rule. Verify historical synthesis agrees with the owner's hierarchy before training.
+
+The cloud prompt below is a future handoff, not a claim that this branch or private
+audit artifacts have been published. Continue from the published implementation branch
+if it is later made available; do not recreate or overwrite its audit work.
+
+### Available Bash runner and monitoring commands
+
+Run from the repository root. All actual Python commands, audit subprocesses and
+TensorBoard use the repository's **uv-managed `.venv`**, not system Python.
+The Bash wrapper defaults to `.venv/bin/python` after changing to the repository root.
+Use `PYTHON` only to explicitly select another environment; it is not changed automatically.
+
+Fresh audit (metadata and bounded examples, **not training**):
+
+```bash
+bash scripts/streamed_overlap_experiment.sh --mode audit \
+  --config scripts/streamed_overlap_audit.example.json \
+  --run-id streamed-overlap-audit-review-01
+```
+
+For any existing run, use its actual ID and suite directory. The following completed
+local audit has a run manifest and can be inspected now:
+
+```bash
+RUN_ID=streamed-overlap-target-audit-20261111-04
+RUN_DIR="/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/$RUN_ID"
+
+# Follow combined preflight/audit/service stdout and stderr.
+tail -n 100 -F "logs/$RUN_ID/training.log"
+
+# In a separate terminal: start a persistent, run-owned TensorBoard.
+bash scripts/streamed_overlap_experiment.sh --mode tensorboard \
+  --run-id "$RUN_ID" --run-dir "$RUN_DIR"
+
+# Check HTTP readiness, suite identity and PID ownership.
+bash scripts/streamed_overlap_experiment.sh --mode tensorboard-status \
+  --run-id "$RUN_ID" --run-dir "$RUN_DIR"
+
+# Verify ownership, then stop only the recorded TensorBoard PID.
+bash scripts/streamed_overlap_experiment.sh --mode tensorboard-stop \
+  --run-id "$RUN_ID" --run-dir "$RUN_DIR"
+```
+
+Open `http://127.0.0.1:6006` after successful start. **Audit runs write no training
+TensorBoard events**, so their dashboards do not show training progress. The server
+does not fabricate events or start training. Future trainer integration must write
+the required real epoch/batch tags.
+
+The equivalent standalone command, only when port 6006 is free, is:
+
+```bash
+.venv/bin/python -m tensorboard.main \
+  --logdir "$RUN_DIR" --host 127.0.0.1 --port 6006
+```
+
+This standalone foreground command is **not owned by the runner**; stop it with
+Ctrl-C in its terminal. Never stop an unrelated process to free the port. The runner
+refuses an occupied port instead of silently choosing another one.
+
+Every audit creates a fresh `logs/<run-id>/training.log` and `run_manifest.json`.
+The manifest records attempt ID, exact command, interpreter/library versions, platform,
+git revision/status/diff hash, resolved config and config/artifact hashes, return code
+and terminal status. Interrupted/failed audits are not marked training-complete.
+It does not claim model-device/memory or full-state-resume validation.
+Config/interpreter preflight errors are logged; existing outputs are never overwritten.
+Service actions append to the existing combined log and maintain `tensorboard.log`,
+`tensorboard.pid`, `tensorboard_owner.json` and a fsynced `tensorboard_history.jsonl`.
+A file lock serializes service actions; PID/start-time/UID/command plus HTTP logdir
+verification prevents claiming or stopping an unrelated listener. Successful start
+separates the service lifetime from the invoking shell; failed startup cleans up only
+its own newly spawned child. `--print-commands` creates nothing and starts nothing.
+
+Local validation used the uv environment: **35 audit/runner/legacy sampler tests
+passed**, and the mounted-source audit produced the new attempt manifest.
+Port 6006 was already occupied and was left untouched. A real TensorBoard lifecycle
+was separately verified on an explicitly selected temporary test port: readiness,
+survival after starter exit, Bash status and owned shutdown. That test server was
+stopped. This did not alter the runner's default port or run any model.
 
 ## Paste-ready GitHub Copilot prompt
 
@@ -8,15 +120,17 @@ Updated: 2026-11-11.
 Implement the approved streamed-overlap and directional fluid-aware semantic-retrieval
 experiment in donald-terratellum/synthoseis-3dvae-poc.
 
-Start from experiment/mu512-latent-scaling, including the planning documents in this
-handoff. Do not start from main: it lacks the current experiment work. At preparation
-time the saved base was 41a8f8a; the owner must publish the updated planning documents
-before assigning this cloud task. Verify those files exist on the selected base.
+Start from a published branch containing this implementation branch's audit work and
+the current planning documents. Do not start from main: it lacks the current
+experiment work. The local branch and uncommitted changes are not automatically
+available to a cloud agent; the owner must publish the intended work first.
+Verify the required files and actual base revision before implementing.
 
 Read and follow:
 1. docs/plans/2026-11-08__streamed_overlap_and_semantic_retrieval_experiment.md
 2. docs/plans/2026-11-11__streamed_overlap_copilot_implementation.md
-3. docs/sessions/2026-11-10-p9-mu512-screening-outcome-and-next-steps.md
+3. docs/plans/2026-11-11__streamed_overlap_target_contract_proposal.md
+4. docs/sessions/2026-11-10-p9-mu512-screening-outcome-and-next-steps.md
 
 Create a separate implementation branch and draft PR targeting the selected experiment
 base. Implement the opt-in code, synthetic-fixture tests, audit and shell-runner tooling.
@@ -29,6 +143,14 @@ target thresholds or launch budgets. Exact semantic-target rules require a local
 and owner approval. If no approved target contract is available, implement the audit
 and infrastructure first, fail closed for semantic training, and report
 LOCAL_TARGET_VALIDATION_PENDING. Do not claim the experiment is training-ready.
+
+The owner reports dataset replacement is complete. Reinventory the current cohorts;
+use the dated regeneration-check instructions in the target-contract proposal as
+historical context, separately inventory current source and validation cohorts,
+and verify actual generator provenance, alignment and fluid synthesis for the relevant
+cohorts. Do not treat older validation results, timestamps, or a recorded SHA alone as
+proof that replacement is complete or that stored waveforms match a target. Do not
+modify, delete, regenerate or overwrite source data without separate owner approval.
 
 Cloud checks use tiny fabricated fixtures only. Do not upload or request private Zarr
 cubes/checkpoints, assume /Volumes is mounted, run long training, use final-test data
@@ -84,19 +206,21 @@ clarification rather than silently choose a different objective.
 
 Important approved decisions:
 
-- Two distinct outputs: physical canonical overlap and directional common-layer
-  coverage with fluid-compatible partial credit.
-- Equal weight per distinct A layer; tolerate thickness differences; measure NTG
-  differences separately without penalizing coverage.
-- Same-realization physical layer identity and cross-volume analog patterns have
-  separate labels/evaluation. Do not compare numeric age IDs across independent sources.
+- Two distinct outputs: physical canonical overlap fraction and directional,
+  fluid-adjusted observable-event coverage, with A as the reference. This replaces
+  equal-weight layer coverage; the event ratio is not an exact layer count.
+- Count peaks and troughs in the shared region relative to the full A depth over
+  shared XY, before augmentation; apply the execution plan's window-level
+  oil/gas/other correction. Disjoint or different-source pairs have zero coverage.
+  Do not compare numeric age IDs across independent sources.
 - Calibrated cosine overlap on mu; an ordered learned semantic head on mu_A/mu_B.
-  Measure mu-cosine retrieval independently. A later spatial-alignment model is deferred.
+  Select by directional pair-head ranking and measure mu-cosine retrieval independently.
+  A later spatial-alignment model is deferred.
 - Fresh E1 residual mu128, skip-free decoder, 32x32x64, shared encoder; no trained
   P0b/mu512 initialization and no production search scoring changes.
 - Stream volume-balanced original fullstack inputs, 12 pairs per batch: 6 same-source
   overlap, 3 same-volume disjoint, 3 cross-volume; two zero-shift pairs; +/-25% XYZ offsets.
-- Approved rotation/flips/swap/scales and source-band depth noise, not arbitrary
+- Rotation and scaling on every view, independent flips/swap and source-band depth noise, not arbitrary
   phase/polarity invariance. Apply tokenizer normalization/extrema input; reconstruct
   noisy augmented dense A. Synthetic training only.
 - Three sequential matched arms; epochs/batches are specified at launch, not guessed.
@@ -111,25 +235,11 @@ legacy sweep. P0b and mu512 are named evaluation references only.
 
 Owner preparation, before assigning the cloud task:
 
-1. Review the revised plan and this handoff. Preserve intended work using explicit paths;
-   never add datasets, private labels, logs, checkpoints or environment secrets.
-2. Commit/push the planning documents to `experiment/mu512-latent-scaling`, or publish
-   an explicitly named successor planning branch containing the same base work.
-   Do not assume the cloud agent can see local uncommitted edits.
-   This checkout's `.git/info/exclude` ignores new files under `docs/plans/`. The
-   revised existing plan is tracked, but this new handoff is not. After review,
-   explicitly force-add only this intended Markdown file; do not remove the folder
-   exclusion or force-add its other contents:
-
-   ```sh
-   git add -u -- docs/plans/2026-11-08__streamed_overlap_and_semantic_retrieval_experiment.md
-   git add -f -- docs/plans/2026-11-11__streamed_overlap_copilot_implementation.md
-   git diff --cached --check
-   git diff --cached --stat
-   # Review the staged content, then commit with the co-author trailer and push
-   # the selected planning branch. Do not execute this step without owner approval.
-   ```
-
+1. Review the revised plans, audit code and intended branch contents. Preserve intended
+   work using explicit paths; never add datasets, private labels, logs, checkpoints or
+   environment secrets. Local ignored or uncommitted files are not visible in the cloud.
+2. With owner approval, publish a branch containing the reviewed plans and audit work.
+   Verify the committed content, not merely the presence of files in the local worktree.
 3. Select that branch explicitly for the Copilot task/issue. If the assignment UI cannot
    select it, arrange the supported base-branch workflow first; do not let Copilot
    silently rebuild the experiment from `main`.
@@ -182,11 +292,12 @@ fixtures validate real source labels. Print the exact local command for the owne
 
 ### M2: obtain local target-contract approval
 
-The local assistant/user runs the read-only audit against mounted sources. Audit
-training/validation examples, not final-test model performance. Present one approval
-form covering the unresolved contract listed in execution-plan sections 3 and 7:
-denominator/background, layer identity/analog correspondence, 3D/partial-fluid credit,
-validity/no-reservoir behavior, noise filter and metric/adoption thresholds.
+The local assistant/user runs the read-only audit against the updated mounted sources.
+Audit training/validation examples, not final-test model performance. Present one
+approval form covering the unresolved contract listed in execution-plan sections 3
+and 7: event-detection and boundary settings, age-range validity and alignment,
+source fluid provenance, noise filter and metric/adoption thresholds. Preserve the
+owner's settled event ratio and simple window-level fluid formula.
 
 The owner supplies a versioned approved contract to the implementation branch. Share
 only approved non-sensitive rules and fabricated fixture cases with the cloud agent;
