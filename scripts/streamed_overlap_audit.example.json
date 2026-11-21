@@ -1,0 +1,7 @@
+{
+  "source_root": "/Volumes/CrucialX9/fake_data",
+  "seismic_key": "seismicCubes_cumsum_fullstack",
+  "sample_sources_per_split": 3,
+  "label_z_offset_hypothesis": 1,
+  "seed": 20260926
+}
