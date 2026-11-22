@@ -5,24 +5,29 @@ import os
 import random
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, create_autospec, patch
 
 import numpy as np
 import torch
 
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_epoch_runner import SelectedReconstruction, SuiteInitialization, run_arm_epochs
+from scripts.streamed_overlap_epoch_runner import (
+    ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, run_arm_epochs, run_suite_epochs,
+)
 from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _rngs_equal, save_suite_initialization, save_suite_run_metadata, verify_arm_initial_checkpoint,
     verify_saved_suite_initialization, verify_suite_initialization, verify_suite_run_metadata,
 )
-from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
+from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
+from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.train import EarlyStoppingState
+from torch.utils.tensorboard import SummaryWriter
 
 
 class FixtureSampler:
@@ -378,6 +383,122 @@ class ArmInitializationTests(unittest.TestCase):
                 run()
             restore.assert_called_once()
             train.assert_not_called()
+
+    def test_suite_runs_arms_sequentially_and_stops_on_failure(self):
+        arms = self.prepare_suite()
+        evidence = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        checkpoints = {arm: item.initial_checkpoint for arm, item in arms.items()}
+        suite = SuiteInitialization(evidence["path"], evidence["evidence_sha256"], checkpoints)
+        metadata = save_suite_run_metadata(
+            self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+            initialization_sha256=evidence["evidence_sha256"],
+        )
+        for item in arms.values():
+            (item.initial_checkpoint.parent / "evaluation").mkdir()
+        calls = []
+
+        @contextmanager
+        def runtime_factory(arm):
+            calls.append(("open", arm))
+            try:
+                model = create_autospec(StreamedPairVAE, instance=True)
+                model.arm = arm
+                yield ArmRuntime(
+                    model, create_autospec(torch.optim.Optimizer, instance=True),
+                    create_autospec(torch.optim.lr_scheduler.ReduceLROnPlateau, instance=True),
+                    create_autospec(StreamedPairSampler, instance=True),
+                    create_autospec(EarlyStoppingState, instance=True), create_autospec(SummaryWriter, instance=True),
+                )
+            finally:
+                calls.append(("close", arm))
+
+        def arm_runner(model, *args, **kwargs):
+            arm = model.arm
+            calls.append(("run", arm))
+            self.assertIs(args[3], arms[arm].journal)
+            self.assertEqual(kwargs["checkpoint_path"], arms[arm].final_checkpoint)
+            self.assertEqual(kwargs["initial_checkpoint"], arms[arm].initial_checkpoint)
+            self.assertEqual(kwargs["attempt_id"], "attempt")
+            if arm == "S1":
+                self.assertIsNone(kwargs["s1"])
+            else:
+                self.assertEqual(kwargs["s1"].checkpoint_path, arms["S1"].final_checkpoint)
+                self.assertIs(kwargs["s1"].journal, arms["S1"].journal)
+                self.assertEqual(kwargs["s1"].selection_kind, "reconstruction")
+            if arm == "S2" and fail_s2:
+                raise RuntimeError("interrupted S2")
+            return {"arm": arm}
+
+        arguments = {
+            "attempt_id": "attempt", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
+            "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
+            "search_manifest": {}, "diagnostic_manifest": {}, "formal_config": {}, "guardrail_manifest": {},
+            "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
+            "suite_initialization": suite,
+        }
+        journals = {arm: item.journal for arm, item in arms.items()}
+        with patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm:
+            original = metadata["path"].read_bytes()
+            metadata["path"].unlink()
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
+            metadata["path"].write_bytes(original)
+            fail_s2 = True
+            with self.assertRaisesRegex(RuntimeError, "interrupted S2"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            self.assertEqual(calls, [("open", "S1"), ("run", "S1"), ("close", "S1"),
+                                     ("open", "S2"), ("run", "S2"), ("close", "S2")])
+            calls.clear()
+            @contextmanager
+            def suppressing_factory(arm):
+                with runtime_factory(arm) as runtime:
+                    try:
+                        yield runtime
+                    except RuntimeError:
+                        pass
+
+            with self.assertRaisesRegex(RuntimeError, "S2 runtime suppressed"):
+                run_suite_epochs(journals, suppressing_factory, **arguments)
+            self.assertNotIn(("open", "S3"), calls)
+            calls.clear()
+            fail_s2 = False
+            result = run_suite_epochs(journals, runtime_factory, **arguments)
+            self.assertEqual(result, {arm: {"arm": arm} for arm in ("S1", "S2", "S3")})
+            self.assertEqual(calls, [(action, arm) for arm in ("S1", "S2", "S3")
+                                     for action in ("open", "run", "close")])
+
+    def test_suite_rejects_unlocked_journal_before_opening_runtime(self):
+        arms = self.prepare_suite()
+        evidence = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        checkpoints = {arm: item.initial_checkpoint for arm, item in arms.items()}
+        save_suite_run_metadata(
+            self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+            initialization_sha256=evidence["evidence_sha256"],
+        )
+        for item in arms.values():
+            (item.initial_checkpoint.parent / "evaluation").mkdir()
+        arms["S3"].journal.close()
+        factory = Mock()
+        with patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs") as run_arm:
+            with self.assertRaisesRegex(ValueError, "locked journal"):
+                run_suite_epochs(
+                    {arm: item.journal for arm, item in arms.items()}, factory,
+                    attempt_id="attempt", monitor_batches={}, validate_epoch=object(), lpips_loss_fn=object(),
+                    manifest_path=self.suite_dir / "manifest", source_root=self.source,
+                    search_manifest={}, diagnostic_manifest={}, formal_config={}, guardrail_manifest={},
+                    guardrail_config={}, historical=HistoricalReconstruction(
+                        self.suite_dir / "report", "a" * 64, self.suite_dir / "checkpoint", "b" * 64, "fixture",
+                    ), matching_config=self.config, hashes=self.hashes,
+                    suite_initialization=SuiteInitialization(evidence["path"], evidence["evidence_sha256"], checkpoints),
+                )
+            run_arm.assert_not_called()
+            factory.assert_not_called()
 
     def test_persisted_suite_evidence_detects_tampering_and_wrong_pin(self):
         arms = self.prepare_suite()

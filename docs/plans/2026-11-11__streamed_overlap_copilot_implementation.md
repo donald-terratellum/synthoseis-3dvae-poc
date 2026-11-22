@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+An opt-in `run_suite_epochs` coordinator now calls the existing per-arm runner
+in S1, S2, S3 order. It verifies the pinned suite metadata and all three locked
+journals before opening an arm runtime, releases each runtime context before the
+next, and supplies S1's reconstruction reference to S2 and S3. An arm failure
+stops later arms, including when a runtime context suppresses an exception.
+On retry the existing per-arm checkpoint recovery is responsible for avoiding
+repeated committed updates. Numeric guardrail failures remain reported results,
+not automatic adoption decisions.
+
+The caller still owns journal locks, runtime construction and cleanup. This
+prepared-suite coordinator does not bootstrap the suite, bind the complete
+resolved launch configuration, enforce resource and logging gates, or authorize
+training. It is not connected to the shell's blocked train/resume/evaluate modes.
+Two synthetic ExFAT tests passed in 5.44 seconds wall time at 525,467,648 bytes
+peak RSS; arm execution was mocked, no optimizer step occurred, and temporary
+files were removed. This is not a training-resource estimate. The portable
+streamed suite passed 220 tests, with one skipped and 54 subtests, using
+`.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The per-arm runner now requires verified `suite_metadata.json` before restoring
 or advancing an arm, and requires the caller's initialization pin to match the
 pin in that metadata. The evidence file must be the suite's
@@ -294,11 +313,10 @@ Private manifests, checkpoints and audit outputs remain on the external volume a
 are not in GitHub. `.venv/bin/uv` was unavailable; use `.venv/bin/python`, not
 system Python.
 
-Training is **not ready or authorized**. The epoch helper is not the sequential
-S1/S2/S3 suite runner. Next implement and verify the actual configuration-bound
-suite runner, durable train/resume and logging integration, selected-checkpoint
-reconstruction comparison suite integration, frozen bounded-search and diagnostics
-inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
+Training is **not ready or authorized**. The prepared-suite coordinator is not
+a complete launch runner. Next implement suite bootstrap and the complete
+configuration-bound train/resume and logging integration, frozen bounded-search
+and diagnostics inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
 smoke and present proposed launch commands, measurements and remaining approval
 gates. A matched streamed S1 reference and independent-seed replication require
 later training. No production thin-run threshold or training budget has been chosen.

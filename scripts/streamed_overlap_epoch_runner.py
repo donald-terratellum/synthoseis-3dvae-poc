@@ -4,13 +4,17 @@ import hashlib
 import json
 import math
 import os
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 import time
+from typing import Callable
 import uuid
 
 import numpy as np
+import torch
 import zarr
+from torch.utils.tensorboard import SummaryWriter
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state
@@ -22,17 +26,19 @@ from scripts.streamed_overlap_guardrails import (
     _manifest as _guardrail_manifest, _measurement, _sha256, compare_reconstruction_guardrails,
 )
 from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
-from scripts.streamed_overlap_journal import BatchJournal, _atomic_record, _sync_directory
+from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record, _sync_directory
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
     verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_run_metadata,
 )
+from scripts.streamed_overlap_model import StreamedPairVAE
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
 )
 from scripts.streamed_overlap_search import run_bounded_searches
+from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
-from scripts.train import train_streamed_epoch
+from scripts.train import EarlyStoppingState, train_streamed_epoch
 from src.tokenizer.core.model_adapter import choose_torch_device
 
 
@@ -456,6 +462,16 @@ class SuiteInitialization:
     initial_checkpoints: dict[str, Path]
 
 
+@dataclass(frozen=True)
+class ArmRuntime:
+    model: StreamedPairVAE
+    optimizer: torch.optim.Optimizer
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau
+    sampler: StreamedPairSampler
+    early_stopping: EarlyStoppingState
+    writer: SummaryWriter
+
+
 def _reference_hash(historical: HistoricalReconstruction) -> str:
     if (not isinstance(historical, HistoricalReconstruction)
             or not _sha256(historical.report_sha256) or not _sha256(historical.checkpoint_sha256)
@@ -783,3 +799,69 @@ def run_arm_epochs(
     if matched_streams is not None:
         result["matched_streams"] = matched_streams
     return result
+
+
+def run_suite_epochs(
+    journals: dict[str, BatchJournal], runtime_factory: Callable[[str], AbstractContextManager[ArmRuntime]], *,
+    attempt_id: str, monitor_batches: dict, validate_epoch, lpips_loss_fn,
+    manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
+    formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
+    historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
+    suite_initialization: SuiteInitialization,
+) -> dict[str, dict]:
+    """Run prepared arms in order; launch approval and resource gates remain external."""
+    if (not isinstance(suite_initialization, SuiteInitialization)
+            or not isinstance(suite_initialization.evidence_path, Path)
+            or suite_initialization.evidence_path.name != "initialization_evidence.json"
+            or not isinstance(journals, dict) or set(journals) != {"S1", "S2", "S3"}
+            or not callable(runtime_factory) or not isinstance(attempt_id, str)
+            or not attempt_id or any(character in attempt_id for character in "\r\n")):
+        raise ValueError("A prepared suite, three journals and an explicit attempt are required.")
+    metadata = verify_suite_run_metadata(
+        suite_initialization.evidence_path.parent, suite_initialization.initial_checkpoints,
+        matching_config=matching_config, expected_hashes=hashes,
+    )
+    if metadata["initialization_sha256"] != suite_initialization.evidence_sha256:
+        raise ValueError("The suite must use the initialization pin recorded in suite metadata.")
+    for arm in ("S1", "S2", "S3"):
+        journal = journals[arm]
+        initial = suite_initialization.initial_checkpoints[arm]
+        evaluation = initial.parent / "evaluation"
+        if (not isinstance(journal, BatchJournal) or journal.lock_fd == -1 or journal.fields != STEP_FIELDS
+                or journal.path != initial.parent / "batch_metrics.csv"
+                or evaluation.is_symlink() or not evaluation.is_dir()):
+            raise ValueError("Each arm requires its locked journal and regular evaluation directory.")
+        _permitted_file(journal.path)
+
+    s1_initial = suite_initialization.initial_checkpoints["S1"]
+    s1 = SelectedReconstruction(
+        s1_initial.with_name("last.pt"), journals["S1"], manifest_path, source_root,
+        search_manifest, diagnostic_manifest, formal_config, s1_initial.parent / "evaluation", "reconstruction",
+    )
+    results = {}
+    for arm in ("S1", "S2", "S3"):
+        initial = suite_initialization.initial_checkpoints[arm]
+        completed = False
+        with runtime_factory(arm) as runtime:
+            if not isinstance(runtime, ArmRuntime) or runtime.model.arm != arm:
+                raise ValueError("The runtime factory must provide the requested arm.")
+            results[arm] = run_arm_epochs(
+                runtime.model, runtime.optimizer, runtime.scheduler, runtime.sampler, journals[arm],
+                lpips_loss_fn, runtime.writer,
+                run_id=matching_config["run_id"], seed=matching_config["experiment_seed"],
+                attempt_id=attempt_id, batches_per_epoch=matching_config["batches_per_epoch"],
+                sparse_probability=matching_config["sparse_probability"], monitor_batches=monitor_batches,
+                monitor_seed=matching_config["monitor_seed"], validation_seed=matching_config["validation_seed"],
+                validate_epoch=validate_epoch, epoch_csv=initial.parent / "training_metrics.csv",
+                checkpoint_path=initial.with_name("last.pt"), hashes=hashes, early_stopping=runtime.early_stopping,
+                manifest_path=manifest_path, source_root=source_root, search_manifest=search_manifest,
+                diagnostic_manifest=diagnostic_manifest, formal_config=formal_config,
+                evaluation_dir=initial.parent / "evaluation", guardrail_manifest=guardrail_manifest,
+                guardrail_config=guardrail_config, historical=historical, s1=None if arm == "S1" else s1,
+                matching_config=matching_config, initial_checkpoint=initial, suite_initialization=suite_initialization,
+            )
+            completed = True
+        if not completed:
+            raise RuntimeError(f"{arm} runtime suppressed an arm failure.")
+        del runtime
+    return results
