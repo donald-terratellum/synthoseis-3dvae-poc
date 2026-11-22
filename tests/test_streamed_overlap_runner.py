@@ -14,6 +14,7 @@ from scripts import streamed_overlap_integration_smoke as integration_smoke
 from scripts.streamed_overlap_smoke import _validate_config
 from test_streamed_overlap_audit import make_source
 from scripts.streamed_overlap_audit import DEFAULT_SEISMIC_KEY
+from scripts.streamed_overlap_audit import content_hash
 
 
 FIXTURE_SERVER = """
@@ -205,6 +206,115 @@ class AuditAttemptTests(unittest.TestCase):
             self.assertFalse(manifest["production_training_allowed"])
             self.assertEqual(manifest["artifact_sha256"]["smoke_report.json"],
                              runner.file_hash(output / "smoke_report.json"))
+
+    def test_prepare_print_only_and_missing_limits_have_no_side_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = [
+                "bash", "scripts/streamed_overlap_experiment.sh", "--mode", "prepare",
+                "--run-id", "prepare-print-fixture", "--output-root", temporary,
+                "--config", "not-read.json", "--mps-memory-fraction", "0.5",
+                "--max-wall-seconds", "30", "--print-commands",
+            ]
+            result = subprocess.run(args, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--action prepare", result.stdout)
+            self.assertIn("--action confirm-prepare-log", result.stdout)
+            self.assertIn("--mps-memory-fraction 0.5", result.stdout)
+            self.assertIn("--max-wall-seconds 30", result.stdout)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+            result = subprocess.run(args[:-3] + ["--print-commands"], capture_output=True, text=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires --mps-memory-fraction", result.stderr)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_prepare_attempt_records_pinned_output_and_propagates_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.json"
+            config.write_text('{"settings":"fixture"}')
+            output = root / "input-record.json"
+            logs = root / "logs"
+            logs.mkdir()
+            record = {"schema": "streamed-suite-inputs-v1", "fixture": "not a training result"}
+            child = mock.Mock()
+            child.wait.return_value = 0
+
+            def start_child(command):
+                self.assertIn("scripts.streamed_overlap_prepare", command)
+                self.assertEqual(command[command.index("--mps-memory-fraction") + 1], "0.5")
+                output.write_text(json.dumps(record))
+                return child
+
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                 mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]):
+                self.assertEqual(runner.prepare_attempt(
+                    config, output, logs, "fixture", mps_memory_fraction=0.5, max_wall_seconds=30,
+                ), 0)
+            manifest = json.loads((logs / "run_manifest.json").read_text())
+            self.assertEqual(manifest["status"], "preparation_child_complete_log_unconfirmed")
+            self.assertFalse(manifest["production_training_allowed"])
+            self.assertEqual(manifest["suite_config_sha256"], content_hash(record))
+            self.assertEqual(manifest["artifact_sha256"]["suite_input_record"], runner.file_hash(output))
+            log = logs / "training.log"
+            log.write_text("fixture combined log")
+            output.write_text('{"schema":"changed"}')
+            with self.assertRaisesRegex(ValueError, "changed before log confirmation"):
+                runner.confirm_prepare_log(logs)
+            self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"],
+                             "preparation_child_complete_log_unconfirmed")
+            output.write_text(json.dumps(record))
+            runner.confirm_prepare_log(logs)
+            self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"],
+                             "preparation_complete_training_not_authorized")
+            with self.assertRaises(FileExistsError):
+                runner.prepare_attempt(config, output, logs, "fixture", mps_memory_fraction=0.5, max_wall_seconds=30)
+
+            logs2 = root / "logs2"
+            logs2.mkdir()
+            child.wait.return_value = 7
+            with mock.patch.object(runner.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]):
+                self.assertEqual(runner.prepare_attempt(
+                    config, root / "failed", logs2, "failure", mps_memory_fraction=0.5, max_wall_seconds=30,
+                ), 7)
+            failed = json.loads((logs2 / "run_manifest.json").read_text())
+            self.assertEqual((failed["status"], failed["returncode"]), ("failed", 7))
+            self.assertNotIn("suite_config_sha256", failed)
+            logs3 = root / "logs3"
+            logs3.mkdir()
+            child.wait.return_value = -15
+            with mock.patch.object(runner.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]):
+                self.assertEqual(runner.prepare_attempt(
+                    config, root / "interrupted", logs3, "signal", mps_memory_fraction=0.5, max_wall_seconds=30,
+                ), 143)
+            failed = json.loads((logs3 / "run_manifest.json").read_text())
+            self.assertEqual((failed["status"], failed["child_returncode"], failed["returncode"]),
+                             ("failed", -15, 143))
+
+    def test_prepare_attempt_rejects_changed_config_after_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir()
+            config = root / "config.json"
+            config.write_text("{}")
+            output = root / "input-record.json"
+            child = mock.Mock()
+            child.wait.return_value = 0
+
+            def start_child(command):
+                config.write_text('{"changed":true}')
+                output.write_text('{"schema":"streamed-suite-inputs-v1"}')
+                return child
+
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                 mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]):
+                with self.assertRaisesRegex(ValueError, "changed during"):
+                    runner.prepare_attempt(config, output, logs, "fixture", mps_memory_fraction=0.5,
+                                           max_wall_seconds=30)
+            manifest = json.loads((logs / "run_manifest.json").read_text())
+            self.assertEqual((manifest["status"], manifest["returncode"]), ("failed", 1))
 
     def test_smoke_config_rejects_source_output_and_validation_v2(self):
         with tempfile.TemporaryDirectory() as temporary:

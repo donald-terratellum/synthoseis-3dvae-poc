@@ -4,6 +4,32 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The existing shell runner can now capture suite-input preparation and its
+preflight output under a new run ID:
+
+```sh
+bash scripts/streamed_overlap_experiment.sh --mode prepare \
+  --config <private-suite-settings.json> --run-id <new-preparation-id> \
+  --output-root <private-output-directory> --mps-memory-fraction <preparation-limit> \
+  --max-wall-seconds <preparation-limit> [--print-commands]
+```
+
+The private output directory must already exist. The output is the suite-input
+JSON file `<private-output-directory>/<run-id>`;
+stdout and stderr go to `logs/<run-id>/training.log`. The attempt manifest
+records the input and output hashes and the logical suite-input hash, and marks
+preparation as **not training-authorized**. A failed child or changed input
+config is recorded as failure. Successful preparation is marked complete only
+after `tee` exits successfully and the log is synced; otherwise a finished
+child remains log-unconfirmed. Print-only creates nothing. This mode does not
+start TensorBoard, run an optimizer, perform full launch checks or enable the
+blocked train/resume/evaluate shell modes. Runner, audit and epoch fixtures
+passed 64 tests and 24 subtests using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_runner.py tests/test_streamed_overlap_audit.py
+tests/test_streamed_overlap_epoch_runner.py` in 5.97 seconds. An invalid-config
+fixture exercised the real shell, runner and preparation child; no real-data
+preparation or training ran.
+
 The suite-input record can now be prepared without training:
 
 ```sh

@@ -1,4 +1,4 @@
-"""Audit attempt records and owned TensorBoard services; not a streamed trainer."""
+"""Audit, preparation and owned TensorBoard services; not a streamed trainer."""
 
 from __future__ import annotations
 
@@ -215,6 +215,123 @@ def smoke_attempt(config: Path, output: Path, log_dir: Path, run_id: str) -> int
         save_json(manifest_path, manifest, replace=True)
 
 
+def prepare_attempt(
+    config: Path, output: Path, log_dir: Path, run_id: str, *, mps_memory_fraction: float, max_wall_seconds: float,
+) -> int:
+    manifest_path = log_dir / "run_manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(f"Refusing an existing attempt manifest: {manifest_path}")
+    command = [
+        sys.executable, "-u", "-m", "scripts.streamed_overlap_prepare",
+        "--config", str(config), "--output", str(output),
+        "--mps-memory-fraction", str(mps_memory_fraction), "--max-wall-seconds", str(max_wall_seconds),
+    ]
+    manifest = {
+        "schema_version": 1, "mode": "prepare", "run_id": run_id, "attempt_id": uuid.uuid4().hex,
+        "started_at_utc": utc_now(), "status": "preflight", "command": command,
+        "config_path": str(config.resolve()), "output_path": str(output.resolve()),
+        "log_path": str((log_dir / "training.log").resolve()),
+        "production_training_allowed": False, "training_device": "mps",
+        "python": sys.version, "platform": platform.platform(), "runner_sha256": file_hash(Path(__file__)),
+        "prepare_sha256": file_hash(Path(__file__).with_name("streamed_overlap_prepare.py")),
+    }
+    save_json(manifest_path, manifest)
+    returncode = 1
+    try:
+        config_bytes = config.read_bytes()
+        manifest["config_sha256"] = hashlib.sha256(config_bytes).hexdigest()
+        resolved_config = json.loads(config_bytes)
+        if not isinstance(resolved_config, dict):
+            raise ValueError("Suite preparation config must be a JSON object.")
+        manifest["resolved_config"] = resolved_config
+        manifest["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        changes = subprocess.check_output(["git", "diff", "HEAD", "--binary"])
+        manifest["git_diff_sha256"] = hashlib.sha256(changes).hexdigest()
+        manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True).splitlines()
+        manifest["versions"] = {
+            package: importlib.metadata.version(package)
+            for package in ("numpy", "zarr", "torch", "tensorboard", "lpips")
+        }
+        manifest["status"] = "running"
+        save_json(manifest_path, manifest, replace=True)
+        print(f"Preparation command: {shlex.join(command)}", flush=True)
+        child = subprocess.Popen(command)
+        try:
+            returncode = child.wait()
+        except (KeyboardInterrupt, SystemExit) as interruption:
+            code = interruption.code if isinstance(interruption, SystemExit) else 130
+            returncode = code if isinstance(code, int) else 1
+            manifest["status"] = "interrupted"
+            child.send_signal(signal.SIGTERM if isinstance(interruption, SystemExit) else signal.SIGINT)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            raise
+        if returncode == 0:
+            from scripts.streamed_overlap_audit import content_hash
+
+            if file_hash(config) != manifest["config_sha256"]:
+                raise ValueError("Suite preparation config changed during the attempt.")
+            if output.is_symlink() or not output.is_file():
+                raise ValueError("Suite preparation did not produce a regular input record.")
+            output_bytes = output.read_bytes()
+            record = json.loads(output_bytes)
+            if not isinstance(record, dict) or record.get("schema") != "streamed-suite-inputs-v1":
+                raise ValueError("Suite preparation did not produce a suite input record.")
+            output_hash = hashlib.sha256(output_bytes).hexdigest()
+            if file_hash(output) != output_hash:
+                raise ValueError("Suite input record changed during preparation.")
+            manifest["suite_config_sha256"] = content_hash(record)
+            manifest["artifact_sha256"] = {"suite_input_record": output_hash}
+            manifest["status"] = "preparation_child_complete_log_unconfirmed"
+        else:
+            manifest["status"] = "failed"
+        manifest["child_returncode"] = returncode
+        returncode = returncode if returncode >= 0 else 128 - returncode
+        return returncode
+    except KeyboardInterrupt:
+        manifest["status"] = "interrupted"
+        returncode = 130
+        raise
+    finally:
+        if manifest["status"] in ("preflight", "running"):
+            manifest["status"] = "failed"
+            if returncode == 0:
+                returncode = 1
+        manifest["returncode"] = returncode
+        manifest["finished_at_utc"] = utc_now()
+        save_json(manifest_path, manifest, replace=True)
+
+
+def confirm_prepare_log(log_dir: Path) -> None:
+    from scripts.streamed_overlap_audit import content_hash
+
+    manifest_path = log_dir / "run_manifest.json"
+    log_path = log_dir / "training.log"
+    if any(path.is_symlink() or not path.is_file() for path in (manifest_path, log_path)):
+        raise ValueError("Preparation requires a regular attempt manifest and completed log.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (not isinstance(manifest, dict) or manifest.get("mode") != "prepare"
+            or manifest.get("status") != "preparation_child_complete_log_unconfirmed"
+            or manifest.get("production_training_allowed") is not False
+            or manifest.get("returncode") != 0 or manifest.get("child_returncode") != 0
+            or manifest.get("log_path") != str(log_path.resolve())):
+        raise ValueError("Preparation attempt is not awaiting log confirmation.")
+    config = Path(manifest["config_path"])
+    output = Path(manifest["output_path"])
+    if (any(path.is_symlink() or not path.is_file() for path in (config, output))
+            or file_hash(config) != manifest["config_sha256"]
+            or file_hash(output) != manifest["artifact_sha256"]["suite_input_record"]
+            or content_hash(json.loads(output.read_text(encoding="utf-8"))) != manifest["suite_config_sha256"]):
+        raise ValueError("Preparation config or input record changed before log confirmation.")
+    with log_path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    manifest["status"] = "preparation_complete_training_not_authorized"
+    save_json(manifest_path, manifest, replace=True)
+
+
 def process_identity(pid: int) -> dict | None:
     if pid <= 1:
         raise ValueError("Refusing an unsafe service PID.")
@@ -414,17 +531,29 @@ def main() -> None:
     signal.signal(signal.SIGTERM, terminate)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--action", required=True, choices=(
-        "audit", "smoke", "tensorboard", "tensorboard-status", "tensorboard-stop",
+        "audit", "smoke", "prepare", "confirm-prepare-log", "tensorboard", "tensorboard-status", "tensorboard-stop",
     ))
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--run-id")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--mps-memory-fraction", type=float)
+    parser.add_argument("--max-wall-seconds", type=float)
     args = parser.parse_args()
-    if args.action in {"audit", "smoke"}:
+    if args.action == "confirm-prepare-log":
+        confirm_prepare_log(args.log_dir)
+        return
+    if args.action in {"audit", "smoke", "prepare"}:
         if args.config is None or args.output is None or args.run_id is None:
-            parser.error("Audit and smoke require --config, --output and --run-id.")
+            parser.error("Audit, smoke and prepare require --config, --output and --run-id.")
+        if args.action == "prepare":
+            if args.mps_memory_fraction is None or args.max_wall_seconds is None:
+                parser.error("Prepare requires --mps-memory-fraction and --max-wall-seconds.")
+            raise SystemExit(prepare_attempt(
+                args.config, args.output, args.log_dir, args.run_id,
+                mps_memory_fraction=args.mps_memory_fraction, max_wall_seconds=args.max_wall_seconds,
+            ))
         attempt = audit_attempt if args.action == "audit" else smoke_attempt
         raise SystemExit(attempt(args.config, args.output, args.log_dir, args.run_id))
     if args.run_dir is None:

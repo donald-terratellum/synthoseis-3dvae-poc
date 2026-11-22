@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -374,6 +375,78 @@ class AuditRunnerTests(unittest.TestCase):
         self.assertIn("--action smoke", result.stdout)
         self.assertFalse((self.root / "logs").exists())
         self.assertFalse(self.output.exists())
+
+    def test_prepare_child_failure_is_logged_and_preserves_exit_status(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", "commit", "-q",
+                        "--allow-empty", "-m", "Fixture"], check=True)
+        fake_python = self.root / "fake-python"
+        fake_python.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = --version ]; then echo fixture-python; exit 0; fi\n"
+            "echo 'prepare stdout'\necho 'prepare stderr' >&2\nexit 7\n"
+        )
+        fake_python.chmod(0o700)
+        result = self.invoke(
+            "--mode", "prepare", "--config", str(self.config), "--run-id", "prepare-failure",
+            "--output-root", str(self.output), "--mps-memory-fraction", "0.5",
+            "--max-wall-seconds", "30", env={**os.environ, "PYTHON": str(fake_python)},
+        )
+        self.assertEqual(result.returncode, 7)
+        log = (self.root / "logs/prepare-failure/training.log").read_text()
+        self.assertIn("prepare stdout", log)
+        self.assertIn("prepare stderr", log)
+        self.assertIn("prepare FAILED: exit 7", log)
+        self.assertFalse(self.output.exists())
+
+    def test_prepare_invalid_config_is_logged_through_real_runner(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", "commit", "-q",
+                        "--allow-empty", "-m", "Fixture"], check=True)
+        repository = Path(__file__).resolve().parents[1]
+        result = self.invoke(
+            "--mode", "prepare", "--config", str(self.config), "--run-id", "invalid-prepare",
+            "--output-root", str(self.output), "--mps-memory-fraction", "0.5",
+            "--max-wall-seconds", "30",
+            env={**os.environ, "PYTHON": sys.executable, "PYTHONPATH": str(repository)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        log_dir = self.root / "logs/invalid-prepare"
+        manifest = json.loads((log_dir / "run_manifest.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertFalse(manifest["production_training_allowed"])
+        self.assertIn("Suite preparation requires all documented settings", (log_dir / "training.log").read_text())
+        self.assertFalse(self.output.exists())
+
+    def test_prepare_log_failure_does_not_confirm_attempt(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid", "commit", "-q",
+                        "--allow-empty", "-m", "Fixture"], check=True)
+        fake_python = self.root / "fake-python"
+        fake_python.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in *confirm-prepare-log*) touch \"$FIXTURE_MARKER\";; esac\n"
+            "echo fixture-python\n"
+        )
+        fake_python.chmod(0o700)
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        tee = binaries / "tee"
+        tee.write_text("#!/bin/sh\ncat > /dev/null\nexit 9\n")
+        tee.chmod(0o700)
+        marker = self.root / "confirmed"
+        result = self.invoke(
+            "--mode", "prepare", "--config", str(self.config), "--run-id", "prepare-log-failure",
+            "--output-root", str(self.output), "--mps-memory-fraction", "0.5",
+            "--max-wall-seconds", "30",
+            env={**os.environ, "PYTHON": str(fake_python), "FIXTURE_MARKER": str(marker),
+                 "PATH": f"{binaries}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 9)
+        self.assertFalse(marker.exists())
 
     def test_failed_preflight_is_logged_and_exit_status_is_preserved(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
