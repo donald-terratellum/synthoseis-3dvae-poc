@@ -4,6 +4,38 @@ Updated: 2026-11-22.
 
 ## Local implementation status
 
+### Incremental target and yield implementation
+
+The opt-in `scripts.streamed_overlap_targets` module now computes canonical overlap
+and directional event-coverage targets on original seismic and same-index labels.
+Unsupported windows and unusable semantic inputs have explicit unavailable reasons.
+It is not connected to a trainer. The coarse closure fractions remain a proxy, and
+the saved sources' generation-time worktrees remain unknown.
+
+The diagnostic yield sampler reads only discovered train/validation sources. For each
+source and requested sample it checks zero-shift, Z+16, same-source disjoint and
+cross-source pairs. It is not the eventual batch sampler or retrieval candidate
+manifest. For example, with a new private output path outside the source root:
+
+```sh
+.venv/bin/python -m scripts.streamed_overlap_yield \
+  --source-root /Volumes/CrucialX9/fake_data \
+  --output <new-private-yield-report.json> --seed 20260926 \
+  --samples-per-source 1
+```
+
+One local run of this diagnostic sampled all 180 train and 25 existing validation
+sources: all 820 sampled pair targets were available. The 50 positive validation
+**pairs** do not establish the required 200 eligible retrieval **queries**, and this
+small sample is not a representative yield estimate. It does not freeze candidates,
+prove eligibility, or open either approval gate. The bounded-read run took about 61
+seconds and reached about 821 MiB peak RSS on this Mac; this is not a batch-12 MPS
+training measurement. The private output is not committed.
+
+The frozen evaluation manifest, trainer integration, augmentation path, durable
+recovery, formal evaluation and local MPS smoke are still required. Keep train, resume,
+smoke and evaluate modes blocked. No training has been authorized.
+
 The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
 180 training and 25 validation sources. All 205 have the required semantic arrays;
 `faulted_net_to_gross`, channel labels and closure arrays are present, while the
