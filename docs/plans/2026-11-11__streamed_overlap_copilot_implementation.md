@@ -61,8 +61,42 @@ peak process RSS was 1.16 GiB, total peak memory footprint about 3.69 GiB, and M
 driver allocation after backward was 2.37 GiB. This is not a training-throughput
 estimate and did not test journal, resume, evaluation or TensorBoard integration.
 
-The streamed sampler/trainer, durable recovery, formal evaluation and integrated
-local smoke remain required. Keep train, resume, smoke and evaluate modes blocked.
+The source-bound validation manifest adds hashes for 3,300 canonical input windows
+and 300 full-depth event regions. The bound manifest's content hash is
+`13a5ef4f27c1ec0ab9da53168ee1e765f2e8cc94c74e3761c3e573e9c4c9d6c7`.
+Binding took 422 seconds and about 949 MiB peak RSS; a separate verification took
+123 seconds and about 965 MiB peak RSS. The files are private on the checkpoint
+volume. Verify again immediately before evaluation; these hashes do not cover whole
+source cubes, other diagnostic labels, or generation provenance.
+
+```sh
+.venv/bin/python -m scripts.streamed_overlap_integrity --mode verify \
+  --source-root /Volumes/CrucialX9/fake_data \
+  --manifest <private-bound-validation-manifest.json> \
+  --output <new-private-verification-report.json>
+```
+
+The opt-in single-worker pair sampler now draws fresh volume-balanced pairs, keeps
+separate sampling and augmentation RNG states, bounds open source handles, computes
+all canonical targets before augmentation, and rejects train/validation recorded
+geology-seed overlap. A restored sampler reproduces both pair specifications and
+augmented inputs. The sparse-input probability is an explicit parameter, not a
+training default or an approved launch setting.
+
+With the real sampler, separate train and primary-validation 12-pair S3 MPS
+forward/backward checks each contained six overlapping, three disjoint and three
+cross-source pairs, with two zero-shift pairs and 12 valid coverage labels. Neither
+performed an optimizer step. Including process startup, the train check took 13.14 s,
+1.13 GiB peak RSS and 3.79 GiB peak memory footprint; the validation check took
+11.74 s, 1.58 GiB peak RSS and 3.80 GiB peak memory footprint. MPS driver allocation
+after backward was approximately 2.30 GiB for each. These checks used a 0.5 MPS
+memory-fraction guard and a test-only sparse-input probability of 0.5. They do not
+establish training throughput, full training-memory headroom, or approval of that
+probability. They did not exercise an optimizer, journal, recovery, evaluation or
+TensorBoard integration.
+
+The integrated trainer, durable recovery, formal evaluation and integrated local
+smoke remain required. Keep train, resume, smoke and evaluate modes blocked.
 No training has been authorized.
 
 The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
@@ -85,8 +119,8 @@ same-index windows without padding, clipping, or shifts. The owner reports that
 separate; do not read it until regeneration is complete, then audit separately before
 considering it for any use. The existing validation set remains primary. Target and
 diagnostic yield checks and the model-independent candidate manifest now exist, with
-the source-integrity limitation above. Gate 1 and the separate training-launch
-approval gate remain closed.
+the source-integrity limitations above. The separate training-launch approval gate
+remains closed.
 
 Local implementation is on `experiment/streamed-overlap-copilot-implementation`.
 The audit tooling, pair-target generation and local source inventory exist; integrated
