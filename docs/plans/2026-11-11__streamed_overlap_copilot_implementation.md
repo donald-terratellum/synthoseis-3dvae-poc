@@ -4,6 +4,40 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The suite-input record can now be prepared without training:
+
+```sh
+.venv/bin/python -u -m scripts.streamed_overlap_prepare \
+  --config <private-suite-settings.json> --output <new-private-suite-inputs.json> \
+  --mps-memory-fraction <preparation-limit> --max-wall-seconds <preparation-limit>
+```
+
+The JSON must contain absolute `suite_dir`, `source_root`, `validation_manifest`,
+`search_manifest`, `diagnostic_manifest` and `guardrail_manifest` paths; the
+explicit `source_sha256`, `target_sha256` and `validation_manifest_sha256`;
+`matching_config`, `epoch_validation`, `formal_config` and `guardrail_config`
+objects; and a `historical` object with absolute `report_path` and
+`checkpoint_path`, `report_sha256`, `checkpoint_sha256` and `checkpoint_label`.
+`source_sha256` is the sampler's source-inventory hash (also reported as
+`source_manifest_sha256` by the no-optimizer smoke), not a whole-volume hash.
+The three sidecar paths refer to their existing frozen JSON objects. The command
+checks their configuration bindings, prepares the fixed monitors from streamed
+train and validation pairs, and writes the record and prints its logical hash
+and workload. It does not create the suite directory, run an optimizer step, or
+approve training. The preparation MPS fraction and time limit are not a launch
+resource approval. The time limit is checked after monitor preparation, not a
+hard watchdog, and excludes initial configuration checks. Full validation
+fingerprinting, historical-file verification, resource checks and launch
+approval remain outstanding.
+The portable streamed regression passed 243 tests, with one skipped and 59
+subtests, using `.venv/bin/python -m pytest -q tests/test_streamed_*.py` in
+46.30 seconds. The preparation fixture used synthetic batches with sampler and
+MPS allocation mocked; no real-data preparation or training ran.
+
+Here "training budget" means epochs and batches per epoch—not cloud charges.
+Because training draws streamed pairs, those explicit counts specify how much
+work each matched arm performs; they have not been chosen here.
+
 `run_suite_from_record` now connects a pinned `suite_input_record` JSON file to
 the existing fresh/resume suite runner. It requires the separately supplied
 configuration hash and the same suite destination, reconstructs the frozen

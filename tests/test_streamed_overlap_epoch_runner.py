@@ -1,4 +1,5 @@
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,8 +16,9 @@ from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
     complete_epoch,
-    complete_selected_checkpoint, prepare_epoch_inputs, run_arm_epochs, run_suite, suite_workload,
+    complete_selected_checkpoint, prepare_epoch_inputs, run_arm_epochs, run_suite, run_suite_from_record, suite_workload,
 )
+from scripts.streamed_overlap_prepare import prepare
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
 from scripts.streamed_overlap_targets import Window
 from scripts.train import streamed_monitor_hash
@@ -173,6 +175,96 @@ class EpochInputBindingTests(unittest.TestCase):
             self.assertFalse((self.root / "suite").exists())
             with self.assertRaisesRegex(ValueError, "either epoch validation"):
                 run_suite(self.root / "suite", **{**arguments, "monitor_batches": self.monitor})
+
+    def test_prepares_record_for_runner_without_training(self):
+        source = self.root / "source"
+        source.mkdir()
+        self.manifest_path.touch()
+        matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "test", "experiment_seed": 1,
+            "model_seed": 2, "head_seed": 3, "sampler_seed": 4, "monitor_seed": 5, "validation_seed": 6,
+            "final_epoch": 2, "batches_per_epoch": 3, "sparse_probability": 0.5,
+        }
+        settings = {"reconstruction_query_ids": ["query"], "encode_batch_size": 4,
+                    "reconstruction_batch_size": 2, "max_wall_seconds": 60}
+        validator = StreamedEpochValidator(
+            self.manifest_path, source, manifest_sha256="b" * 64, reconstruction_query_ids=("query",),
+            reconstruction_seed=6, encode_batch_size=4, reconstruction_batch_size=2,
+            max_wall_seconds=60, lpips_loss_fn=self.lpips,
+        )
+        search = {"schema": "streamed-bounded-tokenizer-search-v1", "searches": [{}],
+                  "validation_manifest_sha256": "b" * 64}
+        search["search_manifest_sha256"] = content_hash(search)
+        diagnostic = {"validation_manifest_sha256": "b" * 64, "windows": {}}
+        diagnostic["diagnostic_manifest_sha256"] = content_hash(diagnostic)
+        guardrail = {
+            "schema": "streamed-reconstruction-guardrail-v1", "usage": "post_selection_guardrail",
+            "protocol": {"input_mode": "tokenizer", "latent_mode": "sampled",
+                         "sampling_method": "normal_reparameterization", "seed": 1,
+                         "patch_shape": [32, 32, 64], "lpips_sha256": "c" * 64, "device": "mps"},
+            "datasets": {domain: [{"id": domain, "input_sha256": "a" * 64, "target_sha256": "d" * 64}]
+                         for domain in ("synthetic", "real")},
+        }
+        guardrail["manifest_sha256"] = content_hash(guardrail)
+        sidecars = {
+            "search_manifest": search, "diagnostic_manifest": diagnostic, "guardrail_manifest": guardrail,
+        }
+        paths = {}
+        for key, value in sidecars.items():
+            path = self.root / f"{key}.json"
+            path.write_text(json.dumps(value))
+            paths[key] = str(path)
+        config = {
+            "suite_dir": str(self.root / "new-suite"), "source_root": str(source),
+            "validation_manifest": str(self.manifest_path), "source_sha256": "a" * 64,
+            "target_sha256": "d" * 64, "validation_manifest_sha256": "b" * 64,
+            "matching_config": matching, "epoch_validation": settings,
+            "formal_config": {
+                "final_epoch": 2, "device": "mps", "inference_seed": 1, "encode_batch_size": 4,
+                "max_wall_seconds": 30, "random_seed": 2, "random_repeats": 3,
+                "bootstrap_seed": 4, "bootstrap_repeats": 5, "diagnostic_max_wall_seconds": 30,
+                "search_manifest_sha256": search["search_manifest_sha256"],
+                "diagnostic_manifest_sha256": diagnostic["diagnostic_manifest_sha256"],
+            },
+            "guardrail_config": {"manifest_sha256": guardrail["manifest_sha256"],
+                                 "device": "mps", "max_wall_seconds": 60}, **paths,
+            "historical": {"report_path": str(self.root / "report"), "report_sha256": "e" * 64,
+                           "checkpoint_path": str(self.root / "checkpoint"), "checkpoint_sha256": "f" * 64,
+                           "checkpoint_label": "reference"},
+        }
+        observed = {"monitor": streamed_monitor_hash(self.monitor), "epoch_validation": validator.config_sha256}
+        output = self.root / "suite-inputs.json"
+        with patch("scripts.streamed_overlap_prepare.torch.backends.mps.is_available", return_value=True), \
+             patch("scripts.streamed_overlap_prepare.torch.mps.set_per_process_memory_fraction") as set_limit, \
+             patch("scripts.streamed_overlap_prepare.prepare_epoch_inputs",
+                   return_value=(self.monitor, validator, self.lpips, observed)), \
+             patch("scripts.streamed_overlap_epoch_runner.run_suite", return_value={"fixture": {}}) as run:
+            result = prepare(config, output, mps_memory_fraction=0.5, max_wall_seconds=30)
+            run.assert_not_called()
+            set_limit.assert_called_once_with(0.5)
+            self.assertEqual(result["status"], "SUITE_INPUTS_PREPARED_NOT_AUTHORIZED")
+            record = json.loads(output.read_text())
+            self.assertEqual(result["config_sha256"], content_hash(record))
+            self.assertEqual(record["input_hashes"]["monitor"], observed["monitor"])
+            self.assertFalse((self.root / "new-suite").exists())
+            run_suite_from_record(
+                output, self.root / "new-suite", expected_config_sha256=result["config_sha256"],
+                resume=False, attempt_id="fixture",
+            )
+            self.assertEqual(run.call_args.kwargs["epoch_validation"], settings)
+            with self.assertRaises(FileExistsError):
+                prepare(config, output, mps_memory_fraction=0.5, max_wall_seconds=30)
+            with self.assertRaisesRegex(ValueError, "must be separate"):
+                prepare(config, source / "output.json", mps_memory_fraction=0.5, max_wall_seconds=30)
+            with self.assertRaisesRegex(ValueError, "memory limits"):
+                prepare(config, self.root / "other.json", mps_memory_fraction=0.8, max_wall_seconds=30)
+            with self.assertRaisesRegex(ValueError, "matching hashes"):
+                prepare({**config, "validation_manifest_sha256": "0" * 64}, self.root / "other.json",
+                        mps_memory_fraction=0.5, max_wall_seconds=30)
+            with patch("scripts.streamed_overlap_prepare.time.monotonic", side_effect=[0, 31]):
+                with self.assertRaisesRegex(TimeoutError, "no input record"):
+                    prepare(config, self.root / "other.json", mps_memory_fraction=0.5, max_wall_seconds=30)
+            self.assertFalse((self.root / "other.json").exists())
 
 
 class SuiteWorkloadTests(unittest.TestCase):
