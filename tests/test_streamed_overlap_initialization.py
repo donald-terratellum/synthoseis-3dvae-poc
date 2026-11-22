@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, Mock, create_autospec, patch
 import numpy as np
 import torch
 
+from scripts import streamed_overlap_runner as runner
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
@@ -212,6 +213,46 @@ class ArmInitializationTests(unittest.TestCase):
                     path, self.suite_dir, expected_config_sha256=content_hash(changed), resume=True, attempt_id="next",
                 )
             run.assert_not_called()
+
+    def test_training_attempt_binds_record_and_preserves_failed_service_for_resume(self):
+        inputs = self.suite_inputs()
+        suite = self.source.parent / "attempt-suite"
+        record = suite_input_record(suite, **inputs)
+        digest = content_hash(record)
+        record_path = self.source.parent / "attempt-inputs.json"
+        record_path.write_text(json.dumps(record))
+        logs = self.source.parent / "attempt-logs"
+        logs.mkdir()
+        resume_logs = self.source.parent / "resume-logs"
+        resume_logs.mkdir()
+        options = {
+            "config_sha256": digest, "epochs": 2, "batches_per_epoch": 3,
+            "mps_memory_fraction": 0.4, "min_suite_free_bytes": 1, "min_log_free_bytes": 1,
+        }
+        epoch_inputs = ({}, inputs["validate_epoch"], lambda x: x, None)
+        with patch("scripts.streamed_overlap_epoch_runner.prepare_epoch_inputs", return_value=epoch_inputs), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler",
+                   return_value=FixtureSampler(4, self.hashes["source"])), \
+             patch.object(torch.backends.mps, "is_available", return_value=True), \
+             patch.object(torch.mps, "set_per_process_memory_fraction"), \
+             patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")), \
+             patch.object(runner, "start_tensorboard", side_effect=RuntimeError("port occupied")) as service, \
+             patch.object(runner.platform, "platform", return_value="fixture-platform"), \
+             patch.object(runner.subprocess, "check_output",
+                          side_effect=["fixture", b"fixture", "", "fixture", b"fixture", ""]), \
+             patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+            with self.assertRaisesRegex(RuntimeError, "port occupied"):
+                runner.training_attempt(record_path, suite, logs, logs, "synthetic", resume=False, **options)
+            self.assertEqual(json.loads((suite / "resolved_suite_inputs.json").read_text()), record)
+            self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"], "failed")
+            with self.assertRaisesRegex(RuntimeError, "port occupied"):
+                runner.training_attempt(record_path, suite, resume_logs, logs, "retry", resume=True, **options)
+        self.assertEqual(json.loads((resume_logs / "run_manifest.json").read_text())["status"], "failed")
+        self.assertEqual(service.call_count, 2)
+        self.assertEqual({path.name for path in suite.iterdir()}, {"resolved_suite_inputs.json"})
+        self.assertFalse((logs / "evaluation_receipt.json").exists())
+        self.assertFalse((resume_logs / "evaluation_receipt.json").exists())
 
     def test_evaluation_child_applies_mps_limit_and_never_enables_training(self):
         record = suite_input_record(self.suite_dir, **self.suite_inputs())

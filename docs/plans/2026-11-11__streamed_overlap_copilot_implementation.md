@@ -2,6 +2,54 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: train/resume shell integration
+
+The public shell can now preview fresh and resume commands for the record-bound
+runner, including log confirmation after successful capture. Resume uses a new
+attempt ID but retains the original training ID for TensorBoard ownership.
+Actual shell launch remains blocked even when both acknowledgements are supplied.
+Shell tests cover the previews and the launch gate. A synthetic fixture also
+passes fresh and resume attempts through the real record-bound suite binding,
+with mocked input validation, MPS and a failing TensorBoard start. Both failures
+are recorded, the bound inputs remain intact, and optimizer steps are forbidden.
+It does not exercise actual training or a successful TensorBoard service.
+Runner, initialization, epoch-runner and checkpoint tests passed (113 tests and
+57 subtests). One neighboring audit test still expects evaluation mode to be
+blocked; that expectation predates this change and conflicts with the existing
+evaluation-only shell mode.
+
+The acknowledgements are caller assertions, not proof that integrated real-data
+smoke, aggregate memory and disk review, or separate launch approval occurred.
+Those prerequisites remain outstanding; no production budget has been approved
+and no production training was performed. The proposed shell interface, which
+remains blocked for execution until a subsequent change removes the gate, is:
+
+```sh
+bash scripts/streamed_overlap_experiment.sh --mode train \
+  --config <prepared-suite-inputs.json> --run-dir <new-suite-directory> \
+  --run-id <pinned-training-id> --config-sha256 <prepared-config-sha256> \
+  --epochs <approved-epochs> --batches-per-epoch <approved-batches> \
+  --mps-memory-fraction <limit> --min-suite-free-bytes <bytes> \
+  --min-log-free-bytes <bytes> --acknowledge-training-approval \
+  --acknowledge-training-resources
+
+bash scripts/streamed_overlap_experiment.sh --mode resume \
+  --config <prepared-suite-inputs.json> --run-dir <existing-suite-directory> \
+  --run-id <new-resume-attempt-id> --tensorboard-run-id <pinned-training-id> \
+  --config-sha256 <prepared-config-sha256> --epochs <approved-epochs> \
+  --batches-per-epoch <approved-batches> --mps-memory-fraction <limit> \
+  --min-suite-free-bytes <bytes> --min-log-free-bytes <bytes> \
+  --acknowledge-training-approval --acknowledge-training-resources
+```
+
+The fresh ID and both budgets must match the pinned record. `--print-commands`
+prints the proposed route without creating files or running anything; it does not
+require acknowledgement flags and is not launch approval. The review must
+account for real batch-12-pair forward/backward
+memory, tokenizer subprocesses, storage shared by suite and logs, source
+exclusions and the approved total exposure. The per-process MPS limit and
+caller-supplied disk floors do not establish aggregate headroom or reserve space.
+
 ## Local continuation: post-selection evaluation
 
 The record-bound runner now has internal fresh-training and resume attempts.
@@ -14,14 +62,14 @@ original training attempt's TensorBoard ownership record. If the suite returns,
 the runner verifies the final checkpoints and separate encoder and pair-head
 reports; completion remains unconfirmed until the combined log is checked.
 
-These are internal components, not approved launch commands. The CLI
-acknowledgements do not establish that approval or a resource review occurred.
+These components are not approved launch commands. The CLI acknowledgements do
+not establish that approval or a resource review occurred.
 Disk floors are caller estimates, and the MPS fraction does not bound aggregate
 memory across tokenizer subprocesses. Tests used mocked suite execution and
 TensorBoard; a separate MPS fixture exercised binding, interrupted service
 startup and bootstrap without an optimizer step. Full integrated train/resume
-execution and resource headroom remain unverified. The public train/resume shell
-modes remain blocked; no production training was authorized or performed.
+execution and resource headroom remain unverified. No production training was
+authorized or performed.
 
 The shell now connects evaluation of an **already completed** matched suite to
 the evaluation-only runner, combined log capture and log confirmation:
@@ -47,8 +95,8 @@ or an adoption decision. Summary output is preliminary until log confirmation
 and report checks succeed. Independent-seed replication, reconstruction
 guardrails and untouched final-test evaluation remain separate.
 
-No real suite was evaluated. Shell train/resume remain blocked and production
-training still requires separate approval. Later entries describe historical
+No real suite was evaluated. Production training still requires separate
+approval. Later entries describe historical
 implementation states, not the current availability of evaluation mode.
 
 Journal recovery now reads completed rows incrementally and hashes recorded torn

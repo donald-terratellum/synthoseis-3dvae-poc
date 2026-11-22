@@ -617,9 +617,10 @@ Implement `scripts/streamed_overlap_experiment.sh`, with documented modes:
 ```
 
 Audit, no-optimizer smoke, preparation, evaluation-only and TensorBoard lifecycle
-modes are implemented; train/resume remain explicitly blocked pending runner
-integration and training approval. Evaluation requires a completed suite and
-explicit resource review. See the
+modes are wired. Train/resume commands can be previewed, but execution remains
+blocked pending integrated real-data smoke, resource review and separate launch
+approval. Acknowledgement flags are not evidence of these prerequisites.
+Evaluation requires a completed suite and explicit resource review. See the
 [handoff's runnable commands](2026-11-11__streamed_overlap_copilot_implementation.md).
 Reuse repository helpers rather than introduce a second trainer.
 
@@ -664,14 +665,23 @@ bash scripts/streamed_overlap_experiment.sh --mode audit \
 bash scripts/streamed_overlap_experiment.sh --mode smoke \
   --config <approved-local-config.json> --run-id <new-smoke-id>
 
-# After launch approval; epochs/batches are mandatory, not a fixed crop collection:
+# Proposed commands; execution remains blocked until the launch gate is removed:
 bash scripts/streamed_overlap_experiment.sh --mode train \
-  --config <approved-local-config.json> --run-id <new-training-id> \
-  --epochs <approved-epochs> --batches-per-epoch <approved-batches>
+  --config <prepared-suite-inputs.json> --run-dir <new-suite-directory> \
+  --run-id <pinned-training-id> --config-sha256 <prepared-config-sha256> \
+  --epochs <approved-epochs> --batches-per-epoch <approved-batches> \
+  --mps-memory-fraction <limit> --min-suite-free-bytes <bytes> \
+  --min-log-free-bytes <bytes> --acknowledge-training-approval \
+  --acknowledge-training-resources
 
 # Resume must use recorded state/commit watermark, not weights only:
 bash scripts/streamed_overlap_experiment.sh --mode resume \
-  --run-dir <existing-suite-directory> --checkpoint <last-complete-state.pt>
+  --config <prepared-suite-inputs.json> --run-dir <existing-suite-directory> \
+  --run-id <new-resume-attempt-id> --tensorboard-run-id <pinned-training-id> \
+  --config-sha256 <prepared-config-sha256> --epochs <approved-epochs> \
+  --batches-per-epoch <approved-batches> --mps-memory-fraction <limit> \
+  --min-suite-free-bytes <bytes> --min-log-free-bytes <bytes> \
+  --acknowledge-training-approval --acknowledge-training-resources
 ```
 
 Replace placeholders only with approved values. Print exact, copyable commands in the

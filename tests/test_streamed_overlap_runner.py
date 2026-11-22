@@ -591,6 +591,59 @@ class AuditAttemptTests(unittest.TestCase):
                 self.assertIn("TRAINING_NOT_READY", result.stderr)
             self.assertEqual(list(Path(temporary).iterdir()), [])
 
+    def test_training_shell_previews_route_but_blocks_actual_launch(self):
+        for mode in ("train", "resume"):
+            with self.subTest(mode=mode):
+                run_id = f"training-preview-{mode}-fixture"
+                args = [
+                    "bash", "scripts/streamed_overlap_experiment.sh", "--mode", mode,
+                    "--run-id", run_id, "--config", "record.json", "--run-dir", "suite",
+                    "--config-sha256", "a" * 64, "--epochs", "2", "--batches-per-epoch", "3",
+                    "--mps-memory-fraction", "0.4", "--min-suite-free-bytes", "100",
+                    "--min-log-free-bytes", "200", "--acknowledge-training-approval",
+                    "--acknowledge-training-resources",
+                ]
+                owner = run_id
+                if mode == "resume":
+                    owner = "original-training"
+                    args += ["--tensorboard-run-id", owner]
+                preview = subprocess.run(args + ["--print-commands"], capture_output=True, text=True, check=False)
+                self.assertEqual(preview.returncode, 0, preview.stderr)
+                self.assertIn("PREVIEW ONLY", preview.stdout)
+                self.assertIn(f"--action {mode}-attempt", preview.stdout)
+                self.assertIn("--action confirm-training-log", preview.stdout)
+                self.assertIn(f"--tensorboard-log-dir logs/{owner}", preview.stdout)
+                self.assertIn("--epochs 2 --batches-per-epoch 3", preview.stdout)
+                self.assertIn("--acknowledge-training-approval", preview.stdout)
+                self.assertIn("--acknowledge-training-resources", preview.stdout)
+                without_acknowledgements = subprocess.run(
+                    [arg for arg in args if arg not in (
+                        "--acknowledge-training-approval", "--acknowledge-training-resources",
+                    )] + ["--print-commands"], capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(without_acknowledgements.returncode, 0, without_acknowledgements.stderr)
+                result = subprocess.run(args, capture_output=True, text=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TRAINING_NOT_READY", result.stderr)
+                self.assertFalse((Path("logs") / run_id).exists())
+
+    def test_training_shell_preview_requires_resume_owner(self):
+        args = [
+            "bash", "scripts/streamed_overlap_experiment.sh", "--mode", "resume", "--print-commands",
+            "--run-id", "training-rejected-fixture", "--config", "record.json", "--run-dir", "suite",
+            "--config-sha256", "a" * 64, "--epochs", "2", "--batches-per-epoch", "3",
+            "--mps-memory-fraction", "0.4", "--min-suite-free-bytes", "100", "--min-log-free-bytes", "200",
+        ]
+        for flags, message in (
+            ([], "--tensorboard-run-id"),
+            (["--tensorboard-run-id", "../other"], "--tensorboard-run-id"),
+        ):
+            with self.subTest(flags=flags):
+                result = subprocess.run(args + flags, capture_output=True, text=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertFalse((Path("logs") / "training-rejected-fixture").exists())
+
     def test_evaluate_shell_routes_and_confirms_only_after_successful_capture(self):
         Path("logs").mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory() as temporary:
