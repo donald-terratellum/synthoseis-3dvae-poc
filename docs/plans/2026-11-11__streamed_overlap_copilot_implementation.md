@@ -4,6 +4,36 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+For a prospective fresh suite, `suite_storage_preflight` can now compare
+explicit byte estimates against the filesystem available to the new suite
+directory. It counts separate initial and last checkpoints, best aliases,
+up to one retained selection snapshot per epoch per arm, and one additional
+temporary checkpoint copy for sequential publication. The caller must provide
+positive per-arm checkpoint size bounds, an allowance for all other outputs
+on that filesystem, and a free-space reserve:
+
+```python
+suite_storage_preflight(
+    record["matching_config"], record["search_manifest"], Path(record["suite_dir"]),
+    checkpoint_upper_bytes={"S1": s1_bytes, "S2": s2_bytes, "S3": s3_bytes},
+    other_output_bytes=other_bytes, free_reserve_bytes=reserve_bytes,
+)
+```
+
+Import `Path` from `pathlib` and `suite_storage_preflight` from
+`scripts.streamed_overlap_epoch_runner`. Insufficient space raises an error.
+This is a read-only estimate for a clean fresh run, not a reservation or launch
+gate. The provided bounds are not verified; they must reflect full optimizer
+state, other outputs and filesystem overhead. Interrupted attempts, retries,
+concurrent disk use and logs on other filesystems need separate allowances and
+checks. It neither estimates memory or runtime nor authorizes training; the
+shell modes remain blocked. No epoch count or byte allowance has been chosen.
+Epoch, initialization and runner fixtures passed 87 tests and 37 subtests using
+`.venv/bin/python -m pytest -q tests/test_streamed_overlap_epoch_runner.py
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_runner.py`.
+The space check used a temporary filesystem and mocked capacity boundaries, not
+the production destination.
+
 Completed suites now write `pair_head_metric_checks.json` alongside, but
 separately from, `mu_cosine_comparisons.json`. It records the existing S3
 pair-head metric checks for both the final-epoch and retrieval-selected

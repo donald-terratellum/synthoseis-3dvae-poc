@@ -16,7 +16,8 @@ from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
     complete_epoch,
-    complete_selected_checkpoint, prepare_epoch_inputs, run_arm_epochs, run_suite, run_suite_from_record, suite_workload,
+    complete_selected_checkpoint, prepare_epoch_inputs, run_arm_epochs, run_suite, run_suite_from_record,
+    suite_storage_preflight, suite_workload,
 )
 from scripts.streamed_overlap_prepare import prepare
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
@@ -346,6 +347,64 @@ class SuiteWorkloadTests(unittest.TestCase):
         empty["search_manifest_sha256"] = content_hash(empty)
         with self.assertRaisesRegex(ValueError, "nonempty"):
             suite_workload(self.matching, empty)
+
+    def test_storage_preflight_counts_snapshots_and_shared_transient_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            suite = directory / "suite"
+            options = {
+                "checkpoint_upper_bytes": {"S1": 100, "S2": 200, "S3": 300},
+                "other_output_bytes": 1000, "free_reserve_bytes": 200,
+            }
+            with patch("scripts.streamed_overlap_epoch_runner.os.statvfs",
+                       return_value=SimpleNamespace(f_frsize=10, f_bavail=720)):
+                result = suite_storage_preflight(self.matching, self.search, suite, **options)
+            self.assertEqual(result["checkpoint_counts"], {"S1": 9, "S2": 9, "S3": 10})
+            self.assertEqual(result["checkpoint_bytes"], 5700)
+            self.assertEqual(result["transient_checkpoint_bytes"], 300)
+            self.assertEqual(result["required_bytes"], 7200)
+            self.assertEqual(result["available_bytes"], 7200)
+            self.assertEqual(list(directory.iterdir()), [])
+            with patch("scripts.streamed_overlap_epoch_runner.os.statvfs",
+                       return_value=SimpleNamespace(f_frsize=10, f_bavail=719)):
+                with self.assertRaisesRegex(OSError, "need 7200 bytes, available 7190 bytes"):
+                    suite_storage_preflight(self.matching, self.search, suite, **options)
+
+    def test_storage_preflight_rejects_invalid_bounds_and_filesystems(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            suite = directory / "suite"
+            options = {
+                "checkpoint_upper_bytes": {"S1": 100, "S2": 200, "S3": 300},
+                "other_output_bytes": 1000, "free_reserve_bytes": 200,
+            }
+            for overrides in (
+                {"checkpoint_upper_bytes": {"S1": 100, "S2": 200}},
+                {"checkpoint_upper_bytes": {"S1": True, "S2": 200, "S3": 300}},
+                {"other_output_bytes": 0}, {"free_reserve_bytes": -1},
+            ):
+                with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "positive"):
+                    suite_storage_preflight(self.matching, self.search, suite, **{**options, **overrides})
+            with self.assertRaisesRegex(ValueError, "existing permitted parent"):
+                suite_storage_preflight(self.matching, self.search, directory / "missing" / "suite", **options)
+            with self.assertRaisesRegex(ValueError, "new absolute suite"):
+                suite_storage_preflight(self.matching, self.search, directory, **options)
+            alias = directory / "alias"
+            alias.symlink_to(directory, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "new absolute suite"):
+                suite_storage_preflight(self.matching, self.search, alias / "suite", **options)
+            with self.assertRaisesRegex(ValueError, "frozen bounded-search"):
+                suite_storage_preflight(self.matching, {**self.search, "searches": [{}]}, suite, **options)
+            with patch("scripts.streamed_overlap_epoch_runner.os.statvfs",
+                       return_value=SimpleNamespace(f_frsize=0, f_bavail=10)):
+                with self.assertRaisesRegex(RuntimeError, "available-space"):
+                    suite_storage_preflight(self.matching, self.search, suite, **options)
+            measured = suite_storage_preflight(
+                self.matching, self.search, suite,
+                checkpoint_upper_bytes={"S1": 1, "S2": 1, "S3": 1},
+                other_output_bytes=1, free_reserve_bytes=1,
+            )
+            self.assertGreaterEqual(measured["available_bytes"], measured["required_bytes"])
 
 
 class EpochCompletionTests(unittest.TestCase):

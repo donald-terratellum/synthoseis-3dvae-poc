@@ -559,6 +559,61 @@ def suite_workload(matching_config: dict, search_manifest: dict) -> dict:
     }
 
 
+def suite_storage_preflight(
+    matching_config: dict, search_manifest: dict, suite_dir: Path, *,
+    checkpoint_upper_bytes: dict[str, int], other_output_bytes: int, free_reserve_bytes: int,
+) -> dict:
+    """Estimate clean-run suite storage on one filesystem without authorizing a launch."""
+    workload = suite_workload(matching_config, search_manifest)
+    if (not isinstance(suite_dir, Path) or not suite_dir.is_absolute()
+            or suite_dir.exists() or suite_dir.is_symlink()
+            or suite_dir.parent.is_symlink() or not suite_dir.parent.is_dir()
+            or "fake_data_validation_v2" in suite_dir.parts
+            or "fake_data_validation_v2" in suite_dir.resolve().parts):
+        raise ValueError("Storage preflight requires a new absolute suite path with an existing permitted parent.")
+    directory = suite_dir.parent
+    if (not isinstance(checkpoint_upper_bytes, dict)
+            or set(checkpoint_upper_bytes) != {"S1", "S2", "S3"}
+            or any(type(value) is not int or value <= 0 for value in checkpoint_upper_bytes.values())
+            or type(other_output_bytes) is not int or other_output_bytes <= 0
+            or type(free_reserve_bytes) is not int or free_reserve_bytes <= 0):
+        raise ValueError("Explicit positive checkpoint, other-output and free-reserve byte estimates are required.")
+    epochs = workload["per_arm"]["epochs"]
+    counts = {"S1": epochs + 3, "S2": epochs + 3, "S3": epochs + 4}
+    checkpoint_bytes = sum(counts[arm] * checkpoint_upper_bytes[arm] for arm in counts)
+    transient_bytes = max(checkpoint_upper_bytes.values())
+    required = checkpoint_bytes + transient_bytes + other_output_bytes + free_reserve_bytes
+    filesystem = os.statvfs(directory)
+    if filesystem.f_frsize <= 0 or filesystem.f_bavail < 0:
+        raise RuntimeError("Filesystem did not provide a valid available-space measurement.")
+    available = filesystem.f_frsize * filesystem.f_bavail
+    if available < required:
+        raise OSError(
+            f"Insufficient estimated suite storage at {directory}: need {required} bytes, "
+            f"available {available} bytes."
+        )
+    return {
+        "schema": "streamed-suite-storage-preflight-v1",
+        "directory": str(directory.resolve()),
+        "suite_dir": str(suite_dir.resolve()),
+        "matching_config_sha256": workload["matching_config_sha256"],
+        "search_manifest_sha256": workload["search_manifest_sha256"],
+        "checkpoint_upper_bytes": dict(checkpoint_upper_bytes),
+        "checkpoint_counts": counts,
+        "checkpoint_bytes": checkpoint_bytes,
+        "transient_checkpoint_bytes": transient_bytes,
+        "other_output_bytes": other_output_bytes,
+        "free_reserve_bytes": free_reserve_bytes,
+        "required_bytes": required,
+        "available_bytes": available,
+        "limitation": (
+            "Clean fresh run on this filesystem only; caller-supplied size bounds and other-output allowance "
+            "are not verified. Retries, stale files, other filesystems, concurrent usage, memory and runtime "
+            "require separate review. This estimate is not a reservation or launch approval."
+        ),
+    }
+
+
 def _validate_epoch_inputs(
     monitor_batches: dict, validate_epoch, lpips_loss_fn, *, hashes: dict,
     manifest_path: Path, source_root: Path, guardrail_manifest: dict,
