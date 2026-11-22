@@ -162,6 +162,7 @@ def augment_view(
     else:
         sparse = apply_input_random_sparse_keep(dense, rng=rng)
     return np.ascontiguousarray(sparse), np.ascontiguousarray(dense), {
+        "input_mode": input_mode,
         "transform": transform,
         "noise": noise_stats,
         "retained_fraction": float(np.count_nonzero(sparse) / sparse.size),

@@ -2015,6 +2015,149 @@ def update_gan_balance_controller(
     return next_gan_weight, next_disc_lr, status, control_acc
 
 
+def train_streamed_pair_step(
+    model, optimizer, batch, device, lpips_loss_fn, journal, *,
+    run_id, seed, epoch, batch_index, data_read_seconds,
+):
+    """Run one opt-in joint step and durably record it; not a training entry point."""
+    from collections import Counter
+    from dataclasses import asdict
+    from datetime import timezone
+    import json
+    import os
+    import resource
+    import uuid
+
+    from scripts.streamed_overlap_journal import STEP_FIELDS, _atomic_record, _sync_directory
+    from scripts.streamed_overlap_model import joint_loss
+
+    if journal.fields != STEP_FIELDS or journal.position is None or journal.attempt_id is None:
+        raise ValueError("A reconciled streamed-step journal is required.")
+    if (not isinstance(run_id, str) or not run_id or "\n" in run_id or "\r" in run_id
+            or isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+            or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1
+            or isinstance(batch_index, bool) or not isinstance(batch_index, int) or batch_index < 1
+            or not math.isfinite(data_read_seconds) or data_read_seconds < 0):
+        raise ValueError("Invalid streamed-step identity or data-read time.")
+    if not model.training:
+        raise ValueError("The streamed model must be in training mode.")
+    if journal.rows:
+        identity = journal.rows[0]
+        if (identity["run_id"], identity["arm"], identity["seed"]) != (run_id, model.arm, str(seed)):
+            raise ValueError("Journal run, arm or seed does not match the model.")
+    if (len(batch.provenance) != 12 or len(batch.unavailable_reasons) != 12
+            or len(batch.augmentation_stats) != 12):
+        raise ValueError("A streamed step requires exactly 12 labeled pairs.")
+    if (batch.input_a.shape[0] != 12 or batch.input_b.shape[0] != 12
+            or batch.dense_a.shape[0] != 12 or batch.overlap.shape != (12,)
+            or batch.coverage.shape != (12,) or batch.coverage_valid.shape != (12,)):
+        raise ValueError("Every streamed input and target must contain exactly 12 pairs.")
+    if (batch.coverage_valid.dtype != np.bool_
+            or not np.isfinite(batch.overlap).all()
+            or np.any((batch.overlap < 0) | (batch.overlap > 1))
+            or not np.isfinite(batch.coverage[batch.coverage_valid]).all()
+            or np.any((batch.coverage[batch.coverage_valid] < 0) | (batch.coverage[batch.coverage_valid] > 1))
+            or any(bool(available) != (reason is None)
+                   for available, reason in zip(batch.coverage_valid, batch.unavailable_reasons))):
+        raise ValueError("Streamed target values and validity reasons are inconsistent.")
+    category_counts = Counter(spec.category for spec in batch.provenance)
+    if category_counts != {"same_overlap": 6, "same_disjoint": 3, "cross_source": 3}:
+        raise ValueError("Streamed pair categories do not match the approved batch composition.")
+    if any(not parameter.requires_grad for parameter in model.parameters()):
+        raise ValueError("Every enabled model parameter must remain trainable.")
+    parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    if (len({id(parameter) for parameter in parameters}) != len(parameters)
+            or {id(parameter) for parameter in parameters} != {id(parameter) for parameter in model.parameters()}):
+        raise ValueError("Optimizer must contain every model parameter exactly once.")
+    expected_groups = {
+        "encoder": {id(parameter) for parameter in model.vae.encoder.parameters()},
+        "decoder": {id(parameter) for parameter in model.vae.decoder.parameters()},
+    }
+    if model.overlap_head is not None:
+        expected_groups["overlap"] = {id(parameter) for parameter in model.overlap_head.parameters()}
+    if model.coverage_head is not None:
+        expected_groups["coverage"] = {id(parameter) for parameter in model.coverage_head.parameters()}
+    actual_groups = {
+        group["name"]: {id(parameter) for parameter in group["params"]} for group in optimizer.param_groups
+    }
+    rates = {group["name"]: float(group["lr"]) for group in optimizer.param_groups}
+    if (len(rates) != len(optimizer.param_groups)
+            or actual_groups != expected_groups
+            or any(not math.isfinite(rate) or rate <= 0 for rate in rates.values())):
+        raise ValueError("Optimizer parameter-group names and learning rates must be valid.")
+    position = journal.position
+    step = position.logical_step + 1
+    event_id = uuid.uuid4().hex
+    started = time.monotonic()
+    provenance_dir = journal.path.parent / "provenance"
+    if not provenance_dir.exists():
+        provenance_dir.mkdir()
+        _sync_directory(provenance_dir.parent)
+    stats = []
+    for pair in batch.augmentation_stats:
+        stats.append([
+            {**view, "transform": asdict(view["transform"])} for view in pair
+        ])
+    provenance_path = _atomic_record(provenance_dir, {
+        "schema": "streamed-step-provenance-v1",
+        "event_id": event_id,
+        "pairs": [asdict(spec) for spec in batch.provenance],
+        "augmentation": stats,
+    })
+    a = torch.as_tensor(batch.input_a, device=device)
+    b = torch.as_tensor(batch.input_b, device=device)
+    dense = torch.as_tensor(batch.dense_a, device=device)
+    overlap = torch.as_tensor(batch.overlap, device=device)
+    coverage = torch.as_tensor(batch.coverage, device=device)
+    valid = torch.as_tensor(batch.coverage_valid, device=device)
+    optimizer.zero_grad(set_to_none=True)
+    losses = joint_loss(model(a, b), dense, lpips_loss_fn, overlap, coverage, valid)
+    losses.total.backward()
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), max_norm=2.0, error_if_nonfinite=True,
+    )
+    valid_counts = Counter(
+        spec.category for spec, available in zip(batch.provenance, batch.coverage_valid) if available
+    )
+    reasons = Counter(reason for reason in batch.unavailable_reasons if reason is not None)
+    overlap_loss = losses.overlap.item() if losses.overlap is not None else None
+    coverage_loss = losses.coverage.item() if losses.coverage is not None else None
+    lpips = losses.lpips.item()
+    kl = losses.kl.item()
+    row = {
+        "sequence": len(journal.rows) + 1, "event_id": event_id,
+        "attempt_id": journal.attempt_id, "logical_step": step, "completed_pairs": 12,
+        "cumulative_exposure": position.cumulative_exposure + 12,
+        "replay_of_event": position.replay_events.get(step, ""),
+        "run_id": run_id, "arm": model.arm, "seed": seed,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "epoch": epoch, "batch_index": batch_index, "reconstructed_a": 12,
+        "total_loss": losses.total.item(), "reconstruction_mae": losses.reconstruction.item(),
+        "lpips": lpips, "kl": kl, "weighted_lpips": 0.1 * lpips, "weighted_kl": 0.001 * kl,
+        "overlap_loss": overlap_loss, "weighted_overlap": 0.1 * overlap_loss if overlap_loss is not None else None,
+        "coverage_loss": coverage_loss, "weighted_coverage": 0.1 * coverage_loss if coverage_loss is not None else None,
+        "valid_coverage": losses.valid_coverage if model.coverage_head is not None else None,
+        "slice_counts": json.dumps({"pairs": category_counts, "valid_coverage": valid_counts}, sort_keys=True),
+        "unavailable_reasons": json.dumps(reasons, sort_keys=True),
+        "learning_rates": json.dumps(rates, sort_keys=True, allow_nan=False),
+        "gradient_norm": float(gradient_norm), "data_read_seconds": data_read_seconds,
+        "batch_seconds": time.monotonic() - started + data_read_seconds,
+        "peak_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "mps_driver_bytes": torch.mps.driver_allocated_memory() if torch.device(device).type == "mps" else None,
+        "provenance": os.path.relpath(provenance_path, journal.path.parent),
+    }
+    completed = False
+    try:
+        optimizer.step()
+        row["batch_seconds"] = time.monotonic() - started + data_read_seconds
+        journal.append(row)
+        completed = True
+    finally:
+        if not completed:
+            journal.position = None
+    return row
+
+
 def train_one_epoch(
     model,
     discriminator,

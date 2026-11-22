@@ -95,9 +95,23 @@ establish training throughput, full training-memory headroom, or approval of tha
 probability. They did not exercise an optimizer, journal, recovery, evaluation or
 TensorBoard integration.
 
-The integrated trainer, durable recovery, formal evaluation and integrated local
-smoke remain required. Keep train, resume, smoke and evaluate modes blocked.
-No training has been authorized.
+The existing trainer now has an opt-in single-batch joint-step primitive. Synthetic
+tests exercise one combined backward/optimizer step for each arm and verify encoder
+and enabled-head updates. The associated journal fsyncs each completed CSV row, uses
+a single-writer lock, preserves torn bytes in place with immutable recovery records,
+and identifies stale and replayed events relative to a checkpoint. Per-step source
+and augmentation provenance is written separately. Atomic epoch-state primitives
+capture the model, optimizer, approved scheduler, RNGs, sampler position, selection
+state, hashes and journal watermark; synthetic tests reproduce the joint step after
+recovery. A failed optimizer or journal write requires a fresh recovery attempt.
+These are primitives, not an integrated training or resume runner.
+
+The complete epoch loop, monitor and TensorBoard integration, formal evaluation,
+runner wiring and integrated local smoke remain required. In particular, the sampler's
+source-manifest hash covers inventory metadata, not full training-source contents.
+The journal currently reads completed CSV rows into memory; its long-run memory
+behavior must be assessed before launch. Keep train, resume, smoke and evaluate modes
+blocked. No training has been authorized.
 
 The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
 180 training and 25 validation sources. All 205 have the required semantic arrays;
