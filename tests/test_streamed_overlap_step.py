@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import random
 import csv
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -366,18 +367,32 @@ class StreamedStepTests(unittest.TestCase):
                 self.assertFalse(model.training)
                 self.assertFalse(torch.is_grad_enabled())
                 return {"split": "validation", "manifest_sha256": hashes["validation_manifest"],
+                        "epoch_validation_sha256": "e" * 64,
                         "reconstruction_mae": 1.0, "lpips_loss": 2.0, "kl": 3.0,
                         "metrics": {"mu_cosine_ndcg10": 0.4}}
 
-            def run(model, optimizer, scheduler, sampler, journal, validator):
+            class Validator:
+                config_sha256 = "e" * 64
+
+                def __init__(self, loss_fn):
+                    self.lpips_loss_fn = loss_fn
+
+                def __call__(self, model):
+                    return validate(model)
+
+            lpips_fn = lambda x, y: F.mse_loss(x, y)
+            validator = Validator(lpips_fn)
+
+            def run(model, optimizer, scheduler, sampler, journal, validator, selection_state=None):
                 return train_streamed_epoch(
                     model, optimizer, scheduler, sampler, journal,
-                    lambda x, y: F.mse_loss(x, y), "cpu", writer,
+                    lpips_fn, "cpu", writer,
                     run_id="test", seed=1, epoch=1, batches_per_epoch=2, sparse_probability=0.5,
                     monitor_batches={"train": batch, "validation": validation},
                     monitor_seed=7, validation_seed=8, validate_epoch=validator,
                     epoch_csv=root / "training_metrics.csv", checkpoint_path=root / "last.pt",
-                    hashes=hashes, early_stopping=stop, selection_state={},
+                    hashes=hashes, early_stopping=stop,
+                    selection_state={} if selection_state is None else selection_state,
                 )
 
             previous = batch.input_a[0, 0, 0, 0, 0]
@@ -387,10 +402,24 @@ class StreamedStepTests(unittest.TestCase):
             self.assertEqual(sampler.batches_drawn, 0)
             self.assertEqual(journal.rows, [])
             batch.input_a[0, 0, 0, 0, 0] = previous
+            with self.assertRaisesRegex(ValueError, "validation configuration"):
+                run(model, optimizer, scheduler, sampler, journal, validator)
+            self.assertEqual(sampler.batches_drawn, 0)
+            hashes["epoch_validation"] = validator.config_sha256
+            with self.assertRaisesRegex(ValueError, "Stored epoch validation"):
+                run(model, optimizer, scheduler, sampler, journal, validator, {
+                    "_epoch_validation": {"epoch_validation_sha256": "f" * 64},
+                })
+            self.assertEqual(sampler.batches_drawn, 0)
+            save_epoch_state(
+                root / "last.pt", model=model, optimizer=optimizer, scheduler=scheduler,
+                sampler=sampler, early_stopping=stop, journal=journal, hashes=hashes,
+                completed_epoch=0, batches_per_epoch=2, selection_state={},
+            )
             with patch("scripts.streamed_overlap_checkpoint.save_epoch_state",
                        side_effect=OSError("checkpoint interrupted")):
                 with self.assertRaisesRegex(OSError, "checkpoint interrupted"):
-                    run(model, optimizer, scheduler, sampler, journal, validate)
+                    run(model, optimizer, scheduler, sampler, journal, validator)
             stale = list(journal.rows)
             self.assertIsNone(journal.position)
             self.assertEqual(torch.load(root / "last.pt", weights_only=True)["completed_epoch"], 0)
@@ -410,7 +439,13 @@ class StreamedStepTests(unittest.TestCase):
             with (root / "training_metrics.csv").open("ab") as handle:
                 handle.write(b"interrupted-epoch-row")
             with patch("scripts.train.monitor_streamed_pairs", wraps=monitor_streamed_pairs) as monitor:
-                run(model, optimizer, scheduler, sampler, resumed, validate)
+                result = run(model, optimizer, scheduler, sampler, resumed, validator)
+            self.assertEqual(result["checkpoint"]["attempt_id"], "second")
+            self.assertEqual(result["checkpoint"]["checkpoint_sha256"],
+                             hashlib.sha256((root / "last.pt").read_bytes()).hexdigest())
+            saved = torch.load(root / "last.pt", weights_only=True)
+            self.assertEqual(saved["selection_state"]["_epoch_validation"]["metrics"]["mu_cosine_ndcg10"], 0.4)
+            self.assertEqual(saved["selection_state"]["_epoch_validation"]["epoch_validation_sha256"], "e" * 64)
             self.assertEqual(scheduler.best, 1.0 + 0.1 * 2.0 + 0.001 * 3.0)
             self.assertEqual(monitor.call_count, 1)
             self.assertEqual([row["replay_of_event"] for row in resumed.rows[-2:]],

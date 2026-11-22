@@ -8,12 +8,16 @@ import numpy as np
 import torch
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_evaluation import evaluate_checkpoint
+from scripts.streamed_overlap_evaluation import StreamedEpochValidator, evaluate_checkpoint, export_tokenizer_checkpoint
 from scripts.streamed_overlap_integrity import input_fingerprints, verify_inputs
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
+from scripts.streamed_overlap_selection import select_checkpoints
 from scripts.streamed_overlap_yield import SEISMIC_KEY
 from src.model import VAE3D
+from scripts.train import compute_vae_losses, streamed_inference_context
+from src.tokenizer.core.preprocess import normalize_cube_by_std, preprocess_for_token
+from src.tokenizer.core.model_adapter import VaeLatentAdapter
 from tests.test_streamed_overlap_metrics import frozen_fixture
 
 
@@ -28,13 +32,22 @@ class Encoder(torch.nn.Module):
         return mu, torch.zeros_like(mu)
 
 
+class Decoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 20)
+
+    def forward(self, z):
+        return self.linear(z).reshape(-1, 1, 2, 2, 5), None
+
+
 class ToyVAE(VAE3D):
     def __init__(self):
         torch.nn.Module.__init__(self)
         self.patch_shape = (2, 2, 5)
         self.latent_dim = 2
         self.encoder = Encoder()
-        self.decoder = torch.nn.Linear(2, 2)
+        self.decoder = Decoder()
 
 
 def toy_factory(arm, model_seed, head_seed):
@@ -164,6 +177,178 @@ class EvaluationTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_evaluation.verify_inputs", side_effect=verify_then_change):
             with self.assertRaisesRegex(ValueError, "changed after fingerprint"):
                 self.evaluate()
+
+    def test_epoch_validation_is_deterministic_and_restores_training_state(self):
+        ids = tuple(query["id"] for query in self.manifest["queries"][:3])
+        lpips = lambda x, y: (x - y).square().mean()
+        validator = StreamedEpochValidator(
+            self.root / "manifest.json", self.root, manifest_sha256=self.manifest["manifest_sha256"],
+            reconstruction_query_ids=ids, reconstruction_seed=12, encode_batch_size=11,
+            reconstruction_batch_size=2, max_wall_seconds=60, lpips_loss_fn=lpips,
+        )
+        self.model.train()
+        before = torch.get_rng_state().clone()
+        with patch("scripts.streamed_overlap_evaluation.load_manifest", return_value=self.manifest), \
+             patch("scripts.streamed_overlap_evaluation.open_validation_sources", return_value=self.groups):
+            with streamed_inference_context(self.model, "cpu", seed=4):
+                result = validator(self.model)
+            with streamed_inference_context(self.model, "cpu", seed=5):
+                repeated = validator(self.model)
+        self.assertEqual(result, repeated)
+        self.assertEqual(result["epoch_validation_sha256"], validator.config_sha256)
+        self.assertAlmostEqual(result["metrics"]["mu_cosine_ndcg10"],
+                               self.evaluate(pair_head=False)["scorers"]["mu_cosine"]["summary"]["ndcg_at_10"])
+        originals = [self.groups[query["window"]["source_id"]][SEISMIC_KEY]
+                     for query in self.manifest["queries"][:3]]
+        inputs = torch.from_numpy(np.stack([preprocess_for_token(cube) for cube in originals])[:, None])
+        targets = torch.from_numpy(np.stack([normalize_cube_by_std(cube) for cube in originals])[:, None])
+        with streamed_inference_context(self.model, "cpu", seed=4):
+            mu, logvar = self.model.vae.encoder(inputs)
+            noise = torch.randn((3, 2), generator=torch.Generator().manual_seed(12))
+            prediction, _ = self.model.vae.decoder(mu + (0.5 * logvar).exp() * noise)
+            _, mae, kl, perceptual, _ = compute_vae_losses(
+                prediction, targets, mu, logvar, 0.001, rec_loss_fn=torch.nn.functional.l1_loss,
+                lpips_loss_fn=lpips, lpips_weight=0.1,
+            )
+        self.assertAlmostEqual(result["reconstruction_mae"], mae.item(), places=6)
+        self.assertAlmostEqual(result["lpips_loss"], perceptual.item(), places=6)
+        self.assertAlmostEqual(result["kl"], kl.item(), places=6)
+        self.assertTrue(self.model.training)
+        self.assertTrue(torch.equal(before, torch.get_rng_state()))
+        with self.assertRaisesRegex(ValueError, "eval mode"):
+            validator(self.model)
+
+    def test_tokenizer_export_preserves_mu_and_does_not_overwrite(self):
+        def factory(arm, model_seed, head_seed):
+            del model_seed, head_seed
+            with torch.random.fork_rng():
+                torch.manual_seed(10)
+                return StreamedPairVAE(
+                    VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8), encoder_arch="residual"), arm,
+                )
+
+        self.model = factory("S3", 0, 0)
+        self.optimizer = build_optimizer(self.model)
+        self.save()
+        destination = self.root / "tokenizer.pt"
+        with patch("scripts.streamed_overlap_evaluation.load_manifest", return_value=self.manifest), \
+             patch("scripts.streamed_overlap_evaluation.fresh_e1_model", side_effect=factory):
+            result = export_tokenizer_checkpoint(
+                self.path, self.journal, self.root / "manifest.json", destination,
+            )
+            with self.assertRaises(FileExistsError):
+                export_tokenizer_checkpoint(self.path, self.journal, self.root / "manifest.json", destination)
+        self.assertEqual(result["tokenizer_checkpoint_sha256"], hashlib.sha256(destination.read_bytes()).hexdigest())
+        adapter = VaeLatentAdapter(destination, device="cpu")
+        self.model.eval()
+        cubes = np.random.default_rng(42).normal(size=(2, 8, 8, 8)).astype(np.float32)
+        with torch.inference_mode():
+            expected, _ = self.model.vae.encoder(torch.from_numpy(cubes[:, None]))
+        np.testing.assert_allclose(adapter.encode_batch(cubes), expected.numpy(), rtol=1e-6, atol=1e-6)
+
+    def selection_checkpoint(self, epoch, mae):
+        state = torch.load(self.path, weights_only=True)
+        state["completed_epoch"] = epoch
+        state["journal"] = {
+            "event_id": f"event-{epoch}", "logical_step": epoch, "cumulative_exposure": 12 * epoch,
+        }
+        state["sampler"]["batches_drawn"] = epoch
+        state["hashes"]["epoch_validation"] = "e" * 64
+        state["selection_state"] = {
+            "_epoch_validation": {
+                "split": "validation", "manifest_sha256": self.manifest["manifest_sha256"],
+                "epoch_validation_sha256": "e" * 64,
+                "reconstruction_mae": mae, "lpips_loss": 0.0, "kl": 0.0,
+            },
+        }
+        temporary = self.root / "replacement.pt"
+        torch.save(state, temporary)
+        temporary.replace(self.path)
+
+    def select(self, report):
+        with patch("scripts.streamed_overlap_selection.load_manifest", return_value=self.manifest), \
+             patch("scripts.streamed_overlap_selection.fresh_e1_model", side_effect=toy_factory):
+            return select_checkpoints(
+                self.path, self.journal, self.root / "manifest.json", retrieval_report=report,
+            )
+
+    def test_selection_keeps_distinct_bests_and_reconciles_stale_events(self):
+        last = self.root / "last.pt"
+        self.path.replace(last)
+        self.path = last
+        self.selection_checkpoint(1, 1.0)
+        report = self.evaluate()
+        first = self.select(report)
+        first_hash = first["last"]["checkpoint_sha256"]
+        self.assertEqual(first["best_retrieval"]["checkpoint"]["checkpoint_sha256"], first_hash)
+        self.assertEqual(hashlib.sha256((self.root / "best_reconstruction.pt").read_bytes()).hexdigest(), first_hash)
+        row: dict[str, object] = dict(self.journal.rows[-1])
+        row.update({
+            "sequence": 2, "event_id": "event-2", "logical_step": 2, "epoch": 2,
+            "cumulative_exposure": 24,
+        })
+        self.journal.append(row)
+        with self.assertRaisesRegex(ValueError, "currently reconciled"):
+            self.select(None)
+        self.selection_checkpoint(2, 0.5)
+        second = self.select(None)
+        self.assertEqual(second["best_reconstruction"]["checkpoint"]["step"], 2)
+        self.assertEqual(second["best_retrieval"]["checkpoint"]["step"], 1)
+        self.assertNotEqual(second["last"]["checkpoint_sha256"], first_hash)
+        self.journal.reconcile(watermark="event-1", attempt_id="attempt-2",
+                               expected_step=1, expected_exposure=12)
+        replacement = self.root / "replacement.pt"
+        replacement.write_bytes((self.root / "best_retrieval.pt").read_bytes())
+        replacement.replace(last)
+        restored = self.select(None)
+        self.assertEqual(restored["best_reconstruction"]["checkpoint"]["step"], 1)
+        self.assertEqual(restored["best_retrieval"]["checkpoint"]["step"], 1)
+        self.assertEqual(hashlib.sha256((self.root / "best_reconstruction.pt").read_bytes()).hexdigest(), first_hash)
+        self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 3)
+
+    def test_selection_rejects_mismatched_results_and_recovers_alias_failure(self):
+        last = self.root / "last.pt"
+        self.path.replace(last)
+        self.path = last
+        self.selection_checkpoint(1, 1.0)
+        report = self.evaluate()
+        report["scorers"]["pair_head"]["rows"][0]["ndcg"] = 0.0
+        with self.assertRaisesRegex(ValueError, "summary disagrees"):
+            self.select(report)
+        self.assertFalse((self.root / "best_retrieval.pt").exists())
+        report = self.evaluate()
+        with patch("scripts.streamed_overlap_selection._publish_alias", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                self.select(report)
+        result = self.select(report)
+        self.assertEqual(result["best_retrieval"]["checkpoint"]["step"], 1)
+        self.assertTrue((self.root / "best_retrieval.pt").is_file())
+        self.selection_checkpoint(1, 0.9)
+        with self.assertRaisesRegex(ValueError, "different checkpoint contents"):
+            self.select(None)
+
+    def test_selection_does_not_replace_unrelated_checkpoint(self):
+        last = self.root / "last.pt"
+        self.path.replace(last)
+        self.path = last
+        self.selection_checkpoint(1, 1.0)
+        unrelated = self.root / "best_reconstruction.pt"
+        unrelated.write_bytes(b"unrelated")
+        with self.assertRaisesRegex(ValueError, "existing checkpoint aliases"):
+            self.select(None)
+        self.assertEqual(unrelated.read_bytes(), b"unrelated")
+
+    def test_selection_refuses_modified_owned_alias(self):
+        last = self.root / "last.pt"
+        self.path.replace(last)
+        self.path = last
+        self.selection_checkpoint(1, 1.0)
+        self.select(None)
+        alias = self.root / "best_reconstruction.pt"
+        alias.write_bytes(b"modified")
+        with self.assertRaisesRegex(ValueError, "unrelated selection alias"):
+            self.select(None)
+        self.assertEqual(alias.read_bytes(), b"modified")
 
 
 if __name__ == "__main__":

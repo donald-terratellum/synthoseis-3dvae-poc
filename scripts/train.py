@@ -2444,6 +2444,7 @@ def train_streamed_epoch(
             or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1
             or isinstance(batches_per_epoch, bool) or not isinstance(batches_per_epoch, int)
             or batches_per_epoch < 1 or not callable(validate_epoch)
+            or not isinstance(selection_state, dict)
             or not math.isfinite(sparse_probability) or not 0 <= sparse_probability <= 1):
         raise ValueError("A valid training sampler, epoch budget, validation and journal are required.")
     if (journal.position.logical_step != (epoch - 1) * batches_per_epoch
@@ -2451,6 +2452,17 @@ def train_streamed_epoch(
         raise ValueError("Training must begin at a matching epoch-boundary sampler position.")
     _validate_streamed_monitors(monitor_batches)
     _validate_hashes(hashes)
+    validation_config = getattr(validate_epoch, "config_sha256", None)
+    if validation_config is not None and (
+        hashes.get("epoch_validation") != validation_config
+        or getattr(validate_epoch, "lpips_loss_fn", None) is not lpips_loss_fn
+    ):
+        raise ValueError("Epoch validation configuration and LPIPS must match the frozen training configuration.")
+    if "_epoch_validation" in selection_state and (
+        validation_config is None or not isinstance(selection_state["_epoch_validation"], dict)
+        or selection_state["_epoch_validation"].get("epoch_validation_sha256") != validation_config
+    ):
+        raise ValueError("Stored epoch validation is incompatible with the active validation configuration.")
     if hashes.get("monitor") != streamed_monitor_hash(monitor_batches):
         raise ValueError("Fixed monitor inputs differ from the frozen monitor hash.")
     if (any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**32
@@ -2513,6 +2525,8 @@ def train_streamed_epoch(
         if (not isinstance(validation, dict)
                 or validation.get("split") != "validation"
                 or validation.get("manifest_sha256") != hashes["validation_manifest"]
+                or (validation_config is not None
+                    and validation.get("epoch_validation_sha256") != validation_config)
                 or not isinstance(validation.get("metrics"), dict)):
             raise ValueError("Validation must report the frozen primary validation manifest.")
         val_mae = _streamed_validation_loss(validation.get("reconstruction_mae"), "MAE")
@@ -2551,11 +2565,26 @@ def train_streamed_epoch(
             "attempt_id": journal.attempt_id, "batch_event_id": journal.rows[-1]["event_id"],
         })
         _append_streamed_epoch_metrics(epoch_csv, epoch_row)
+        checkpoint_selection_state = selection_state
+        if validation_config is not None:
+            checkpoint_selection_state = {**selection_state, "_epoch_validation": validation}
         save_epoch_state(
             Path(checkpoint_path), model=model, optimizer=optimizer, scheduler=scheduler,
             sampler=sampler, early_stopping=early_stopping, journal=journal, hashes=hashes,
-            completed_epoch=epoch, batches_per_epoch=batches_per_epoch, selection_state=selection_state,
+            completed_epoch=epoch, batches_per_epoch=batches_per_epoch, selection_state=checkpoint_selection_state,
         )
+        if validation_config is not None:
+            import hashlib
+
+            digest = hashlib.sha256()
+            with Path(checkpoint_path).open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            validation["checkpoint"] = {
+                "arm": model.arm, "run_id": run_id, "attempt_id": journal.attempt_id,
+                "step": journal.position.logical_step, "journal_event_id": journal.rows[-1]["event_id"],
+                "checkpoint_sha256": digest.hexdigest(),
+            }
         completed = True
         return validation
     finally:

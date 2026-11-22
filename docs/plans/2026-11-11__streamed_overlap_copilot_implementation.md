@@ -148,10 +148,39 @@ peak RSS including interpreter startup, using tiny fixture models and arrays.
 These are not real-data evaluation resource estimates. No real checkpoint or model
 has been scored.
 
-This evaluator is not yet a complete formal validation callback or adoption
-decision: reconstruction metrics and guardrails, independent-seed provenance,
-physical-overlap and other requested diagnostic reports, checkpoint selection,
-bounded tokenizer searches, runner wiring and an integrated local smoke remain.
+An opt-in epoch callback now verifies the same frozen inputs, evaluates
+tokenizer-aligned mu-cosine on the frozen queries, and computes sampled
+reconstruction MAE, LPIPS and KL on an explicitly fixed subset of query IDs. Its
+manifest, query IDs, batch sizes, seed and wall-time limit have a configuration
+hash that must match the epoch helper's checkpoint hashes. Validation metrics are
+stored in the full-state checkpoint and the helper returns its hash and journal
+identity. A separate helper supports a create-exclusive export of a completed VAE
+checkpoint to the existing tokenizer adapter format; it does not change tokenizer
+defaults or run a tokenizer search.
+
+The numerical reconstruction guardrail compares fully covered, hash-identified
+synthetic and real measurement records using the fixed +2% recipe and MAE
+thresholds and matched sampling protocol. It does not collect or verify those
+measurements, establish data or checkpoint provenance, or make an adoption decision.
+The guardrail datasets and full-coverage measurement producer remain to be frozen
+and implemented; no final-test data was accessed.
+
+An opt-in checkpoint selector records immutable journal-linked selection events
+and publishes separate best-reconstruction and best-retrieval aliases for
+`last.pt`. It excludes discarded recovery events, repairs interrupted alias
+publication on the next selection, verifies retrieval eligibility and trained-head
+evidence, and never treats checkpoint ranking as adoption. Historical best
+snapshots are retained as verified copies so earlier selections can be restored
+after recovery; their disk consumption can grow throughout a run and must be
+budgeted before launch. The checkpoint volume does not support hard links; a local
+probe confirmed file/directory fsync and atomic replacement.
+
+The independent-seed provenance check, physical-overlap and other requested
+diagnostic reports, bounded tokenizer searches, runner wiring and integrated local
+smoke remain. Keep launch modes blocked.
+Fourteen synthetic evaluator, selection and guardrail tests used temporary files
+on the checkpoint volume and took 4.06 seconds and about 343 MiB peak RSS
+including startup. This is not a real-data runtime or memory estimate.
 The sampler's source-manifest hash covers inventory metadata, not full
 training-source contents. The journal currently reads completed CSV rows into
 memory; its long-run memory behavior must be assessed before launch. Keep train,

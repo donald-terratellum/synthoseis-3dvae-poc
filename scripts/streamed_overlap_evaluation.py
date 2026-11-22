@@ -3,8 +3,11 @@
 from dataclasses import asdict
 import hashlib
 import math
+import os
 from pathlib import Path
+import shutil
 import time
+import uuid
 
 import numpy as np
 import torch
@@ -14,15 +17,17 @@ from scripts.streamed_overlap_checkpoint import _validate_hashes
 from scripts.streamed_overlap_integrity import (
     _digest_array, _window_record, load_manifest, open_validation_sources, verify_inputs,
 )
-from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
+from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _sync_directory
 from scripts.streamed_overlap_manifest import _window
-from scripts.streamed_overlap_metrics import _eligible_queries, calculate_rankings, summarize_rankings
+from scripts.streamed_overlap_metrics import (
+    _eligible_queries, calculate_rankings, linear_ndcg_at_10, summarize_rankings,
+)
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_targets import _read_bounded
 from scripts.streamed_overlap_yield import SEISMIC_KEY
-from scripts.train import streamed_inference_context
+from scripts.train import build_checkpoint_payload, compute_vae_losses, streamed_inference_context
 from src.tokenizer.core.model_adapter import choose_torch_device
-from src.tokenizer.core.preprocess import preprocess_for_token
+from src.tokenizer.core.preprocess import normalize_cube_by_std, preprocess_for_token
 from src.tokenizer.core.similarity import cosine_similarity
 
 
@@ -129,7 +134,7 @@ def _require_trained_coverage(state: dict, model, journal: BatchJournal, identit
         raise ValueError("No committed valid coverage update is recorded for the head.")
 
 
-def _read_input(window_data: dict, groups: dict, fingerprints: dict, patch_shape: tuple[int, ...]) -> np.ndarray:
+def _read_original(window_data: dict, groups: dict, fingerprints: dict, patch_shape: tuple[int, ...]) -> np.ndarray:
     window = _window(window_data)
     if window.shape != patch_shape or window.source_id not in groups:
         raise ValueError("Validation input window is unsupported or has an unknown source.")
@@ -141,7 +146,189 @@ def _read_input(window_data: dict, groups: dict, fingerprints: dict, patch_shape
     record = fingerprints.get(content_hash(_window_record(window)))
     if not isinstance(record, dict) or record.get("arrays", {}).get(SEISMIC_KEY) != _digest_array(original):
         raise ValueError("Validation seismic window changed after fingerprint verification.")
-    return preprocess_for_token(original)
+    return original
+
+
+def _read_input(window_data: dict, groups: dict, fingerprints: dict, patch_shape: tuple[int, ...]) -> np.ndarray:
+    return preprocess_for_token(_read_original(window_data, groups, fingerprints, patch_shape))
+
+
+def _query_scores(model, query, groups, fingerprints, device, encode_batch_size, deadline, score_pair_head):
+    windows = [query["window"], *(candidate["window"] for candidate in query["candidates"])]
+    latents = []
+    for offset in range(0, len(windows), encode_batch_size):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Evaluation wall-time limit exceeded; no partial report is valid.")
+        cubes = np.stack([
+            _read_input(window, groups, fingerprints, model.vae.patch_shape)
+            for window in windows[offset:offset + encode_batch_size]
+        ])
+        inputs = torch.from_numpy(cubes[:, None]).to(device)
+        mu, _ = model.vae.encoder(inputs)
+        if mu.ndim != 2 or mu.shape[0] != len(cubes) or not torch.isfinite(mu).all():
+            raise ValueError("Encoder produced invalid validation mu vectors.")
+        latents.append(mu)
+    mu = torch.cat(latents)
+    values = mu.cpu().numpy()
+    cosine = [cosine_similarity(values[0], candidate) for candidate in values[1:]]
+    pair_scores = None
+    if score_pair_head:
+        head = model.coverage_head
+        if head is None:
+            raise ValueError("Trained coverage head is unavailable.")
+        pair_scores = head(mu[:1].expand(len(mu) - 1, -1), mu[1:]).cpu().tolist()
+    return cosine, pair_scores
+
+
+class StreamedEpochValidator:
+    """Fixed validation-only reconstruction and mu-cosine callback for the epoch helper."""
+
+    def __init__(
+        self, manifest_path: Path, source_root: Path, *, manifest_sha256: str,
+        reconstruction_query_ids: tuple[str, ...], reconstruction_seed: int,
+        encode_batch_size: int, reconstruction_batch_size: int, max_wall_seconds: float,
+        lpips_loss_fn,
+    ):
+        if (not isinstance(manifest_sha256, str) or len(manifest_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in manifest_sha256)
+                or not isinstance(reconstruction_query_ids, tuple) or not reconstruction_query_ids
+                or any(not isinstance(value, str) or not value for value in reconstruction_query_ids)
+                or len(set(reconstruction_query_ids)) != len(reconstruction_query_ids)
+                or isinstance(reconstruction_seed, bool) or not isinstance(reconstruction_seed, int)
+                or not 0 <= reconstruction_seed < 2**32
+                or any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+                       for value in (encode_batch_size, reconstruction_batch_size))
+                or isinstance(max_wall_seconds, bool) or not isinstance(max_wall_seconds, (int, float))
+                or not math.isfinite(max_wall_seconds) or max_wall_seconds <= 0
+                or not callable(lpips_loss_fn)):
+            raise ValueError("Fixed validation identities, batch sizes, seed and wall-time limit are required.")
+        self.manifest_path = manifest_path
+        self.source_root = source_root
+        self.manifest_sha256 = manifest_sha256
+        self.reconstruction_query_ids = reconstruction_query_ids
+        self.reconstruction_seed = reconstruction_seed
+        self.encode_batch_size = encode_batch_size
+        self.reconstruction_batch_size = reconstruction_batch_size
+        self.max_wall_seconds = float(max_wall_seconds)
+        self.lpips_loss_fn = lpips_loss_fn
+        self.config_sha256 = content_hash({
+            "schema": "streamed-epoch-validation-v1", "manifest_sha256": manifest_sha256,
+            "reconstruction_query_ids": reconstruction_query_ids, "reconstruction_seed": reconstruction_seed,
+            "encode_batch_size": encode_batch_size, "reconstruction_batch_size": reconstruction_batch_size,
+            "max_wall_seconds": self.max_wall_seconds,
+        })
+
+    def __call__(self, model) -> dict:
+        if model.training or torch.is_grad_enabled():
+            raise ValueError("Epoch validation requires eval mode and inference-only execution.")
+        if isinstance(self.lpips_loss_fn, torch.nn.Module) and self.lpips_loss_fn.training:
+            raise ValueError("Epoch validation LPIPS module must be in eval mode.")
+        started = time.monotonic()
+        deadline = started + self.max_wall_seconds
+        manifest = load_manifest(self.manifest_path)
+        if manifest["manifest_sha256"] != self.manifest_sha256:
+            raise ValueError("Epoch validation manifest does not match the frozen configuration.")
+        queries = _eligible_queries(manifest)
+        by_id = {query["id"]: query for query in queries}
+        if any(query_id not in by_id for query_id in self.reconstruction_query_ids):
+            raise ValueError("Every reconstruction query must belong to the frozen eligible manifest.")
+        groups = open_validation_sources(self.source_root.resolve(strict=True), manifest)
+        verify_inputs(manifest, groups)
+        fingerprints = manifest["input_integrity"]["fingerprints"]["windows"]
+        devices = {parameter.device for parameter in model.parameters()}
+        if len(devices) != 1:
+            raise ValueError("Epoch validation requires a model on one device.")
+        device = next(iter(devices))
+        rankings = []
+        for query in queries:
+            cosine, _ = _query_scores(
+                model, query, groups, fingerprints, device, self.encode_batch_size, deadline, False,
+            )
+            candidates = query["candidates"]
+            rankings.append(linear_ndcg_at_10(
+                [candidate["target"]["coverage"] for candidate in candidates],
+                cosine, [candidate["id"] for candidate in candidates],
+            ))
+        generator = torch.Generator(device="cpu").manual_seed(self.reconstruction_seed)
+        noise = torch.randn((len(self.reconstruction_query_ids), model.vae.latent_dim), generator=generator)
+        sums = {"reconstruction_mae": 0.0, "lpips_loss": 0.0, "kl": 0.0}
+        for start in range(0, len(self.reconstruction_query_ids), self.reconstruction_batch_size):
+            if time.monotonic() > deadline:
+                raise TimeoutError("Epoch validation wall-time limit exceeded; no partial report is valid.")
+            ids = self.reconstruction_query_ids[start:start + self.reconstruction_batch_size]
+            originals = [
+                _read_original(by_id[query_id]["window"], groups, fingerprints, model.vae.patch_shape)
+                for query_id in ids
+            ]
+            inputs = torch.from_numpy(np.stack([preprocess_for_token(cube) for cube in originals])[:, None]).to(device)
+            targets = torch.from_numpy(np.stack([normalize_cube_by_std(cube) for cube in originals])[:, None]).to(device)
+            mu, logvar = model.vae.encoder(inputs)
+            if (not torch.isfinite(mu).all() or not torch.isfinite(logvar).all()
+                    or mu.shape != (len(ids), model.vae.latent_dim) or logvar.shape != mu.shape):
+                raise ValueError("Epoch validation encoder produced invalid latent parameters.")
+            latent = mu + (0.5 * logvar).exp() * noise[start:start + len(ids)].to(device)
+            reconstruction, _ = model.vae.decoder(latent)
+            if reconstruction.shape != targets.shape or not torch.isfinite(reconstruction).all():
+                raise ValueError("Epoch validation reconstruction is non-finite or has the wrong shape.")
+            _, mae, kl, lpips, _ = compute_vae_losses(
+                reconstruction, targets, mu, logvar, kl_weight=0.001,
+                rec_loss_fn=torch.nn.functional.l1_loss, lpips_loss_fn=self.lpips_loss_fn, lpips_weight=0.1,
+            )
+            for name, value in (("reconstruction_mae", mae), ("lpips_loss", lpips), ("kl", kl)):
+                scalar = float(value.item())
+                if not math.isfinite(scalar) or scalar < 0:
+                    raise ValueError(f"Epoch validation {name} must be finite and nonnegative.")
+                sums[name] += len(ids) * scalar
+        if time.monotonic() > deadline:
+            raise TimeoutError("Epoch validation wall-time limit exceeded; no partial report is valid.")
+        return {
+            "split": "validation", "manifest_sha256": self.manifest_sha256,
+            "epoch_validation_sha256": self.config_sha256,
+            **{name: value / len(self.reconstruction_query_ids) for name, value in sums.items()},
+            "metrics": {"mu_cosine_ndcg10": float(np.mean(rankings))},
+        }
+
+
+def export_tokenizer_checkpoint(
+    checkpoint_path: Path, journal: BatchJournal, manifest_path: Path, output_path: Path,
+) -> dict:
+    """Export a completed streamed VAE for explicit tokenizer mu-mode evaluation."""
+    manifest = load_manifest(manifest_path)
+    _eligible_queries(manifest)
+    state, checkpoint_hash = _checkpoint_state(checkpoint_path)
+    identity = _identity(state, checkpoint_hash, journal, manifest["manifest_sha256"])
+    model = fresh_e1_model(identity["arm"], model_seed=0, head_seed=0)
+    model.load_state_dict(state["model"], strict=True)
+    payload = build_checkpoint_payload(model.vae, epoch=identity["epoch"])
+    payload["streamed_origin"] = identity
+    temporary = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        digest = hashlib.sha256()
+        with temporary.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        with temporary.open("rb") as source, output_path.open("xb") as destination:
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+        _sync_directory(output_path.parent)
+        written = hashlib.sha256()
+        with output_path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                written.update(chunk)
+        if written.digest() != digest.digest():
+            raise ValueError("Exported tokenizer checkpoint differs from its source bytes.")
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {
+        "checkpoint": identity, "tokenizer_checkpoint_sha256": digest.hexdigest(),
+        "embedding_mode": "mu", "latent_mode": "vae",
+    }
 
 
 def evaluate_checkpoint(
@@ -187,31 +374,15 @@ def evaluate_checkpoint(
     scores = {"mu_cosine": {}, "pair_head": {}}
     with streamed_inference_context(model, actual_device, inference_seed):
         for query in queries:
-            windows = [query["window"], *(candidate["window"] for candidate in query["candidates"])]
-            latents = []
-            for offset in range(0, len(windows), encode_batch_size):
-                if time.monotonic() - started > max_wall_seconds:
-                    raise TimeoutError("Evaluation wall-time limit exceeded; no partial report is valid.")
-                cubes = np.stack([
-                    _read_input(window, groups, fingerprints, model.vae.patch_shape)
-                    for window in windows[offset:offset + encode_batch_size]
-                ])
-                inputs = torch.from_numpy(cubes[:, None]).to(actual_device)
-                mu, _ = model.vae.encoder(inputs)
-                if mu.ndim != 2 or mu.shape[0] != len(cubes) or not torch.isfinite(mu).all():
-                    raise ValueError("Encoder produced invalid validation mu vectors.")
-                latents.append(mu)
-            mu = torch.cat(latents)
-            mu_a, mu_b = mu[:1].expand(len(mu) - 1, -1), mu[1:]
-            values = mu.cpu().numpy()
-            cosine = [cosine_similarity(values[0], candidate) for candidate in values[1:]]
+            cosine, prediction = _query_scores(
+                model, query, groups, fingerprints, actual_device, encode_batch_size,
+                started + max_wall_seconds, score_pair_head,
+            )
             candidates = query["candidates"]
             scores["mu_cosine"][query["id"]] = dict(zip((item["id"] for item in candidates), cosine))
             if score_pair_head:
-                head = model.coverage_head
-                if head is None:
-                    raise ValueError("Trained coverage head is unavailable.")
-                prediction = head(mu_a, mu_b).cpu().tolist()
+                if prediction is None:
+                    raise ValueError("Directional coverage scores are unavailable.")
                 scores["pair_head"][query["id"]] = dict(zip((item["id"] for item in candidates), prediction))
     reports = {}
     for scorer in ("mu_cosine", "pair_head") if score_pair_head else ("mu_cosine",):
