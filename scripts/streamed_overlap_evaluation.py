@@ -20,7 +20,7 @@ from scripts.streamed_overlap_integrity import (
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _sync_directory
 from scripts.streamed_overlap_manifest import _window
 from scripts.streamed_overlap_metrics import (
-    _eligible_queries, calculate_rankings, linear_ndcg_at_10, summarize_rankings,
+    _eligible_queries, calculate_rankings, event_coverage_diagnostics, linear_ndcg_at_10, summarize_rankings,
 )
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_targets import _read_bounded
@@ -395,6 +395,8 @@ def evaluate_checkpoint(
             "summary": summarize_rankings(ranking, bootstrap_seed=bootstrap_seed, bootstrap_repeats=bootstrap_repeats),
             "rows": [asdict(row) for row in ranking.rows],
         }
+        if scorer == "pair_head":
+            reports[scorer]["event_coverage_diagnostics"] = event_coverage_diagnostics(manifest, scores[scorer])
     if time.monotonic() - started > max_wall_seconds:
         raise TimeoutError("Evaluation wall-time limit exceeded; no partial report is valid.")
     return {

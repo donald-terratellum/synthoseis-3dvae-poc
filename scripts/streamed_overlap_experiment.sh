@@ -18,9 +18,10 @@ TensorBoard binds to 127.0.0.1:6006 and remains running after this shell exits.
 Only a verified run-owned PID can be reused or stopped; occupied ports are errors.
 No training or event generation occurs in these monitoring modes.
 
-This milestone implements audit and monitoring, not model training.
-All train/resume/smoke/evaluate modes are blocked pending target-contract approval
-and subsequent implementation. Audit output is LOCAL_TARGET_VALIDATION_PENDING.
+This runner implements audit and monitoring, not the integrated training suite.
+Train/resume/smoke/evaluate modes remain blocked until runner integration,
+evaluation prerequisites and the separate training approval are complete.
+Audit output is LOCAL_TARGET_VALIDATION_PENDING.
 Combined stdout/stderr is captured at logs/<run-id>/training.log.
 PYTHON may select the interpreter; default is this repository's uv-managed .venv/bin/python.
 Print-only mode creates no files and starts no processes.
@@ -56,7 +57,7 @@ done
 case "$mode" in
   audit|tensorboard|tensorboard-status|tensorboard-stop) ;;
   train|resume|smoke|evaluate)
-    printf 'LOCAL_TARGET_VALIDATION_PENDING: streamed trainer/targets are not implemented. No training authorized.\n' >&2
+    printf 'TRAINING_NOT_READY: integrated runner and evaluation prerequisites remain incomplete; audit status is LOCAL_TARGET_VALIDATION_PENDING. No training authorized.\n' >&2
     exit 2 ;;
   *) printf 'Unknown or missing --mode. Use --help.\n' >&2; exit 2 ;;
 esac

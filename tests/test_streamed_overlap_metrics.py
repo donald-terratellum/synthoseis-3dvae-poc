@@ -8,6 +8,7 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_metrics import (
     calculate_rankings,
     compare_matched_cosine,
+    event_coverage_diagnostics,
     linear_ndcg_at_10,
     paired_source_bootstrap,
     retrieval_metric_gate,
@@ -74,6 +75,35 @@ def make_report(manifest, *, arm="S3", scorer="pair_head", experiment_seed=1, re
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_event_diagnostics_preserve_directional_errors_and_fluid_availability(self):
+        manifest = frozen_fixture()
+        target = manifest["queries"][0]["candidates"][0]["target"]
+        target.update({"fluid_a": [0.2, 0.0, 0.8], "fluid_b": [0.0, 0.1, 0.9]})
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        scores = predictions(manifest)
+        first = manifest["queries"][0]
+        scores[first["id"]][0] = 0.8
+        result = event_coverage_diagnostics(manifest, scores)
+        row = result["pairs"][0]
+        self.assertAlmostEqual(row["error"], -0.2)
+        self.assertAlmostEqual(row["fluid_mismatch"], 0.2)
+        self.assertIsNone(row["fluid_mismatch_unavailable_reason"])
+        self.assertIsNone(result["pairs"][1]["fluid_mismatch"])
+        self.assertIsNotNone(result["pairs"][1]["fluid_mismatch_unavailable_reason"])
+        overlap = result["categories"]["same_overlap"]
+        self.assertEqual(overlap["count"], 600)
+        self.assertEqual(overlap["fluid_mismatch_available"], 1)
+        self.assertAlmostEqual(overlap["mae"], 0.2 / 600)
+        self.assertAlmostEqual(overlap["bias"], -0.2 / 600)
+        target["fluid_a"] = [0.2, 0.0, 0.2]
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "fluid fractions"):
+            event_coverage_diagnostics(manifest, scores)
+
     def test_linear_gain_and_candidate_id_ties(self):
         labels = [1.0, 0.5] + [0.0] * 8
         scores = [0.0] * 10

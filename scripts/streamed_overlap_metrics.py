@@ -206,6 +206,68 @@ def calculate_rankings(
                          random_seed, random_repeats, tuple(rows))
 
 
+def event_coverage_diagnostics(manifest: dict, predictions: dict[str, dict[int, float]]) -> dict:
+    """Report frozen-pair coverage errors and the recorded fluid-fraction mismatch."""
+    queries = _eligible_queries(manifest)
+    if set(predictions) != {query["id"] for query in queries}:
+        raise ValueError("Coverage predictions must cover exactly the frozen eligible queries.")
+    rows = []
+    for query in queries:
+        candidates = query["candidates"]
+        supplied = predictions[query["id"]]
+        if (not isinstance(supplied, dict) or set(supplied) != {candidate["id"] for candidate in candidates}
+                or any(isinstance(key, bool) or not isinstance(key, int) for key in supplied)):
+            raise ValueError("Coverage predictions must match the frozen candidate IDs.")
+        for candidate in candidates:
+            target = candidate["target"]
+            prediction = supplied[candidate["id"]]
+            if (isinstance(prediction, bool) or not isinstance(prediction, Real)
+                    or not math.isfinite(prediction) or not 0 <= prediction <= 1):
+                raise ValueError("Coverage predictions must be finite values in [0, 1].")
+            fluid_a, fluid_b = target.get("fluid_a"), target.get("fluid_b")
+            mismatch = None
+            if fluid_a is not None or fluid_b is not None:
+                fractions: list[list[float]] = []
+                for fluid in (fluid_a, fluid_b):
+                    if (not isinstance(fluid, (list, tuple)) or len(fluid) != 3
+                            or any(isinstance(value, bool) or not isinstance(value, Real)
+                                   or not math.isfinite(value) or not -1e-12 <= float(value) <= 1 + 1e-12
+                                   for value in fluid)
+                            or not math.isclose(sum(fluid), 1.0, rel_tol=0, abs_tol=1e-9)):
+                        raise ValueError("Recorded fluid fractions must be valid matched triples.")
+                    fractions.append([float(value) for value in fluid])
+                mismatch = 0.5 * sum(abs(a - b) for a, b in zip(*fractions))
+            error = float(prediction) - float(target["coverage"])
+            rows.append({
+                "query_id": query["id"], "candidate_id": candidate["id"],
+                "source_id": query["window"]["source_id"], "cohort": query["cohort"],
+                "category": candidate["category"], "target": float(target["coverage"]),
+                "prediction": float(prediction), "error": error, "fluid_mismatch": mismatch,
+                "fluid_mismatch_unavailable_reason": None if mismatch is not None
+                else "fluid fractions not recorded for this pair",
+            })
+    categories = {}
+    for category in ("same_overlap", "same_disjoint", "cross_source"):
+        selected = [row for row in rows if row["category"] == category]
+        if not selected:
+            categories[category] = {"count": 0, "unavailable_reason": "no pairs in eligible queries"}
+            continue
+        errors = np.asarray([row["error"] for row in selected], dtype=np.float64)
+        categories[category] = {
+            "count": len(selected), "mae": float(np.mean(np.abs(errors))),
+            "rmse": float(np.sqrt(np.mean(errors**2))), "bias": float(np.mean(errors)),
+            "fluid_mismatch_available": sum(row["fluid_mismatch"] is not None for row in selected),
+        }
+    return {
+        "manifest_sha256": manifest["manifest_sha256"], "pairs": rows, "categories": categories,
+        "limitations": [
+            "Fluid fractions are the approved coarse closure proxy, not verified per-layer fluid labels.",
+            "NTG, thin-layer and no-reservoir diagnostics require separately fingerprinted inputs.",
+            "Pair errors describe correlated validation pairs, not independent geological realizations.",
+        ],
+    }
+
+
 def paired_source_bootstrap(rows: tuple[QueryRanking, ...], differences, *, seed: int, repeats: int) -> tuple[float, float]:
     if (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
             or isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 2):

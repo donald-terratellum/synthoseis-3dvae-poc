@@ -141,6 +141,9 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["input_verification"]["status"], "VALIDATION_INPUTS_VERIFIED")
         self.assertEqual(set(result["scorers"]), {"mu_cosine", "pair_head"})
         self.assertEqual(len(result["scorers"]["pair_head"]["rows"]), 200)
+        diagnostics = result["scorers"]["pair_head"]["event_coverage_diagnostics"]
+        self.assertEqual(len(diagnostics["pairs"]), 2000)
+        self.assertEqual(diagnostics["categories"]["same_overlap"]["count"], 600)
 
     def test_untrained_head_rejected_before_source_verification(self):
         self.optimizer = build_optimizer(self.model)

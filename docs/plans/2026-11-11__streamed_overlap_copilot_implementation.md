@@ -160,10 +160,26 @@ defaults or run a tokenizer search.
 
 The numerical reconstruction guardrail compares fully covered, hash-identified
 synthetic and real measurement records using the fixed +2% recipe and MAE
-thresholds and matched sampling protocol. It does not collect or verify those
-measurements, establish data or checkpoint provenance, or make an adoption decision.
-The guardrail datasets and full-coverage measurement producer remain to be frozen
-and implemented; no final-test data was accessed.
+thresholds and matched sampling protocol. A separate opt-in full-store producer
+can now freeze and reread every baked `divide_by_std` patch, fingerprint tokenizer
+inputs and dense targets, and measure sampled reconstruction using the actual
+tokenizer adapter or a journal-bound streamed checkpoint. It binds the device,
+LPIPS weights and implementation, relevant code and package versions, rejects
+changed inputs/checkpoints and restores inference RNG state. It uses a fixed
+one-patch-at-a-time sampling protocol, with no augmentation of guardrail targets.
+The numerical comparison remains **not** an adoption decision: dataset/reference
+approval, source provenance and selection provenance are not established by these
+helpers. No reconstruction manifest has been approved or frozen against real data;
+no final-test data was accessed. The recorded hashes cover decoded float32 patches
+and tokenizer inputs, not complete source-store or generation provenance.
+
+The checkpoint retrieval evaluator now also reports directional event-coverage
+errors by pair category and per-pair closure-proxy fluid mismatch where the frozen
+target records it. The existing frozen primary manifest's 1,800 recorded fluid
+triples passed the diagnostic's numeric checks without scoring a model or rereading
+source cubes. Missing fluid fractions are explicitly unavailable. NTG,
+thin-layer and no-reservoir diagnostics still require separately fingerprinted
+inputs; physical-overlap error and constant/waveform baselines are not implemented.
 
 An opt-in checkpoint selector records immutable journal-linked selection events
 and publishes separate best-reconstruction and best-retrieval aliases for
@@ -175,12 +191,17 @@ after recovery; their disk consumption can grow throughout a run and must be
 budgeted before launch. The checkpoint volume does not support hard links; a local
 probe confirmed file/directory fsync and atomic replacement.
 
-The independent-seed provenance check, physical-overlap and other requested
-diagnostic reports, bounded tokenizer searches, runner wiring and integrated local
-smoke remain. Keep launch modes blocked.
+The independent-seed provenance check, remaining diagnostic reports, bounded
+tokenizer searches, runner wiring and an end-to-end streamed/MPS smoke remain.
+Keep launch modes blocked.
 Fourteen synthetic evaluator, selection and guardrail tests used temporary files
 on the checkpoint volume and took 4.06 seconds and about 343 MiB peak RSS
 including startup. This is not a real-data runtime or memory estimate.
+A separate synthetic CPU smoke exercised full-store freezing, two repeat measurements,
+the real tokenizer adapter and cached `SliceLPIPSLoss`, using one artificial patch
+per domain and an untrained tiny fixture checkpoint. It took 1.85 seconds, about
+794 MiB peak RSS and 724 MiB peak memory footprint including startup; it performed
+no optimizer step and is neither a guardrail result nor a full-suite/MPS estimate.
 The sampler's source-manifest hash covers inventory metadata, not full
 training-source contents. The journal currently reads completed CSV rows into
 memory; its long-run memory behavior must be assessed before launch. Keep train,

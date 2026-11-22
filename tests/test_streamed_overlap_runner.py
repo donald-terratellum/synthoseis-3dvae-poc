@@ -163,6 +163,18 @@ class TensorBoardLifecycleTests(unittest.TestCase):
 
 
 class AuditAttemptTests(unittest.TestCase):
+    def test_incomplete_execution_modes_remain_blocked_without_side_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for mode in ("train", "resume", "smoke", "evaluate"):
+                result = subprocess.run(
+                    ["bash", "scripts/streamed_overlap_experiment.sh", "--mode", mode,
+                     "--run-id", "blocked-fixture", "--output-root", temporary],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TRAINING_NOT_READY", result.stderr)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
     def test_real_fixture_attempt_records_hashes_and_never_starts_tensorboard(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
