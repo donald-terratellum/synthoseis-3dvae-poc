@@ -4,13 +4,24 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The selected-checkpoint orchestration now also has an opt-in
+`complete_selected_reconstruction` primitive. It requires the selected formal
+evaluation, a reconstruction-manifest hash, device and wall limit bound to both
+the final and selected checkpoints as `hashes["reconstruction_guardrail"]`.
+It measures the selected immutable snapshot with the frozen full-store producer,
+records a hash-bound completion, and rechecks the stores, runtime and LPIPS state
+before reusing a completed measurement. Interrupted attempts are preserved.
+Synthetic tests cover the producer and recovery; this continuation did not measure
+any real or historical guardrail data. The helper is not yet wired into the suite
+runner or matched S1/P0b comparisons, and its result is not an adoption decision.
+
 The epoch orchestration now also runs frozen retrieval, bounded tokenizer search
 and, for S3, diagnostic evaluation on the actual selected reconstruction checkpoint
 and selected S3 retrieval checkpoint after the final epoch. It verifies the
 reconciled final checkpoint, live selection history, immutable snapshot and alias
 before evaluation. Interrupted attempts remain on disk; completed reports and
 search outputs are checked before reuse. These are opt-in primitives with synthetic
-tests, not a fully wired suite runner. Reconstruction guardrail measurements on
+tests, not a fully wired suite runner. Reconstruction guardrail comparisons on
 selected checkpoints, launch inputs, budgeting, and the train/resume/evaluate shell
 modes remain incomplete and blocked. Selected evaluation can repeat an evaluation
 already performed at the final epoch, so budget that work explicitly.
@@ -80,7 +91,7 @@ system Python.
 Training is **not ready or authorized**. The epoch helper is not the sequential
 S1/S2/S3 suite runner. Next implement and verify the actual configuration-bound
 suite runner, durable train/resume and logging integration, selected-checkpoint
-reconstruction guardrails, frozen bounded-search and diagnostics
+reconstruction comparisons, frozen bounded-search and diagnostics
 inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
 smoke and present proposed launch commands, measurements and remaining approval
 gates. A matched streamed S1 reference and independent-seed replication require

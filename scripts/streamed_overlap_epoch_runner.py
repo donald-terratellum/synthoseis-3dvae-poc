@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -14,11 +15,16 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state
 from scripts.streamed_overlap_diagnostics import diagnostic_report
 from scripts.streamed_overlap_evaluation import _checkpoint_state, _identity, evaluate_checkpoint
+from scripts.streamed_overlap_guardrails import _manifest as _guardrail_manifest, _measurement
 from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
 from scripts.streamed_overlap_journal import _atomic_record, _sync_directory
+from scripts.streamed_overlap_reconstruction import (
+    _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
+)
 from scripts.streamed_overlap_search import run_bounded_searches
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
 from scripts.train import train_streamed_epoch
+from src.tokenizer.core.model_adapter import choose_torch_device
 
 
 def _digest(path: Path) -> str:
@@ -286,6 +292,114 @@ def complete_selected_checkpoint(
     completion["sha256"] = content_hash(completion)
     _atomic_record(completed, completion)
     return completion
+
+
+def complete_selected_reconstruction(
+    checkpoint_path: Path, journal, manifest_path: Path, source_root: Path,
+    search_manifest: dict, diagnostic_manifest: dict, formal_config: dict, *,
+    selection_kind: str, evaluation_dir: Path, guardrail_manifest: dict,
+    guardrail_config: dict, lpips_loss_fn,
+) -> dict:
+    """Measure a verified selection on the frozen reconstruction guardrail inputs."""
+    required = {"manifest_sha256", "device", "max_wall_seconds"}
+    if (not isinstance(formal_config, dict) or not isinstance(guardrail_config, dict)
+            or set(guardrail_config) != required or not isinstance(guardrail_manifest, dict)
+            or guardrail_config["device"] != formal_config.get("device")
+            or isinstance(guardrail_config["max_wall_seconds"], bool)
+            or not isinstance(guardrail_config["max_wall_seconds"], (int, float))
+            or not math.isfinite(guardrail_config["max_wall_seconds"])
+            or guardrail_config["max_wall_seconds"] <= 0):
+        raise ValueError("An explicit frozen reconstruction guardrail configuration is required.")
+    expected = _guardrail_manifest(guardrail_manifest)
+    if (guardrail_manifest["manifest_sha256"] != guardrail_config["manifest_sha256"]
+            or guardrail_manifest["protocol"].get("device") != guardrail_config["device"]):
+        raise ValueError("Reconstruction manifest and frozen configuration disagree.")
+    config_hash = content_hash(guardrail_config)
+    last_state, last_hash = _checkpoint_state(checkpoint_path)
+    if last_state.get("hashes", {}).get("reconstruction_guardrail") != config_hash:
+        raise ValueError("Final checkpoint and frozen reconstruction configuration disagree.")
+    selected = complete_selected_checkpoint(
+        checkpoint_path, journal, manifest_path, source_root, search_manifest,
+        diagnostic_manifest, formal_config, selection_kind=selection_kind, evaluation_dir=evaluation_dir,
+    )
+    identity = selected["checkpoint"]
+    snapshot = checkpoint_path.parent / "selection" / "snapshots" / f"{identity['checkpoint_sha256']}.pt"
+    state, digest = _checkpoint_state(snapshot)
+    if (digest != identity["checkpoint_sha256"]
+            or state["hashes"].get("reconstruction_guardrail") != config_hash):
+        raise ValueError("Selected checkpoint and frozen reconstruction configuration disagree.")
+    alias = checkpoint_path.parent / f"best_{selection_kind}.pt"
+
+    def verify_checkpoints():
+        if any(path.is_symlink() or not path.is_file() or _digest(path) != expected_hash
+               for path, expected_hash in ((checkpoint_path, last_hash), (snapshot, digest), (alias, digest))):
+            raise ValueError("Final or selected checkpoint changed during reconstruction measurement.")
+
+    verify_checkpoints()
+    directory = evaluation_dir / f"guardrail-{selection_kind}"
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError("Reconstruction measurement directory must be a regular directory.")
+    directory.mkdir(exist_ok=True)
+    _sync_directory(evaluation_dir)
+    events = directory / "completed"
+    if events.is_symlink() or (events.exists() and not events.is_dir()):
+        raise ValueError("Reconstruction completion records must be in a regular directory.")
+    events.mkdir(exist_ok=True)
+    _sync_directory(directory)
+    matches = []
+    for path in events.glob("*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(record, dict) or record.get("schema") != "streamed-reconstruction-completion-v1"
+                or record.get("sha256") != content_hash({
+                    key: value for key, value in record.items() if key != "sha256"
+                })):
+            raise ValueError("Reconstruction completion record is invalid.")
+        if record.get("checkpoint") == identity and record.get("config_sha256") == config_hash:
+            matches.append(record)
+    if len(matches) > 1:
+        raise ValueError("Duplicate reconstruction completion records for the selected checkpoint.")
+    if matches:
+        record = matches[0]
+        artifact = record["measurement"]
+        path = directory / artifact["path"]
+        if (path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(directory.resolve())
+                or _digest(path) != artifact["sha256"]):
+            raise ValueError("Completed reconstruction measurement is missing or changed.")
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if report.get("checkpoint") != identity:
+            raise ValueError("Reconstruction measurement checkpoint differs from the selection.")
+        _measurement(report, guardrail_manifest, expected, identity["arm"])
+        deadline = time.monotonic() + guardrail_config["max_wall_seconds"]
+        protocol = guardrail_manifest["protocol"]
+        device = choose_torch_device(guardrail_config["device"])
+        if (protocol.get("runtime") != _reconstruction_runtime()
+                or lpips_fingerprint(lpips_loss_fn) != protocol["lpips_sha256"]
+                or {parameter.device.type for parameter in lpips_loss_fn.parameters()} != {device.type}):
+            raise ValueError("Reconstruction runtime or LPIPS differs from the frozen protocol.")
+        _verify_stores(guardrail_manifest, deadline)
+        verify_checkpoints()
+        return record
+    attempt = directory / f"checkpoint-{identity['epoch']:06d}-{uuid.uuid4().hex}"
+    attempt.mkdir()
+    _sync_directory(directory)
+    report = measure_reconstruction(
+        guardrail_manifest, snapshot, arm=identity["arm"], device=guardrail_config["device"],
+        lpips_loss_fn=lpips_loss_fn, max_wall_seconds=guardrail_config["max_wall_seconds"],
+        journal=journal, validation_manifest_path=manifest_path,
+    )
+    if report.get("checkpoint") != identity:
+        raise ValueError("Reconstruction measurement checkpoint differs from the selection.")
+    _measurement(report, guardrail_manifest, expected, identity["arm"])
+    artifact = _save_report(attempt, "measurement.json", report)
+    verify_checkpoints()
+    record = {
+        "schema": "streamed-reconstruction-completion-v1", "checkpoint": identity,
+        "config_sha256": config_hash, "measurement": artifact,
+        "limitation": "Measurement only; matched references, numerical comparison and adoption remain separate.",
+    }
+    record["sha256"] = content_hash(record)
+    _atomic_record(events, record)
+    return record
 
 
 def run_arm_epochs(

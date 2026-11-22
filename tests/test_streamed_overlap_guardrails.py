@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -10,6 +11,8 @@ import torch
 import zarr
 
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_epoch_runner import complete_selected_reconstruction
+from scripts.streamed_overlap_evaluation import _identity
 from scripts.streamed_overlap_guardrails import compare_reconstruction_guardrails
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_model import StreamedPairVAE
@@ -110,6 +113,104 @@ class GuardrailTests(unittest.TestCase):
         altered["checkpoint"]["experiment_seed"] = 3
         with self.assertRaisesRegex(ValueError, "matched experiment seed"):
             compare_reconstruction_guardrails(manifest, candidate, {"S1": altered})
+
+
+class SelectedReconstructionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.evaluation = self.root / "evaluation"
+        self.evaluation.mkdir()
+        self.checkpoint = self.root / "last.pt"
+        self.checkpoint.write_bytes(b"selected checkpoint")
+        digest = hashlib.sha256(self.checkpoint.read_bytes()).hexdigest()
+        snapshots = self.root / "selection" / "snapshots"
+        snapshots.mkdir(parents=True)
+        self.snapshot = snapshots / f"{digest}.pt"
+        self.snapshot.write_bytes(self.checkpoint.read_bytes())
+        (self.root / "best_retrieval.pt").write_bytes(self.checkpoint.read_bytes())
+        self.identity = {
+            "arm": "S3", "checkpoint_sha256": digest, "run_id": "run",
+            "attempt_id": "attempt", "step": 1, "epoch": 1, "experiment_seed": 2,
+        }
+        self.manifest = fixture_manifest()
+        self.manifest["protocol"].update({"device": "cpu", "runtime": {"fixture": True}})
+        self.manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in self.manifest.items() if key != "manifest_sha256"
+        })
+        self.config = {
+            "manifest_sha256": self.manifest["manifest_sha256"],
+            "device": "cpu", "max_wall_seconds": 60,
+        }
+        self.state = {"hashes": {"reconstruction_guardrail": content_hash(self.config)}}
+        self.report = measurement(self.manifest, "S3", "d", 1.0)
+        self.report["checkpoint"] = self.identity
+        self.lpips = torch.nn.Linear(1, 1)
+
+    def run_measurement(self, config=None):
+        return complete_selected_reconstruction(
+            self.checkpoint, object(), self.root / "validation.json", self.root,
+            {}, {}, {"device": "cpu"}, selection_kind="retrieval",
+            evaluation_dir=self.evaluation, guardrail_manifest=self.manifest,
+            guardrail_config=self.config if config is None else config, lpips_loss_fn=self.lpips,
+        )
+
+    def test_selected_measurement_is_recoverable_and_reverified(self):
+        def produce(manifest, path, **kwargs):
+            self.assertEqual(path, self.snapshot)
+            self.assertEqual(kwargs["arm"], "S3")
+            self.assertEqual(manifest, self.manifest)
+            return self.report
+
+        with patch("scripts.streamed_overlap_epoch_runner._checkpoint_state",
+                   return_value=(self.state, self.identity["checkpoint_sha256"])), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
+                   return_value={"checkpoint": self.identity}), \
+             patch("scripts.streamed_overlap_epoch_runner.measure_reconstruction",
+                   side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                self.run_measurement()
+        with patch("scripts.streamed_overlap_epoch_runner._checkpoint_state",
+                   return_value=(self.state, self.identity["checkpoint_sha256"])), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
+                   return_value={"checkpoint": self.identity}), \
+             patch("scripts.streamed_overlap_epoch_runner.measure_reconstruction", side_effect=produce) as measure, \
+             patch("scripts.streamed_overlap_epoch_runner._reconstruction_runtime", return_value={"fixture": True}), \
+             patch("scripts.streamed_overlap_epoch_runner.lpips_fingerprint", return_value="a" * 64), \
+             patch("scripts.streamed_overlap_epoch_runner.choose_torch_device",
+                   return_value=SimpleNamespace(type="cpu")), \
+             patch("scripts.streamed_overlap_epoch_runner._verify_stores") as verify:
+            result = self.run_measurement()
+            self.assertEqual(self.run_measurement(), result)
+            self.assertEqual(measure.call_count, 1)
+            verify.assert_called_once()
+            artifact = self.evaluation / "guardrail-retrieval" / result["measurement"]["path"]
+            artifact.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                self.run_measurement()
+
+    def test_changed_configuration_is_rejected_before_selected_evaluation(self):
+        with patch("scripts.streamed_overlap_epoch_runner._checkpoint_state",
+                   return_value=(self.state, self.identity["checkpoint_sha256"])), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint") as selected:
+            with self.assertRaisesRegex(ValueError, "Final checkpoint and frozen"):
+                self.run_measurement({**self.config, "max_wall_seconds": 61})
+            selected.assert_not_called()
+
+    def test_changed_alias_during_measurement_cannot_publish_completion(self):
+        def produce(*_args, **_kwargs):
+            (self.root / "best_retrieval.pt").write_bytes(b"changed")
+            return self.report
+
+        with patch("scripts.streamed_overlap_epoch_runner._checkpoint_state",
+                   return_value=(self.state, self.identity["checkpoint_sha256"])), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
+                   return_value={"checkpoint": self.identity}), \
+             patch("scripts.streamed_overlap_epoch_runner.measure_reconstruction", side_effect=produce):
+            with self.assertRaisesRegex(ValueError, "checkpoint changed"):
+                self.run_measurement()
+        self.assertEqual(list((self.evaluation / "guardrail-retrieval" / "completed").glob("*.json")), [])
 
 
 class FixtureLPIPS(SliceLPIPSLoss):
@@ -274,6 +375,67 @@ class ReconstructionProducerTests(unittest.TestCase):
                     manifest, checkpoint, arm="S1", device="cpu", lpips_loss_fn=self.lpips,
                     max_wall_seconds=60, journal=journal, validation_manifest_path=self.root / "validation.json",
                 )
+
+    def test_selected_measurement_runs_frozen_fixture_producer_and_recovers(self):
+        manifest = self.freeze()
+        config = {"manifest_sha256": manifest["manifest_sha256"], "device": "cpu", "max_wall_seconds": 60}
+        model = StreamedPairVAE(FixtureVAE(), "S1")
+        checkpoint = self.root / "last.pt"
+        state = {
+            "schema": "streamed-epoch-state-v1", "arm": "S1", "completed_epoch": 1,
+            "batches_per_epoch": 1, "model": model.state_dict(),
+            "sampler": {"split": "train", "batches_drawn": 1, "source_manifest_hash": "b" * 64},
+            "hashes": {
+                "validation_manifest": "a" * 64, "source": "b" * 64,
+                "config": "c" * 64, "target": "d" * 64,
+                "reconstruction_guardrail": content_hash(config),
+            },
+            "journal": {"event_id": "event-1", "logical_step": 1, "cumulative_exposure": 12},
+        }
+        torch.save(state, checkpoint)
+        digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        snapshots = self.root / "selection" / "snapshots"
+        snapshots.mkdir(parents=True)
+        (snapshots / f"{digest}.pt").write_bytes(checkpoint.read_bytes())
+        (self.root / "best_reconstruction.pt").write_bytes(checkpoint.read_bytes())
+        evaluation = self.root / "evaluation"
+        evaluation.mkdir()
+        journal = BatchJournal(self.root / "batch.csv", STEP_FIELDS, create=True)
+        self.addCleanup(journal.close)
+        journal.reconcile(watermark=None, attempt_id="attempt-1", expected_step=0, expected_exposure=0)
+        row: dict[str, object] = dict.fromkeys(STEP_FIELDS, "")
+        row.update({
+            "sequence": 1, "event_id": "event-1", "attempt_id": "attempt-1",
+            "logical_step": 1, "completed_pairs": 12, "cumulative_exposure": 12,
+            "run_id": "run-1", "arm": "S1", "seed": 3, "epoch": 1, "batch_index": 1,
+        })
+        journal.append(row)
+        identity = _identity(state, digest, journal, "a" * 64)
+
+        def factory(arm, model_seed, head_seed):
+            del model_seed, head_seed
+            return StreamedPairVAE(FixtureVAE(), arm)
+
+        with patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
+                   return_value={"checkpoint": identity}), \
+             patch("scripts.streamed_overlap_reconstruction.load_manifest",
+                   return_value={"manifest_sha256": "a" * 64}), \
+             patch("scripts.streamed_overlap_reconstruction.fresh_e1_model", side_effect=factory):
+            def measure():
+                return complete_selected_reconstruction(
+                    checkpoint, journal, self.root / "validation.json", self.root,
+                    {}, {}, {"device": "cpu"}, selection_kind="reconstruction",
+                    evaluation_dir=evaluation, guardrail_manifest=manifest,
+                    guardrail_config=config, lpips_loss_fn=self.lpips,
+                )
+            result = measure()
+            self.assertEqual(result["checkpoint"], identity)
+            self.assertEqual(measure(), result)
+            self.assertTrue((evaluation / "guardrail-reconstruction" / result["measurement"]["path"]).is_file())
+            patches = zarr.open_group(str(self.stores["real"]), mode="r+")["patches"]
+            patches[0, 0, 0, 0] = 123
+            with self.assertRaisesRegex(ValueError, "differs from its frozen"):
+                measure()
 
     def test_synthetic_smoke_loads_a_real_tokenizer_adapter(self):
         manifest = self.freeze()
