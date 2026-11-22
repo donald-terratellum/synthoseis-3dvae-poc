@@ -35,7 +35,7 @@ from scripts.streamed_overlap_matching import (
     verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_run_metadata,
 )
 from scripts.streamed_overlap_metrics import (
-    QueryRanking, RankingReport, _eligible_queries, compare_matched_cosine, summarize_rankings,
+    QueryRanking, RankingReport, _eligible_queries, compare_matched_cosine, retrieval_metric_gate, summarize_rankings,
 )
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_reconstruction import (
@@ -1091,71 +1091,88 @@ def _bind_suite_inputs(suite_dir: Path, record: dict, *, resume: bool) -> None:
         _publish_exclusive(path, write)
 
 
-def _suite_cosine_comparisons(results: dict, initialization: SuiteInitialization, manifest: dict,
-                              formal_config: dict) -> dict:
-    """Compare selected encoder rankings, separately from the trained S3 pair head."""
+def _require_suite_matching(results: dict) -> None:
     for arm in ("S2", "S3"):
         matched = results[arm]["matched_streams"]["record"]
         if (matched.get("status") != "MATCHED_RECORDED_STREAMS_ONLY"
                 or matched.get("sha256") != content_hash({k: v for k, v in matched.items() if k != "sha256"})
                 or matched.get("reference") != results["S1"]["last_epoch"]["checkpoint"]
                 or matched.get("candidate") != results[arm]["last_epoch"]["checkpoint"]):
-            raise ValueError("Cosine comparisons require the verified matched arm records.")
+            raise ValueError("Suite comparisons require the verified matched arm records.")
 
+
+def _suite_ranking(
+    results: dict, initialization: SuiteInitialization, manifest: dict, formal_config: dict, *,
+    arm: str, kind: str, scorer: str,
+) -> tuple[RankingReport, dict]:
     queries = _eligible_queries(manifest)
     expected = {q["id"]: (q["window"]["source_id"], q["cohort"]) for q in queries}
     fingerprints = manifest["input_integrity"]["fingerprints"]
+    completion = (results[arm]["last_epoch"] if kind == "final"
+                  else results[arm]["selected_evaluations"][kind])
+    identity = completion["checkpoint"]
+    directory = initialization.initial_checkpoints[arm].parent / "evaluation"
+    config_hash = content_hash(formal_config)
+    if kind != "final":
+        directory = directory / f"selected-{kind}"
+        config_hash = content_hash({"formal_evaluation": formal_config, "selection_kind": kind})
+    artifact = completion["artifacts"]["retrieval"]
+    path = directory / artifact["path"]
+    if (completion.get("sha256") != content_hash({k: v for k, v in completion.items() if k != "sha256"})
+            or completion.get("config_sha256") != config_hash
+            or identity.get("arm") != arm or identity.get("validation_manifest_sha256") != manifest["manifest_sha256"]
+            or path.is_symlink() or not path.is_file()
+            or not path.resolve().is_relative_to(directory.resolve()) or _digest(path) != artifact["sha256"]):
+        raise ValueError("Selected ranking evaluation is missing, changed or mismatched.")
+    report = json.loads(path.read_text(encoding="utf-8"))
+    verification = report["input_verification"]
+    if (report.get("schema") != "streamed-retrieval-evaluation-v1" or report.get("checkpoint") != identity
+            or verification.get("status") != "VALIDATION_INPUTS_VERIFIED"
+            or verification.get("manifest_sha256") != manifest["manifest_sha256"]
+            or verification.get("verified_windows") != len(fingerprints["windows"])
+            or verification.get("verified_full_depth_event_regions") != len(fingerprints["event_traces"])):
+        raise ValueError("Selected ranking evaluation lacks verified validation inputs.")
+    score = report.get("scorers", {}).get(scorer)
+    if not isinstance(score, dict) or not isinstance(score.get("rows"), list):
+        raise ValueError(f"Selected evaluation lacks {scorer} rankings.")
+    summary = score.get("summary")
+    if not isinstance(summary, dict):
+        raise ValueError(f"Selected evaluation lacks the {scorer} summary.")
+    ranking = RankingReport(
+        manifest["manifest_sha256"], scorer, arm, identity["experiment_seed"],
+        formal_config["random_seed"], formal_config["random_repeats"],
+        tuple(QueryRanking(**row) for row in score["rows"]),
+    )
+    if ({row.query_id: (row.source_id, row.cohort) for row in ranking.rows} != expected
+            or len(ranking.rows) != len(expected)
+            or summarize_rankings(ranking, bootstrap_seed=formal_config["bootstrap_seed"],
+                                  bootstrap_repeats=formal_config["bootstrap_repeats"]) != summary):
+        raise ValueError("Selected rankings do not match the frozen validation cohort.")
+    final = results[arm]["last_epoch"]["checkpoint"]
+    if any(identity[key] != final[key] for key in (
+        "arm", "run_id", "experiment_seed", "config_sha256", "source_sha256",
+        "target_sha256", "validation_manifest_sha256",
+    )):
+        raise ValueError("Selected checkpoint does not belong to the matched arm.")
+    return ranking, {"checkpoint": identity, "retrieval_sha256": artifact["sha256"],
+                     "ndcg_at_10": summary["ndcg_at_10"]}
+
+
+def _suite_cosine_comparisons(results: dict, initialization: SuiteInitialization, manifest: dict,
+                              formal_config: dict) -> dict:
+    """Compare selected encoder rankings, separately from the trained S3 pair head."""
+    _require_suite_matching(results)
     rankings = {}
     sources = {}
     for arm, kind in (("S1", "final"), ("S2", "final"), ("S3", "final"),
                       ("S1", "reconstruction"), ("S2", "reconstruction"),
                       ("S3", "reconstruction"), ("S3", "retrieval")):
-        completion = (results[arm]["last_epoch"] if kind == "final"
-                      else results[arm]["selected_evaluations"][kind])
-        identity = completion["checkpoint"]
-        directory = initialization.initial_checkpoints[arm].parent / "evaluation"
-        config_hash = content_hash(formal_config)
-        if kind != "final":
-            directory = directory / f"selected-{kind}"
-            config_hash = content_hash({"formal_evaluation": formal_config, "selection_kind": kind})
-        artifact = completion["artifacts"]["retrieval"]
-        path = directory / artifact["path"]
-        if (completion.get("sha256") != content_hash({k: v for k, v in completion.items() if k != "sha256"})
-                or completion.get("config_sha256") != config_hash
-                or identity.get("arm") != arm or identity.get("validation_manifest_sha256") != manifest["manifest_sha256"]
-                or path.is_symlink() or not path.is_file()
-                or not path.resolve().is_relative_to(directory.resolve()) or _digest(path) != artifact["sha256"]):
-            raise ValueError("Selected cosine evaluation is missing, changed or mismatched.")
-        report = json.loads(path.read_text(encoding="utf-8"))
-        verification = report["input_verification"]
-        if (report.get("schema") != "streamed-retrieval-evaluation-v1" or report.get("checkpoint") != identity
-                or verification.get("status") != "VALIDATION_INPUTS_VERIFIED"
-                or verification.get("manifest_sha256") != manifest["manifest_sha256"]
-                or verification.get("verified_windows") != len(fingerprints["windows"])
-                or verification.get("verified_full_depth_event_regions") != len(fingerprints["event_traces"])):
-            raise ValueError("Selected cosine evaluation lacks verified validation inputs.")
-        score = report["scorers"]["mu_cosine"]
-        summary = score["summary"]
-        ranking = RankingReport(
-            manifest["manifest_sha256"], "mu_cosine", arm, identity["experiment_seed"],
-            formal_config["random_seed"], formal_config["random_repeats"],
-            tuple(QueryRanking(**row) for row in score["rows"]),
+        ranking, source = _suite_ranking(
+            results, initialization, manifest, formal_config, arm=arm, kind=kind, scorer="mu_cosine",
         )
-        if ({row.query_id: (row.source_id, row.cohort) for row in ranking.rows} != expected
-                or len(ranking.rows) != len(expected)
-                or summarize_rankings(ranking, bootstrap_seed=formal_config["bootstrap_seed"],
-                                      bootstrap_repeats=formal_config["bootstrap_repeats"]) != summary):
-            raise ValueError("Selected cosine rankings do not match the frozen validation cohort.")
-        final = results[arm]["last_epoch"]["checkpoint"]
-        if any(identity[key] != final[key] for key in (
-            "arm", "run_id", "experiment_seed", "config_sha256", "source_sha256",
-            "target_sha256", "validation_manifest_sha256",
-        )):
-            raise ValueError("Selected cosine checkpoint does not belong to the matched arm.")
         key = f"{arm}_{kind}"
         rankings[key] = ranking
-        sources[key] = {"checkpoint": identity, "retrieval_sha256": artifact["sha256"],
-                        "ndcg_at_10": summary["ndcg_at_10"]}
+        sources[key] = source
 
     comparisons = {}
     for candidate, baseline in (
@@ -1188,6 +1205,45 @@ def _suite_cosine_comparisons(results: dict, initialization: SuiteInitialization
     if path.exists():
         if json.loads(path.read_text(encoding="utf-8")) != result:
             raise ValueError("Saved cosine comparison differs from current evaluation.")
+    else:
+        _save_report(path.parent, path.name, result)
+    return result
+
+
+def _suite_pair_head_metric_checks(
+    results: dict, initialization: SuiteInitialization, manifest: dict, formal_config: dict,
+) -> dict:
+    """Report S3 head metrics without treating them as encoder or adoption results."""
+    _require_suite_matching(results)
+    checks = {}
+    for kind in ("final", "retrieval"):
+        ranking, source = _suite_ranking(
+            results, initialization, manifest, formal_config, arm="S3", kind=kind, scorer="pair_head",
+        )
+        checks[kind] = {
+            "source": source,
+            "metric_gate": retrieval_metric_gate(
+                ranking, bootstrap_seed=formal_config["bootstrap_seed"],
+                bootstrap_repeats=formal_config["bootstrap_repeats"], replication=None,
+            ),
+        }
+    result = {
+        "schema": "streamed-suite-pair-head-metric-checks-v1",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "checks": checks,
+        "limitation": (
+            "S3 pair-head validation against uniform random, not a comparison of encoder representations. "
+            "The retrieval checkpoint was selected on this validation set. Independent-seed execution, "
+            "reconstruction guardrails and adoption remain separate."
+        ),
+    }
+    result["sha256"] = content_hash(result)
+    path = initialization.evidence_path.parent / "pair_head_metric_checks.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("Pair-head metric output must be a regular file.")
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != result:
+            raise ValueError("Saved pair-head metric checks differ from current evaluation.")
     else:
         _save_report(path.parent, path.name, result)
     return result
@@ -1304,6 +1360,9 @@ def run_suite_epochs(
             raise RuntimeError(f"{arm} runtime suppressed an arm failure.")
         del runtime
     results["S3"]["mu_cosine_comparisons"] = _suite_cosine_comparisons(
+        results, suite_initialization, manifest, formal_config,
+    )
+    results["S3"]["pair_head_metric_checks"] = _suite_pair_head_metric_checks(
         results, suite_initialization, manifest, formal_config,
     )
     return results

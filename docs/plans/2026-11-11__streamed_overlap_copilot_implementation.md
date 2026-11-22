@@ -4,6 +4,24 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+Completed suites now write `pair_head_metric_checks.json` alongside, but
+separately from, `mu_cosine_comparisons.json`. It records the existing S3
+pair-head metric checks for both the final-epoch and retrieval-selected
+checkpoints, after checking the matched-arm records, checkpoint and evaluation
+identities, report hashes, validation cohort and recomputed summaries. A failed
+single-seed check is `FAIL`; a passing one remains `PENDING` because independent
+replication is not supplied. The selected checkpoint was chosen on the same
+validation set. This checks the head against the random baseline, not S3 versus
+S2 encoder representations, and is not an adoption decision. Reconstruction
+guardrails and independent-seed replication remain separate. Existing reports
+are reused only when their contents agree; publication is not atomic across the
+suite's reports.
+
+The metric, initialization and epoch fixtures passed 76 tests and 31 subtests
+using `.venv/bin/python -m pytest -q tests/test_streamed_overlap_metrics.py
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_epoch_runner.py`.
+These are synthetic fixtures; no real suite was trained or evaluated.
+
 Before opening any arm, the prepared-suite coordinator now rechecks the full
 frozen synthetic and real reconstruction guardrail stores, reconstruction
 runtime and LPIPS state. It uses the existing guardrail wall-time setting and

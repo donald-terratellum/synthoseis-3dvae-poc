@@ -9,7 +9,9 @@ import unittest
 import numpy as np
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_epoch_runner import SuiteInitialization, _suite_cosine_comparisons
+from scripts.streamed_overlap_epoch_runner import (
+    SuiteInitialization, _suite_cosine_comparisons, _suite_pair_head_metric_checks,
+)
 from scripts.streamed_overlap_metrics import (
     calculate_rankings,
     compare_matched_cosine,
@@ -291,6 +293,12 @@ class RankingMetricTests(unittest.TestCase):
                             "rows": [asdict(row) for row in ranking.rows],
                         }},
                     }
+                    if arm == "S3":
+                        head = make_report(manifest, reverse=kind == "final")
+                        report["scorers"]["pair_head"] = {
+                            "summary": summarize_rankings(head, bootstrap_seed=4, bootstrap_repeats=20),
+                            "rows": [asdict(row) for row in head.rows],
+                        }
                     directory = root / arm / "evaluation"
                     if kind != "final":
                         directory = directory / f"selected-{kind}"
@@ -325,18 +333,55 @@ class RankingMetricTests(unittest.TestCase):
                 "mean_ndcg_gain_over_s2"], 0)
             self.assertLess(result["comparisons"]["S3_final_vs_S2_final"]["mean_ndcg_gain_over_s2"], 0)
             self.assertEqual(_suite_cosine_comparisons(results, suite, manifest, config), result)
+            checks = _suite_pair_head_metric_checks(results, suite, manifest, config)
+            self.assertEqual(checks["checks"]["final"]["metric_gate"]["status"], "FAIL")
+            self.assertEqual(checks["checks"]["retrieval"]["metric_gate"]["status"], "PENDING")
+            self.assertIsNone(checks["checks"]["retrieval"]["metric_gate"]["checks"][
+                "independent_seed_repeats_gain_direction"])
+            self.assertEqual(checks["checks"]["retrieval"]["source"]["retrieval_sha256"],
+                             results["S3"]["selected_evaluations"]["retrieval"]["artifacts"]["retrieval"]["sha256"])
+            self.assertEqual(json.loads((root / "pair_head_metric_checks.json").read_text()), checks)
+            self.assertEqual(_suite_pair_head_metric_checks(results, suite, manifest, config), checks)
+            self.assertNotIn("metric_gate", result)
+            saved = root / "pair_head_metric_checks.json"
+            saved.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Saved pair-head"):
+                _suite_pair_head_metric_checks(results, suite, manifest, config)
+            saved.write_text(json.dumps(checks), encoding="utf-8")
             matched = results["S2"]["matched_streams"]["record"]
             original = matched["candidate"]
             matched["candidate"] = {**original, "step": 3}
             matched["sha256"] = content_hash({k: v for k, v in matched.items() if k != "sha256"})
             with self.assertRaisesRegex(ValueError, "matched arm records"):
                 _suite_cosine_comparisons(results, suite, manifest, config)
+            with self.assertRaisesRegex(ValueError, "matched arm records"):
+                _suite_pair_head_metric_checks(results, suite, manifest, config)
             matched["candidate"] = original
             matched["sha256"] = content_hash({k: v for k, v in matched.items() if k != "sha256"})
             changed = root / "S3" / "evaluation" / "selected-retrieval" / "retrieval.json"
+            original_report = changed.read_text(encoding="utf-8")
+            completion = results["S3"]["selected_evaluations"]["retrieval"]
+            original_completion = copy.deepcopy(completion)
+            for alteration in ("missing_scorer", "missing_query", "changed_summary"):
+                altered = json.loads(original_report)
+                if alteration == "missing_scorer":
+                    del altered["scorers"]["pair_head"]
+                elif alteration == "missing_query":
+                    altered["scorers"]["pair_head"]["rows"].pop()
+                else:
+                    altered["scorers"]["pair_head"]["summary"]["gain"] = 0.0
+                changed.write_text(json.dumps(altered), encoding="utf-8")
+                completion["artifacts"]["retrieval"]["sha256"] = hashlib.sha256(changed.read_bytes()).hexdigest()
+                completion["sha256"] = content_hash({k: v for k, v in completion.items() if k != "sha256"})
+                with self.subTest(alteration=alteration), self.assertRaises(ValueError):
+                    _suite_pair_head_metric_checks(results, suite, manifest, config)
+            completion.clear()
+            completion.update(original_completion)
             changed.write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "missing, changed or mismatched"):
                 _suite_cosine_comparisons(results, suite, manifest, config)
+            with self.assertRaisesRegex(ValueError, "missing, changed or mismatched"):
+                _suite_pair_head_metric_checks(results, suite, manifest, config)
 
 
 if __name__ == "__main__":

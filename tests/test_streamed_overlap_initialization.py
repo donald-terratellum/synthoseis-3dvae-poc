@@ -761,7 +761,9 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner._verify_reconstruction_inputs") as guardrail_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm, \
              patch("scripts.streamed_overlap_epoch_runner._suite_cosine_comparisons",
-                   return_value={"fixture": True}) as cosine:
+                   return_value={"fixture": True}) as cosine, \
+             patch("scripts.streamed_overlap_epoch_runner._suite_pair_head_metric_checks",
+                   return_value={"head_fixture": True}) as head_checks:
             original = metadata["path"].read_bytes()
             metadata["path"].unlink()
             with self.assertRaisesRegex(ValueError, "regular file"):
@@ -856,9 +858,11 @@ class ArmInitializationTests(unittest.TestCase):
             result = run_suite_epochs(journals, runtime_factory, **arguments)
             self.assertEqual(result, {
                 "S1": {"arm": "S1"}, "S2": {"arm": "S2"},
-                "S3": {"arm": "S3", "mu_cosine_comparisons": {"fixture": True}},
+                "S3": {"arm": "S3", "mu_cosine_comparisons": {"fixture": True},
+                       "pair_head_metric_checks": {"head_fixture": True}},
             })
             cosine.assert_called_once()
+            head_checks.assert_called_once()
             self.assertEqual(calls, [(action, arm) for arm in ("S1", "S2", "S3")
                                      for action in ("open", "run", "close")])
             calls.clear()
@@ -1018,6 +1022,7 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner._verify_reconstruction_inputs"), \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", return_value={}) as run_arm, \
              patch("scripts.streamed_overlap_epoch_runner._suite_cosine_comparisons", return_value={}), \
+             patch("scripts.streamed_overlap_epoch_runner._suite_pair_head_metric_checks", return_value={}), \
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train, \
              patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
             path = arms["S3"].final_checkpoint
