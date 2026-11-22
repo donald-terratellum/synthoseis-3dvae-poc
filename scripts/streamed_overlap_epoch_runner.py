@@ -25,7 +25,7 @@ from scripts.streamed_overlap_integrity import _digest_array, load_manifest, ope
 from scripts.streamed_overlap_journal import BatchJournal, _atomic_record, _sync_directory
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
-    verify_matched_arm_records, verify_saved_suite_initialization,
+    verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_run_metadata,
 )
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
@@ -694,9 +694,17 @@ def run_arm_epochs(
             or suite_initialization.initial_checkpoints.get(model.arm) != initial_checkpoint
             or initial_checkpoint.name != "initial.pt"
             or checkpoint_path != initial_checkpoint.with_name("last.pt")
+            or not isinstance(suite_initialization.evidence_path, Path)
+            or suite_initialization.evidence_path.name != "initialization_evidence.json"
             or not isinstance(getattr(journal, "path", None), Path)
             or journal.path.parent != initial_checkpoint.parent):
         raise ValueError("The arm must use its retained suite initialization checkpoint.")
+    metadata = verify_suite_run_metadata(
+        suite_initialization.evidence_path.parent, suite_initialization.initial_checkpoints,
+        matching_config=matching_config, expected_hashes=hashes,
+    )
+    if metadata["initialization_sha256"] != suite_initialization.evidence_sha256:
+        raise ValueError("The arm must use the initialization pin recorded in suite metadata.")
     suite_record = verify_saved_suite_initialization(
         suite_initialization.evidence_path, suite_initialization.initial_checkpoints,
         matching_config=matching_config, expected_hashes=hashes,

@@ -4,6 +4,20 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The per-arm runner now requires verified `suite_metadata.json` before restoring
+or advancing an arm, and requires the caller's initialization pin to match the
+pin in that metadata. The evidence file must be the suite's
+`initialization_evidence.json`; missing, mismatched or changed metadata and
+changed initial snapshots stop before restore. The gate is checked on resume
+as well. It does not create metadata, establish the complete suite configuration,
+or replace the sequential suite runner and training approval.
+
+The synthetic restore-gate test passed on ExFAT in 3.76 seconds wall time at
+479,133,696 bytes peak RSS; restore and training were mocked and temporary files
+were removed. This is not a training-resource estimate. The portable streamed
+suite passed 218 tests, with one skipped and 54 subtests, using
+`.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 An opt-in suite metadata helper now persists the initialization evidence pin,
 matching configuration and checkpoint hash bindings in `suite_metadata.json`.
 It verifies the evidence and retained initial snapshots before publication and

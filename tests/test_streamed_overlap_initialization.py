@@ -321,10 +321,26 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
                    side_effect=RuntimeError("restore reached")) as restore, \
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
-            with self.assertRaisesRegex(ValueError, "regular file"):
+            with self.assertRaisesRegex(ValueError, "retained suite initialization checkpoint"):
                 run(suite_initialization=replace(suite, evidence_path=self.suite_dir / "missing.json"))
-            with self.assertRaisesRegex(ValueError, "pinned configuration"):
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                run()
+            metadata = save_suite_run_metadata(
+                self.suite_dir, suite.initial_checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+                initialization_sha256=suite.evidence_sha256,
+            )
+            with self.assertRaisesRegex(ValueError, "pin recorded in suite metadata"):
                 run(suite_initialization=replace(suite, evidence_sha256="0" * 64))
+            original_metadata = metadata["path"].read_bytes()
+            changed_metadata = json.loads(original_metadata)
+            changed_metadata["matching_config"]["experiment_seed"] += 1
+            changed_metadata["sha256"] = content_hash({
+                key: value for key, value in changed_metadata.items() if key != "sha256"
+            })
+            metadata["path"].write_text(json.dumps(changed_metadata))
+            with self.assertRaisesRegex(ValueError, "Suite metadata is invalid"):
+                run()
+            metadata["path"].write_bytes(original_metadata)
             with self.assertRaisesRegex(ValueError, "retained suite initialization checkpoint"):
                 run(initial_checkpoint=arms["S1"].initial_checkpoint)
             with self.assertRaisesRegex(ValueError, "retained suite initialization checkpoint"):
@@ -353,6 +369,11 @@ class ArmInitializationTests(unittest.TestCase):
             state = torch.load(last, weights_only=True)
             state["completed_epoch"] = 1
             torch.save(state, last)
+            metadata["path"].unlink()
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                run()
+            restore.assert_not_called()
+            metadata["path"].write_bytes(original_metadata)
             with self.assertRaisesRegex(RuntimeError, "restore reached"):
                 run()
             restore.assert_called_once()

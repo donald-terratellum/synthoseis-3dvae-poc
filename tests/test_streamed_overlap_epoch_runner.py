@@ -102,6 +102,8 @@ class EpochCompletionTests(unittest.TestCase):
                     arm: "a" * 64 for arm in ("S1", "S2", "S3")
                 }},
             }),
+            patch("scripts.streamed_overlap_epoch_runner.verify_suite_run_metadata",
+                  return_value={"initialization_sha256": "f" * 64}),
             patch("scripts.streamed_overlap_epoch_runner.complete_matched_arm",
                   return_value={"record": {"status": "MATCHED_RECORDED_STREAMS_ONLY"}}),
         ]
