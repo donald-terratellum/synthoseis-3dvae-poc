@@ -20,6 +20,7 @@ from scripts.streamed_overlap_epoch_runner import (
     run_arm_epochs, run_suite, run_suite_epochs, run_suite_from_record, suite_input_record,
 )
 from scripts.streamed_overlap_evaluation import StreamedEpochValidator
+from scripts.streamed_overlap_evaluate_child import evaluate as evaluate_child
 from scripts.streamed_overlap_initialization import (
     _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
 )
@@ -210,6 +211,59 @@ class ArmInitializationTests(unittest.TestCase):
                     path, self.suite_dir, expected_config_sha256=content_hash(changed), resume=True, attempt_id="next",
                 )
             run.assert_not_called()
+
+    def test_evaluation_child_applies_mps_limit_and_never_enables_training(self):
+        record = suite_input_record(self.suite_dir, **self.suite_inputs())
+        digest = content_hash(record)
+        path = self.source.parent / "evaluation-inputs.json"
+        path.write_text(json.dumps(record))
+        _bind_suite_inputs(self.suite_dir, record, resume=False)
+        reports = {}
+        for key in ("mu_cosine_comparisons", "pair_head_metric_checks"):
+            reports[key] = {"schema": key}
+            reports[key]["sha256"] = content_hash(reports[key])
+        results = {
+            arm: {"last_epoch": {"checkpoint": {"arm": arm, "config_sha256": digest}}}
+            for arm in ("S1", "S2", "S3")
+        }
+        results["S3"].update(reports)
+        options = {"config_sha256": digest, "attempt_id": "evaluation", "mps_memory_fraction": 0.4}
+        with patch("scripts.streamed_overlap_evaluate_child.torch.backends.mps.is_available", return_value=True), \
+             patch("scripts.streamed_overlap_evaluate_child.torch.mps.set_per_process_memory_fraction") as set_limit, \
+             patch("scripts.streamed_overlap_evaluate_child.run_suite_from_record", return_value=results) as run, \
+             patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")), \
+             patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+            receipt = evaluate_child(path, self.suite_dir, **options)
+            self.assertEqual(receipt["status"], "REPORTS_COMPUTED_NOT_ADOPTION")
+            self.assertEqual(receipt["report_sha256"], {key: value["sha256"] for key, value in reports.items()})
+            set_limit.assert_called_once_with(0.4)
+            run.assert_called_once_with(
+                path, self.suite_dir, expected_config_sha256=digest, resume=True,
+                attempt_id="evaluation", evaluate_only=True,
+            )
+            run.reset_mock()
+            set_limit.reset_mock()
+            for changes in ({"mps_memory_fraction": 0}, {"mps_memory_fraction": True},
+                            {"mps_memory_fraction": float("nan")}, {"attempt_id": "bad\nid"},
+                            {"config_sha256": "0" * 64}):
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    evaluate_child(path, self.suite_dir, **{**options, **changes})
+            with patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "1"}):
+                with self.assertRaisesRegex(RuntimeError, "without CPU fallback"):
+                    evaluate_child(path, self.suite_dir, **options)
+            run.assert_not_called()
+            set_limit.assert_not_called()
+            results["S3"]["pair_head_metric_checks"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "invalid pair_head_metric_checks"):
+                evaluate_child(path, self.suite_dir, **options)
+            results["S3"]["pair_head_metric_checks"]["sha256"] = content_hash({"schema": "pair_head_metric_checks"})
+            def change_record(*args, **kwargs):
+                path.write_text("{}")
+                return results
+
+            run.side_effect = change_record
+            with self.assertRaisesRegex(ValueError, "pinned configuration hash"):
+                evaluate_child(path, self.suite_dir, **options)
 
     def test_suite_bootstrap_recovers_partial_arm_and_pins_evidence(self):
         journals = self.empty_suite_journals()

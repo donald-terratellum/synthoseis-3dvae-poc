@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The future logged runner now has an evaluation-only child in
+`scripts/streamed_overlap_evaluate_child.py`. It checks the pinned record and
+saved suite inputs, requires an explicit MPS memory fraction in `(0, 0.5]`
+without CPU fallback, and calls the existing suite runner with `resume=True`
+and `evaluate_only=True`. On completion it prints checkpoint identities and
+the separate encoder-cosine and S3 pair-head report hashes, not an adoption
+decision. A changed input record or invalid returned report fails.
+
+This child is a runner component, not a complete launch command: it does not
+capture a durable combined log, start TensorBoard, establish disk or memory
+headroom, or verify historical measurement provenance. It can write evaluation
+reports and journal recovery records and is not atomic. The outer logged runner
+and local resource checks remain to be integrated; shell train/resume/evaluate
+remain blocked and no training is authorized.
+Initialization, epoch and runner fixtures passed 88 tests and 42 subtests using
+`.venv/bin/python -m pytest -q tests/test_streamed_overlap_initialization.py
+tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_runner.py`.
+The child test mocked MPS and suite execution; no real evaluation or training ran.
+
 For a prospective fresh suite, review storage against a prepared suite record:
 
 ```sh
