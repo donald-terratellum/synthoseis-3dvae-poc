@@ -18,8 +18,8 @@ from scripts.streamed_overlap_epoch_runner import SelectedReconstruction, SuiteI
 from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
-    ArmEvidence, _rngs_equal, save_suite_initialization, verify_arm_initial_checkpoint,
-    verify_saved_suite_initialization, verify_suite_initialization,
+    ArmEvidence, _rngs_equal, save_suite_initialization, save_suite_run_metadata, verify_arm_initial_checkpoint,
+    verify_saved_suite_initialization, verify_suite_initialization, verify_suite_run_metadata,
 )
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.train import EarlyStoppingState
@@ -196,6 +196,85 @@ class ArmInitializationTests(unittest.TestCase):
         )
         self.assertEqual(record["matching_config"], self.config)
         self.assertEqual(record["initialization"]["status"], "MATCHED_INITIALIZATION_ONLY")
+
+    def test_suite_metadata_pins_initialization_and_reuses_after_advancing(self):
+        arms = self.prepare_suite()
+        evidence = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        checkpoints = {arm: item.initial_checkpoint for arm, item in arms.items()}
+
+        def save(pin=evidence["evidence_sha256"]):
+            return save_suite_run_metadata(
+                self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+                initialization_sha256=pin,
+            )
+
+        with self.assertRaisesRegex(ValueError, "pinned configuration"):
+            save("0" * 64)
+        self.assertFalse((self.suite_dir / "suite_metadata.json").exists())
+        result = save()
+        original = result["path"].read_bytes()
+        self.assertEqual(save(), result)
+        self.assertEqual(result["path"].read_bytes(), original)
+        state = torch.load(arms["S1"].final_checkpoint, weights_only=True)
+        state["completed_epoch"] = 1
+        torch.save(state, arms["S1"].final_checkpoint)
+        record = verify_suite_run_metadata(
+            self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+        )
+        self.assertEqual(record["initialization_sha256"], evidence["evidence_sha256"])
+        self.assertEqual(record["sha256"], result["metadata_sha256"])
+        with self.assertRaisesRegex(ValueError, "requested configuration"):
+            verify_suite_run_metadata(
+                self.suite_dir, checkpoints, matching_config={**self.config, "experiment_seed": 7},
+                expected_hashes=self.hashes,
+            )
+        initial = checkpoints["S2"]
+        initial_bytes = initial.read_bytes()
+        state = torch.load(initial, weights_only=True)
+        state["training"]["torch_rng"][0] ^= 1
+        torch.save(state, initial)
+        with self.assertRaisesRegex(ValueError, "does not match saved suite evidence"):
+            verify_suite_run_metadata(
+                self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+            )
+        initial.write_bytes(initial_bytes)
+        changed = json.loads(original)
+        changed["initialization_sha256"] = "0" * 64
+        changed["sha256"] = content_hash({key: value for key, value in changed.items() if key != "sha256"})
+        result["path"].write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ValueError, "pinned configuration"):
+            verify_suite_run_metadata(
+                self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+            )
+
+    def test_partial_suite_metadata_is_not_overwritten(self):
+        arms = self.prepare_suite()
+        evidence = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        path = self.suite_dir / "suite_metadata.json"
+        path.write_bytes(b"partial")
+        with self.assertRaises(json.JSONDecodeError):
+            save_suite_run_metadata(
+                self.suite_dir, {arm: item.initial_checkpoint for arm, item in arms.items()},
+                matching_config=self.config, expected_hashes=self.hashes,
+                initialization_sha256=evidence["evidence_sha256"],
+            )
+        self.assertEqual(path.read_bytes(), b"partial")
+
+    def test_suite_metadata_rejects_symlinked_suite_before_reading_evidence(self):
+        link = self.suite_dir.parent / "suite-link"
+        link.symlink_to(self.suite_dir, target_is_directory=True)
+        with patch("scripts.streamed_overlap_matching.verify_saved_suite_initialization") as verify:
+            with self.assertRaisesRegex(ValueError, "regular directory"):
+                save_suite_run_metadata(
+                    link, {}, matching_config=self.config, expected_hashes=self.hashes,
+                    initialization_sha256="0" * 64,
+                )
+            verify.assert_not_called()
+        self.assertFalse((self.suite_dir / "suite_metadata.json").exists())
 
     def test_arm_runner_rechecks_pinned_suite_before_restore(self):
         formal = {"final_epoch": self.config["final_epoch"]}

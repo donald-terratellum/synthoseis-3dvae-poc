@@ -4,6 +4,27 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+An opt-in suite metadata helper now persists the initialization evidence pin,
+matching configuration and checkpoint hash bindings in `suite_metadata.json`.
+It verifies the evidence and retained initial snapshots before publication and
+on reuse, including after an arm's `last.pt` advances. Existing partial or
+mismatched metadata is not overwritten. Its exclusive publication is fsynced
+but is not atomic on ExFAT; a hard interruption can leave a partial file that
+must be investigated. The self-hash detects accidental changes, not coordinated
+replacement of metadata and evidence. This helper does not persist the complete
+resolved suite configuration, prove the initialization was used, or authorize
+training. The future suite runner must persist this metadata before any arm
+advances and verify it on resume, bind all launch settings and artifact paths,
+and enforce the remaining gates.
+
+Three synthetic metadata tests passed on ExFAT in 4.56 seconds wall time and
+481,558,528 bytes peak RSS. No training or optimizer step occurred. The initial
+cleanup command reported a nonempty temporary directory because PyTorch created
+an empty cache directory; both directories were subsequently removed. This is
+not a training-resource estimate. The portable streamed suite passed 218 tests,
+with one skipped and 54 subtests, using
+`.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The per-arm helper now verifies S2 and S3's completed recorded pair and
 augmentation streams against S1 before selected-checkpoint comparisons. It
 requires the initial checkpoint hashes from the pinned suite evidence, retains

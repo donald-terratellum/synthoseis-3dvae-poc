@@ -360,6 +360,72 @@ def save_suite_initialization(
     return {"path": path, "evidence_sha256": record["sha256"]}
 
 
+def _validate_suite_metadata_dir(suite_dir: Path) -> None:
+    if ("fake_data_validation_v2" in suite_dir.parts or suite_dir.is_symlink()
+            or "fake_data_validation_v2" in suite_dir.resolve().parts or not suite_dir.is_dir()):
+        raise ValueError("Suite metadata requires a regular directory outside validation-v2.")
+
+
+def verify_suite_run_metadata(
+    suite_dir: Path, initial_checkpoints: dict[str, Path], *, matching_config: dict, expected_hashes: dict,
+) -> dict:
+    """Verify the durable initialization pin and retained checkpoints for a suite."""
+    _validate_suite_metadata_dir(suite_dir)
+    path = suite_dir / "suite_metadata.json"
+    _permitted_file(path)
+    raw = path.read_bytes()
+    file_hash = hashlib.sha256(raw).hexdigest()
+    record = json.loads(raw)
+    if (not isinstance(record, dict)
+            or set(record) != {"schema", "matching_config", "checkpoint_hashes", "initialization_sha256", "sha256"}
+            or record["schema"] != "streamed-suite-metadata-v1"
+            or record["sha256"] != content_hash({key: value for key, value in record.items() if key != "sha256"})
+            or record["matching_config"] != matching_config or record["checkpoint_hashes"] != expected_hashes):
+        raise ValueError("Suite metadata is invalid or does not match the requested configuration.")
+    verify_saved_suite_initialization(
+        suite_dir / "initialization_evidence.json", initial_checkpoints,
+        matching_config=matching_config, expected_hashes=expected_hashes,
+        expected_evidence_sha256=record["initialization_sha256"],
+    )
+    _permitted_file(path)
+    if _digest(path) != file_hash:
+        raise ValueError("Suite metadata changed during verification.")
+    return record
+
+
+def save_suite_run_metadata(
+    suite_dir: Path, initial_checkpoints: dict[str, Path], *, matching_config: dict, expected_hashes: dict,
+    initialization_sha256: str,
+) -> dict:
+    """Publish or reverify the suite's initialization pin without starting training."""
+    _validate_suite_metadata_dir(suite_dir)
+    verify_saved_suite_initialization(
+        suite_dir / "initialization_evidence.json", initial_checkpoints,
+        matching_config=matching_config, expected_hashes=expected_hashes,
+        expected_evidence_sha256=initialization_sha256,
+    )
+    record = {
+        "schema": "streamed-suite-metadata-v1",
+        "matching_config": dict(matching_config),
+        "checkpoint_hashes": dict(expected_hashes),
+        "initialization_sha256": initialization_sha256,
+    }
+    record["sha256"] = content_hash(record)
+    path = suite_dir / "suite_metadata.json"
+    if not path.exists() and not path.is_symlink():
+        payload = (json.dumps(record, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+
+        def write(handle):
+            handle.write(payload)
+
+        _publish_exclusive(path, write)
+    if verify_suite_run_metadata(
+        suite_dir, initial_checkpoints, matching_config=matching_config, expected_hashes=expected_hashes,
+    ) != record:
+        raise ValueError("Saved suite metadata differs from the requested initialization pin.")
+    return {"path": path, "metadata_sha256": record["sha256"]}
+
+
 def _valid_pair(pair: object, category: str) -> bool:
     if (not isinstance(pair, dict) or set(pair) != {"category", "a", "b", "augmentation_seed_a", "augmentation_seed_b"}
             or pair["category"] != category):
