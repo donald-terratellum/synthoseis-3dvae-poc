@@ -15,13 +15,17 @@ import zarr
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state
 from scripts.streamed_overlap_diagnostics import diagnostic_report
-from scripts.streamed_overlap_evaluation import _checkpoint_state, _identity, evaluate_checkpoint
+from scripts.streamed_overlap_evaluation import (
+    _checkpoint_state, _identity, _validate_evaluation_parameters, evaluate_checkpoint,
+)
 from scripts.streamed_overlap_guardrails import (
     _manifest as _guardrail_manifest, _measurement, _sha256, compare_reconstruction_guardrails,
 )
 from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
 from scripts.streamed_overlap_journal import BatchJournal, _atomic_record, _sync_directory
-from scripts.streamed_overlap_matching import matching_config_hash, verify_arm_initial_checkpoint
+from scripts.streamed_overlap_matching import (
+    matching_config_hash, verify_arm_initial_checkpoint, verify_saved_suite_initialization,
+)
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
 )
@@ -109,6 +113,7 @@ def _validate_formal_config(search_manifest: dict, diagnostic_manifest: dict, co
     if (not isinstance(config, dict) or set(config) != required
             or isinstance(config["final_epoch"], bool) or not isinstance(config["final_epoch"], int)
             or config["final_epoch"] < 1 or config["device"] != "mps"
+            or not isinstance(search_manifest, dict) or not isinstance(diagnostic_manifest, dict)
             or search_manifest.get("search_manifest_sha256") != config["search_manifest_sha256"]
             or search_manifest.get("search_manifest_sha256") != content_hash({
                 key: value for key, value in search_manifest.items() if key != "search_manifest_sha256"
@@ -118,6 +123,16 @@ def _validate_formal_config(search_manifest: dict, diagnostic_manifest: dict, co
                 key: value for key, value in diagnostic_manifest.items() if key != "diagnostic_manifest_sha256"
             })):
         raise ValueError("An explicit frozen MPS evaluation configuration is required.")
+    _validate_evaluation_parameters(
+        inference_seed=config["inference_seed"], encode_batch_size=config["encode_batch_size"],
+        max_wall_seconds=config["max_wall_seconds"], random_seed=config["random_seed"],
+        random_repeats=config["random_repeats"], bootstrap_seed=config["bootstrap_seed"],
+        bootstrap_repeats=config["bootstrap_repeats"],
+    )
+    diagnostic_limit = config["diagnostic_max_wall_seconds"]
+    if (isinstance(diagnostic_limit, bool) or not isinstance(diagnostic_limit, (int, float))
+            or not math.isfinite(diagnostic_limit) or diagnostic_limit <= 0):
+        raise ValueError("An explicit positive diagnostic wall-time limit is required.")
 
 
 def _formal_reports(
@@ -433,6 +448,13 @@ class HistoricalReconstruction:
     checkpoint_label: str
 
 
+@dataclass(frozen=True)
+class SuiteInitialization:
+    evidence_path: Path
+    evidence_sha256: str
+    initial_checkpoints: dict[str, Path]
+
+
 def _reference_hash(historical: HistoricalReconstruction) -> str:
     if (not isinstance(historical, HistoricalReconstruction)
             or not _sha256(historical.report_sha256) or not _sha256(historical.checkpoint_sha256)
@@ -589,7 +611,7 @@ def run_arm_epochs(
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, evaluation_dir: Path, guardrail_manifest: dict, guardrail_config: dict,
     historical: HistoricalReconstruction, s1: SelectedReconstruction | None, matching_config: dict,
-    initial_checkpoint: Path,
+    initial_checkpoint: Path, suite_initialization: SuiteInitialization,
 ) -> dict:
     """Resume one arm from its full epoch state and finish evaluation before advancing."""
     if hashes.get("formal_evaluation") != content_hash(formal_config):
@@ -610,6 +632,7 @@ def run_arm_epochs(
             or sparse_probability != matching_config["sparse_probability"]
             or formal_config["final_epoch"] != matching_config["final_epoch"]):
         raise ValueError("Arm arguments must match the frozen matching configuration.")
+    _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
     _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
     if (hashes.get("reconstruction_guardrail") != content_hash(guardrail_config)
             or hashes.get("reconstruction_reference") != _reference_hash(historical)):
@@ -620,6 +643,25 @@ def run_arm_epochs(
                 not isinstance(s1, SelectedReconstruction) or s1.selection_kind != "reconstruction"
             ))):
         raise ValueError("S1 needs P0b only; S2 and S3 require the selected S1 reconstruction reference.")
+    if (not isinstance(suite_initialization, SuiteInitialization)
+            or not isinstance(suite_initialization.initial_checkpoints, dict)
+            or suite_initialization.initial_checkpoints.get(model.arm) != initial_checkpoint
+            or initial_checkpoint.name != "initial.pt"
+            or checkpoint_path != initial_checkpoint.with_name("last.pt")
+            or not isinstance(getattr(journal, "path", None), Path)
+            or journal.path.parent != initial_checkpoint.parent):
+        raise ValueError("The arm must use its retained suite initialization checkpoint.")
+    verify_saved_suite_initialization(
+        suite_initialization.evidence_path, suite_initialization.initial_checkpoints,
+        matching_config=matching_config, expected_hashes=hashes,
+        expected_evidence_sha256=suite_initialization.evidence_sha256,
+    )
+    if s1 is not None:
+        s1_initial = suite_initialization.initial_checkpoints["S1"]
+        if (s1.checkpoint_path != s1_initial.with_name("last.pt")
+                or not isinstance(getattr(s1.journal, "path", None), Path)
+                or s1.journal.path.parent != s1_initial.parent):
+            raise ValueError("The S1 reconstruction reference must belong to this initialized suite.")
     verify_arm_initial_checkpoint(
         initial_checkpoint, checkpoint_path, arm=model.arm,
         matching_config=matching_config, expected_hashes=hashes,

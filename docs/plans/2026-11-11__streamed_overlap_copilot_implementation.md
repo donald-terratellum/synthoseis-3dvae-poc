@@ -4,6 +4,23 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The per-arm epoch helper now requires the caller's pinned suite-initialization
+evidence before any restore or optimizer step. It verifies all three retained
+initial snapshots and requires the current arm's `initial.pt`, `last.pt` and
+journal to share an arm directory. S2/S3 must use an S1 reconstruction reference
+from the initialized suite's S1 directory. Invalid or missing evidence stops before
+restore. The helper also validates the frozen search/diagnostic manifest identities
+and evaluation seeds, counts and wall limits before restore rather than discovering
+invalid settings after an epoch. The suite runner must still persist the evidence pin
+in durable run metadata, construct the complete frozen configuration, and verify recorded
+streams; this gate alone does not establish a matched trajectory or authorize
+training. Synthetic ExFAT testing of the gate took 2.15 seconds, with 443,613,184
+bytes peak RSS and 475,136 bytes MPS driver allocation sampled afterward. Restore
+and training were mocked; temporary files were removed. These are not training
+resource estimates.
+The portable streamed suite passed 211 tests, with one skipped and 54 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The opt-in suite-initialization preflight can now persist
 `initialization_evidence.json` with the matching configuration, checkpoint hash
 bindings and hash-bound preflight report. A separate verifier checks a caller-pinned

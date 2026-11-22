@@ -356,17 +356,13 @@ def export_tokenizer_checkpoint(
     }
 
 
-def evaluate_checkpoint(
-    checkpoint_path: Path, journal: BatchJournal, manifest_path: Path, source_root: Path, *,
-    device: str, inference_seed: int, encode_batch_size: int, max_wall_seconds: float,
+def _validate_evaluation_parameters(
+    *, inference_seed: int, encode_batch_size: int, max_wall_seconds: float,
     random_seed: int, random_repeats: int, bootstrap_seed: int, bootstrap_repeats: int,
-    score_pair_head: bool, score_overlap: bool = False,
-) -> dict:
-    """Score only a completed checkpoint against its verified frozen validation inputs."""
+) -> None:
     if (isinstance(encode_batch_size, bool) or not isinstance(encode_batch_size, int) or encode_batch_size < 1
             or isinstance(max_wall_seconds, bool) or not isinstance(max_wall_seconds, (int, float))
-            or not math.isfinite(max_wall_seconds) or max_wall_seconds <= 0
-            or not isinstance(score_pair_head, bool) or not isinstance(score_overlap, bool)):
+            or not math.isfinite(max_wall_seconds) or max_wall_seconds <= 0):
         raise ValueError("Explicit positive evaluation batch size and wall-time limit are required.")
     if (any(isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in (inference_seed, random_seed, bootstrap_seed))
@@ -374,6 +370,22 @@ def evaluate_checkpoint(
             or any(isinstance(value, bool) or not isinstance(value, int) or value < 2
                    for value in (random_repeats, bootstrap_repeats))):
         raise ValueError("Explicit valid inference, random and bootstrap configuration is required.")
+
+
+def evaluate_checkpoint(
+    checkpoint_path: Path, journal: BatchJournal, manifest_path: Path, source_root: Path, *,
+    device: str, inference_seed: int, encode_batch_size: int, max_wall_seconds: float,
+    random_seed: int, random_repeats: int, bootstrap_seed: int, bootstrap_repeats: int,
+    score_pair_head: bool, score_overlap: bool = False,
+) -> dict:
+    """Score only a completed checkpoint against its verified frozen validation inputs."""
+    if not isinstance(score_pair_head, bool) or not isinstance(score_overlap, bool):
+        raise ValueError("Explicit positive evaluation batch size and wall-time limit are required.")
+    _validate_evaluation_parameters(
+        inference_seed=inference_seed, encode_batch_size=encode_batch_size, max_wall_seconds=max_wall_seconds,
+        random_seed=random_seed, random_repeats=random_repeats,
+        bootstrap_seed=bootstrap_seed, bootstrap_repeats=bootstrap_repeats,
+    )
     started = time.monotonic()
     manifest = load_manifest(manifest_path)
     queries = _eligible_queries(manifest)

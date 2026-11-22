@@ -5,6 +5,7 @@ import os
 import random
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ import torch
 
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_epoch_runner import SelectedReconstruction, SuiteInitialization, run_arm_epochs
 from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
@@ -194,6 +196,88 @@ class ArmInitializationTests(unittest.TestCase):
         )
         self.assertEqual(record["matching_config"], self.config)
         self.assertEqual(record["initialization"]["status"], "MATCHED_INITIALIZATION_ONLY")
+
+    def test_arm_runner_rechecks_pinned_suite_before_restore(self):
+        formal = {"final_epoch": self.config["final_epoch"]}
+        guardrail = {}
+        self.hashes.update(
+            formal_evaluation=content_hash(formal), reconstruction_guardrail=content_hash(guardrail),
+            reconstruction_reference="f" * 64,
+        )
+        arms = self.prepare_suite()
+        saved = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        suite = SuiteInitialization(
+            saved["path"], saved["evidence_sha256"],
+            {arm: item.initial_checkpoint for arm, item in arms.items()},
+        )
+        s1 = SelectedReconstruction(
+            arms["S1"].final_checkpoint, arms["S1"].journal, self.suite_dir / "manifest",
+            self.source, {}, {}, formal, self.suite_dir, "reconstruction",
+        )
+        arguments = {
+            "run_id": self.config["run_id"], "seed": self.config["experiment_seed"], "attempt_id": "resume",
+            "batches_per_epoch": self.config["batches_per_epoch"], "sparse_probability": 0.5,
+            "monitor_batches": {}, "monitor_seed": self.config["monitor_seed"],
+            "validation_seed": self.config["validation_seed"], "validate_epoch": object(),
+            "epoch_csv": self.run_dir / "epochs.csv", "checkpoint_path": arms["S3"].final_checkpoint,
+            "hashes": self.hashes, "early_stopping": self.stopping, "manifest_path": self.suite_dir / "manifest",
+            "source_root": self.source, "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": formal, "evaluation_dir": self.run_dir, "guardrail_manifest": {},
+            "guardrail_config": guardrail, "historical": object(), "s1": s1,
+            "matching_config": self.config, "initial_checkpoint": arms["S3"].initial_checkpoint,
+            "suite_initialization": suite,
+        }
+
+        def run(**overrides):
+            return run_arm_epochs(
+                self.model, self.optimizer, self.scheduler, self.sampler, self.journal, object(), object(),
+                **{**arguments, **overrides},
+            )
+
+        with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._reference_hash", return_value="f" * 64), \
+             patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
+                   side_effect=RuntimeError("restore reached")) as restore, \
+             patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                run(suite_initialization=replace(suite, evidence_path=self.suite_dir / "missing.json"))
+            with self.assertRaisesRegex(ValueError, "pinned configuration"):
+                run(suite_initialization=replace(suite, evidence_sha256="0" * 64))
+            with self.assertRaisesRegex(ValueError, "retained suite initialization checkpoint"):
+                run(initial_checkpoint=arms["S1"].initial_checkpoint)
+            with self.assertRaisesRegex(ValueError, "retained suite initialization checkpoint"):
+                run(checkpoint_path=arms["S1"].final_checkpoint)
+            with patch.object(self.journal, "path", arms["S1"].journal.path):
+                with self.assertRaisesRegex(ValueError, "retained suite initialization checkpoint"):
+                    run()
+            with self.assertRaisesRegex(ValueError, "S1 reconstruction reference must belong"):
+                run(s1=replace(s1, checkpoint_path=arms["S3"].final_checkpoint))
+            initial = arms["S2"].initial_checkpoint
+            original = initial.read_bytes()
+            state = torch.load(initial, weights_only=True)
+            state["training"]["torch_rng"][0] ^= 1
+            torch.save(state, initial)
+            with self.assertRaisesRegex(ValueError, "does not match saved suite evidence"):
+                run()
+            initial.write_bytes(original)
+            restore.assert_not_called()
+            train.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "restore reached"):
+                run()
+            restore.assert_called_once()
+            train.assert_not_called()
+            restore.reset_mock()
+            last = arms["S3"].final_checkpoint
+            state = torch.load(last, weights_only=True)
+            state["completed_epoch"] = 1
+            torch.save(state, last)
+            with self.assertRaisesRegex(RuntimeError, "restore reached"):
+                run()
+            restore.assert_called_once()
+            train.assert_not_called()
 
     def test_persisted_suite_evidence_detects_tampering_and_wrong_pin(self):
         arms = self.prepare_suite()

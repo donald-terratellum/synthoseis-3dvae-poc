@@ -3,11 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
-    HistoricalReconstruction, SelectedReconstruction, _completed, complete_epoch,
+    HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, complete_epoch,
     complete_selected_checkpoint, run_arm_epochs,
 )
 
@@ -58,15 +59,24 @@ class EpochCompletionTests(unittest.TestCase):
         self.historical = HistoricalReconstruction(
             self.root / "p0b.json", "d" * 64, self.root / "p0b.pt", "e" * 64, "reconstruction-best",
         )
+        s1_journal = Mock(spec=BatchJournal)
+        s1_journal.path = self.root / "batch_metrics.csv"
         self.s1 = SelectedReconstruction(
-            self.root / "s1.pt", object(), self.root / "manifest", self.source,
+            self.checkpoint, s1_journal, self.root / "manifest", self.source,
             self.search_manifest, self.diagnostic_manifest, self.config, self.evaluation, "reconstruction",
+        )
+        self.arm_args = (
+            object(), object(), object(), SimpleNamespace(path=self.root / "batch_metrics.csv"), object(), object(),
         )
         self.matching_config = {
             "schema": "streamed-matching-config-v1", "run_id": "run", "experiment_seed": 1,
             "model_seed": 1, "head_seed": 2, "sampler_seed": 3, "monitor_seed": 1, "validation_seed": 1,
             "final_epoch": 6, "batches_per_epoch": 2, "sparse_probability": 0.5,
         }
+        self.suite_initialization = SuiteInitialization(
+            self.root / "initialization_evidence.json", "f" * 64,
+            {arm: self.root / "initial.pt" for arm in ("S1", "S2", "S3")},
+        )
         self.hashes = {
             "formal_evaluation": content_hash(self.config),
             "matching": content_hash(self.matching_config),
@@ -87,6 +97,7 @@ class EpochCompletionTests(unittest.TestCase):
             patch("scripts.streamed_overlap_epoch_runner.diagnostic_report", return_value={"diagnostic": "ok"}),
             patch("scripts.streamed_overlap_epoch_runner.select_checkpoints", return_value={"selection": "ok"}),
             patch("scripts.streamed_overlap_epoch_runner.verify_arm_initial_checkpoint", return_value="a" * 64),
+            patch("scripts.streamed_overlap_epoch_runner.verify_saved_suite_initialization", return_value={}),
         ]
         self.mocks = [item.start() for item in self.patches]
         for item in reversed(self.patches):
@@ -203,7 +214,7 @@ class EpochCompletionTests(unittest.TestCase):
                        }
                    )) as compare:
             result = run_arm_epochs(
-                SimpleNamespace(arm="S3"), *([object()] * 6),
+                SimpleNamespace(arm="S3"), *self.arm_args,
                 run_id="run", seed=1, attempt_id="resume", batches_per_epoch=2,
                 sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
                 validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
@@ -214,6 +225,7 @@ class EpochCompletionTests(unittest.TestCase):
                 guardrail_manifest=self.guardrail_manifest, guardrail_config=self.guardrail_config,
                 historical=self.historical, s1=self.s1, matching_config=self.matching_config,
                 initial_checkpoint=self.root / "initial.pt",
+                suite_initialization=self.suite_initialization,
             )
         self.assertEqual(order, ["evaluate", "train-5", "evaluate", "train-6", "evaluate",
                                  "reconstruction", "retrieval", "compare-reconstruction", "compare-retrieval"])
@@ -230,7 +242,7 @@ class EpochCompletionTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
             with self.assertRaisesRegex(OSError, "evaluation failed"):
                 run_arm_epochs(
-                    SimpleNamespace(arm="S3"), *([object()] * 6), run_id="run", seed=1,
+                    SimpleNamespace(arm="S3"), *self.arm_args, run_id="run", seed=1,
                     attempt_id="resume", batches_per_epoch=2,
                     sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
                     validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
@@ -241,13 +253,14 @@ class EpochCompletionTests(unittest.TestCase):
                     guardrail_manifest=self.guardrail_manifest, guardrail_config=self.guardrail_config,
                     historical=self.historical, s1=self.s1, matching_config=self.matching_config,
                     initial_checkpoint=self.root / "initial.pt",
+                    suite_initialization=self.suite_initialization,
                 )
             train.assert_not_called()
 
     def test_guardrails_are_required_before_restoring_or_training(self):
         def run(arm="S3", *, hashes=None, s1=None):
             return run_arm_epochs(
-                SimpleNamespace(arm=arm), *([object()] * 6),
+                SimpleNamespace(arm=arm), *self.arm_args,
                 run_id="run", seed=1, attempt_id="resume", batches_per_epoch=2,
                 sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
                 validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
@@ -258,6 +271,7 @@ class EpochCompletionTests(unittest.TestCase):
                 guardrail_manifest=self.guardrail_manifest, guardrail_config=self.guardrail_config,
                 historical=self.historical, s1=s1, matching_config=self.matching_config,
                 initial_checkpoint=self.root / "initial.pt",
+                suite_initialization=self.suite_initialization,
             )
 
         with patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state") as restore:
@@ -282,6 +296,7 @@ class EpochCompletionTests(unittest.TestCase):
             "evaluation_dir": self.evaluation, "guardrail_manifest": self.guardrail_manifest,
             "guardrail_config": self.guardrail_config, "historical": self.historical, "s1": self.s1,
             "matching_config": self.matching_config, "initial_checkpoint": self.root / "initial.pt",
+            "suite_initialization": self.suite_initialization,
         }
         cases = {
             "run_id": "other", "seed": 2, "batches_per_epoch": 3, "sparse_probability": 0.1,
@@ -292,17 +307,34 @@ class EpochCompletionTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
             for key, value in cases.items():
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, "frozen matching configuration"):
-                    run_arm_epochs(SimpleNamespace(arm="S3"), *([object()] * 6), **{**kwargs, key: value})
+                    run_arm_epochs(SimpleNamespace(arm="S3"), *self.arm_args, **{**kwargs, key: value})
             changed_formal = {**self.config, "final_epoch": 7}
             with self.assertRaisesRegex(ValueError, "frozen matching configuration"):
                 run_arm_epochs(
-                    SimpleNamespace(arm="S3"), *([object()] * 6),
+                    SimpleNamespace(arm="S3"), *self.arm_args,
                     **{**kwargs, "formal_config": changed_formal,
                        "hashes": {**self.hashes, "formal_evaluation": content_hash(changed_formal)}},
                 )
+            for key, changed in (
+                ("search_manifest", {**self.search_manifest, "searches": ["changed"]}),
+                ("diagnostic_manifest", {**self.diagnostic_manifest, "windows": {"changed": {}}}),
+            ):
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, "frozen MPS evaluation"):
+                    run_arm_epochs(SimpleNamespace(arm="S3"), *self.arm_args, **{**kwargs, key: changed})
+            for key, value in (
+                ("encode_batch_size", 0), ("inference_seed", -1), ("random_repeats", 1),
+                ("bootstrap_repeats", 1), ("max_wall_seconds", 0), ("diagnostic_max_wall_seconds", 0),
+            ):
+                invalid_formal = {**self.config, key: value}
+                invalid_hashes = {**self.hashes, "formal_evaluation": content_hash(invalid_formal)}
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    run_arm_epochs(
+                        SimpleNamespace(arm="S3"), *self.arm_args,
+                        **{**kwargs, "formal_config": invalid_formal, "hashes": invalid_hashes},
+                    )
             self.mocks[8].side_effect = ValueError("initial checkpoint invalid")
             with self.assertRaisesRegex(ValueError, "initial checkpoint invalid"):
-                run_arm_epochs(SimpleNamespace(arm="S3"), *([object()] * 6), **kwargs)
+                run_arm_epochs(SimpleNamespace(arm="S3"), *self.arm_args, **kwargs)
             restore.assert_not_called()
             train.assert_not_called()
 
@@ -317,7 +349,7 @@ class EpochCompletionTests(unittest.TestCase):
 
         def run():
             return run_arm_epochs(
-                SimpleNamespace(arm="S1"), *([object()] * 6),
+                SimpleNamespace(arm="S1"), *self.arm_args,
                 run_id="run", seed=1, attempt_id="resume", batches_per_epoch=2,
                 sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
                 validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
@@ -328,6 +360,7 @@ class EpochCompletionTests(unittest.TestCase):
                 guardrail_manifest=self.guardrail_manifest, guardrail_config=self.guardrail_config,
                 historical=self.historical, s1=None, matching_config=self.matching_config,
                 initial_checkpoint=self.root / "initial.pt",
+                suite_initialization=self.suite_initialization,
             )
 
         with patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
@@ -354,7 +387,7 @@ class EpochCompletionTests(unittest.TestCase):
                    return_value={"comparison": {"status": "PASS_NUMERIC_ONLY"}}) as compare, \
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
             result = run_arm_epochs(
-                SimpleNamespace(arm="S2"), *([object()] * 6),
+                SimpleNamespace(arm="S2"), *self.arm_args,
                 run_id="run", seed=1, attempt_id="resume", batches_per_epoch=2,
                 sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
                 validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
@@ -365,6 +398,7 @@ class EpochCompletionTests(unittest.TestCase):
                 guardrail_manifest=self.guardrail_manifest, guardrail_config=self.guardrail_config,
                 historical=self.historical, s1=self.s1, matching_config=self.matching_config,
                 initial_checkpoint=self.root / "initial.pt",
+                suite_initialization=self.suite_initialization,
             )
         train.assert_not_called()
         selected.assert_called_once()
