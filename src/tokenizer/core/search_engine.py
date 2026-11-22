@@ -28,6 +28,7 @@ def run_similarity_search_on_padded_volume(
     batch_size: int = 32,
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    window_score_callback: Optional[Callable[[tuple[int, int, int], float], None]] = None,
 ) -> np.ndarray:
     if padded_volume.ndim != 3:
         raise ValueError("padded_volume must be 3D")
@@ -79,6 +80,8 @@ def run_similarity_search_on_padded_volume(
             ye = ys + sy
             ze = zs + sz
             sim = compute_similarity(latent, token_latent, mode=similarity_mode)
+            if window_score_callback is not None:
+                window_score_callback((xs, ys, zs), float(sim))
             out_sum[xs:xe, ys:ye, zs:ze] += sim * taper
             out_wgt[xs:xe, ys:ye, zs:ze] += taper
             completed_windows += 1

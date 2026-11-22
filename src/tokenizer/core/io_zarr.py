@@ -90,7 +90,9 @@ def compute_axis_padding(axis_len: int, patch_size: int = 32, base_pad: int = 16
     return base_pad, base_pad + extra_tail
 
 
-def compute_padding(volume_shape: Sequence[int], patch_size: int = 32, base_pad: int = 16) -> Tuple[Tuple[int, int], ...]:
+def compute_padding(
+    volume_shape: Sequence[int], patch_size: int | Sequence[int] = 32, base_pad: int = 16,
+) -> Tuple[Tuple[int, int], ...]:
     if len(volume_shape) != 3:
         raise ValueError("volume_shape must have 3 axes")
     patch_shape = normalize_patch_size(patch_size)

@@ -25,6 +25,7 @@ class SearchVolumeIntegrationTests(unittest.TestCase):
             temp_path = tmp / "temp_input.zarr"
             output_path = tmp / "output.zarr"
             bench_path = tmp / "bench.json"
+            score_path = tmp / "window_scores.jsonl"
 
             source = zarr.open(str(source_path), mode="w")
             source.create_array("data", data=np.ones((7, 9, 13), dtype=np.float32))
@@ -50,6 +51,8 @@ class SearchVolumeIntegrationTests(unittest.TestCase):
                     "pooled",
                     "--benchmark-json",
                     str(bench_path),
+                    "--window-scores-jsonl",
+                    str(score_path),
                 ],
                 cwd=str(REPO_ROOT),
                 capture_output=True,
@@ -79,6 +82,11 @@ class SearchVolumeIntegrationTests(unittest.TestCase):
             self.assertEqual(bench["status"], "completed")
             expected_windows = compute_total_windows_from_padded_shape(expected_padded_shape, patch_size=32, stride=16)
             self.assertEqual(bench["total_windows"], expected_windows)
+            scores = [json.loads(line) for line in score_path.read_text().splitlines()]
+            self.assertEqual(len(scores), expected_windows)
+            self.assertEqual(scores[0]["origin"], [-16, -16, -16])
+            self.assertTrue(all(not row["fully_contained"] for row in scores))
+            self.assertTrue(all(np.isfinite(row["score"]) for row in scores))
             self.assertIn("windows_per_sec", bench)
             self.assertIn("elapsed_s", bench)
 

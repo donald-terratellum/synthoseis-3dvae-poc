@@ -9,8 +9,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import argparse
+from contextlib import ExitStack
+import json
 import numpy as np
+import os
 import time
+from typing import Callable
 import zarr
 
 from src.tokenizer.config.defaults import RuntimeConfig
@@ -99,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_volume.add_argument("--y", type=int, default=None, help="Optional token center y in source volume")
     search_volume.add_argument("--z", type=int, default=None, help="Optional token center z in source volume")
     search_volume.add_argument("--benchmark-json", type=Path, default=None, help="Optional benchmark report JSON path")
+    search_volume.add_argument(
+        "--window-scores-jsonl", type=Path, default=None,
+        help="Create an optional JSONL file of individual search-window scores.",
+    )
 
     ui = subparsers.add_parser("ui", help="Launch desktop UI")
     ui.add_argument("--source", type=Path, help="Optional source volume path to load at startup")
@@ -192,16 +200,36 @@ def cmd_search_volume(args: argparse.Namespace) -> int:
         stride=args.stride,
     )
 
-    similarity_padded = run_similarity_search_on_padded_volume(
-        padded_volume=padded,
-        token_latent=token_latent,
-        patch_size=patch_shape,
-        stride=args.stride,
-        preprocess_fn=preprocess_for_token,
-        latent_batch_fn=latent_batch_fn,
-        similarity_mode=args.similarity_mode,
-        batch_size=args.batch_size,
-    )
+    with ExitStack() as stack:
+        score_stream = None
+        score_callback: Callable[[tuple[int, int, int], float], None] | None = None
+        if args.window_scores_jsonl is not None:
+            score_stream = stack.enter_context(args.window_scores_jsonl.open("x", encoding="utf-8"))
+
+            def write_score(start, score):
+                origin = [int(value - pad[0]) for value, pad in zip(start, padding)]
+                contained = all(0 <= value and value + size <= bound
+                                for value, size, bound in zip(origin, patch_shape, search_volume.shape))
+                score_stream.write(json.dumps(
+                    {"origin": origin, "score": score, "fully_contained": contained},
+                    allow_nan=False,
+                ) + "\n")
+            score_callback = write_score
+
+        similarity_padded = run_similarity_search_on_padded_volume(
+            padded_volume=padded,
+            token_latent=token_latent,
+            patch_size=patch_shape,
+            stride=args.stride,
+            preprocess_fn=preprocess_for_token,
+            latent_batch_fn=latent_batch_fn,
+            similarity_mode=args.similarity_mode,
+            batch_size=args.batch_size,
+            window_score_callback=score_callback,
+        )
+        if score_stream is not None:
+            score_stream.flush()
+            os.fsync(score_stream.fileno())
     similarity = remove_padding(similarity_padded, padding)
 
     if similarity.shape != search_volume.shape:

@@ -217,7 +217,7 @@ errors by pair category and per-pair closure-proxy fluid mismatch where the froz
 target records it. The existing frozen primary manifest's 1,800 recorded fluid
 triples passed the diagnostic's numeric checks without scoring a model or rereading
 source cubes. Missing fluid fractions are explicitly unavailable. NTG,
-thin-layer and no-reservoir diagnostics still require separately fingerprinted
+thin-layer and no-reservoir diagnostics require separately fingerprinted
 inputs. Opt-in checkpoint scoring can also report physical-overlap MAE, RMSE and
 bias by pair category and fixed overlap bins, against a zero constant and an explicit
 waveform baseline: original-window mean-centered Pearson correlation mapped to
@@ -235,8 +235,33 @@ after recovery; their disk consumption can grow throughout a run and must be
 budgeted before launch. The checkpoint volume does not support hard links; a local
 probe confirmed file/directory fsync and atomic replacement.
 
-The independent-seed provenance check, remaining diagnostic reports, bounded
-tokenizer searches and full runner wiring remain. Keep launch modes blocked.
+The independent-seed provenance check, frozen diagnostic/search launch inputs and
+full runner wiring remain. Keep launch modes blocked.
+
+The opt-in bounded-search primitive now freezes primary-validation regions, query
+identities, tokenizer implementation hashes, stride, batch size, window count,
+memory limits and timeout. It verifies source fingerprints and runs the actual
+tokenizer CLI in explicit VAE/mu/cosine mode. An optional CLI JSONL stream preserves
+individual window scores without changing the existing Hann output; reports distinguish
+the best fully contained window and query rank from the Hann-blended voxel peak.
+A disposable real-data MPS check used one canonical-sized validation region, 45 padded
+windows and one fully contained window. It passed in 272.40 seconds including
+source verification and startup. Parent peak RSS was 1,249,230,848 bytes; this is not
+a peak measurement for the CLI child or a launch estimate. The untrained checkpoint
+and one-window ranking are a plumbing check, not a scientific result. An initial
+attempt failed because the MPS low watermark exceeded the configured high watermark;
+the corrected subprocess sets both explicitly. No production search manifest has
+been approved, and no search is yet invoked by the training runner.
+
+Separately, a diagnostic sidecar can fingerprint native-index NTG, lithology and
+channel-label windows and reverify them before reporting directional pair errors.
+It reports mean stored NTG over corrected rock, corrected-sand absence, and complete
+within-window corrected-sand runs below a required predeclared voxel threshold.
+Window-edge runs are censored. These are diagnostic proxies, not proven geological
+layers or proof of reservoir absence. Missing, unsupported and invalid arrays retain
+explicit reasons; a water-only window has no NTG-over-rock value. The sidecar does
+not verify checkpoint provenance, has not yet been frozen for the primary cohort,
+and is not yet connected to the evaluator or runner.
 The existing interrupted-checkpoint/replay fixture now also runs on MPS: it uses
 a small synthetic S3 model and synthetic pairs, exercises optimizer steps, epoch
 logging, an injected checkpoint failure and deterministic replay, and never opens

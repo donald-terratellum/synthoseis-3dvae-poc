@@ -122,6 +122,25 @@ class Phase4EngineTests(unittest.TestCase):
         self.assertTrue(np.allclose(out_cos, 1.0, atol=1e-6))
         self.assertTrue(np.allclose(out_dot, 2.0, atol=1e-6))
 
+    def test_window_scores_do_not_change_hann_output(self):
+        padded = np.arange(64, dtype=np.float32).reshape(4, 4, 4) + 1
+        token = np.array([1.0], dtype=np.float32)
+        kwargs = {
+            "padded_volume": padded, "token_latent": token, "patch_size": 2, "stride": 2,
+            "preprocess_fn": lambda cube: cube,
+            "latent_fn": lambda cube: np.array([cube.mean()], dtype=np.float32),
+            "similarity_mode": "dot",
+        }
+        baseline = run_similarity_search_on_padded_volume(**kwargs)
+        scores = []
+        observed = run_similarity_search_on_padded_volume(
+            **kwargs, window_score_callback=lambda origin, score: scores.append((origin, score)),
+        )
+        np.testing.assert_array_equal(observed, baseline)
+        self.assertEqual(len(scores), 8)
+        self.assertEqual(scores[0], ((0, 0, 0), float(padded[:2, :2, :2].mean())))
+        self.assertEqual(scores[-1][0], (2, 2, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
