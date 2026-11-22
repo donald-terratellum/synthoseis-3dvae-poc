@@ -50,9 +50,11 @@ detector found no zero-event trace; its counts are historical and must not be us
 characterize the smoothed detector. The updated smoothed-detector diagnostic scanned
 the same 45,000 traces and found no zero-event trace; p10/median/p90 event counts were
 197/215/243 for training and 184/217/239 for validation. The streamed pair-target
-implementation, target-yield preflight and frozen evaluation manifest still need to
-be implemented and checked. Gate 1 remains closed until those steps pass; the separate
-training-launch gate also remains closed.
+implementation, bounded target-yield preflight and frozen primary-validation manifest
+have since been implemented and checked; see the current local evidence and its
+limitations in the [handoff](2026-11-11__streamed_overlap_copilot_implementation.md).
+These bounded checks do not certify every source or open the separate training-launch
+gate. The remaining runner and evaluation integration must not be bypassed.
 
 Proceed autonomously on the approved decisions below. Do not repeatedly ask about
 settled choices. Only stop for an unresolved scientific contract, failed safety or

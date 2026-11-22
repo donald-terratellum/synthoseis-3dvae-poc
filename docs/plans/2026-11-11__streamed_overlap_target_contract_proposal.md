@@ -1,9 +1,11 @@
 # Streamed retrieval: local audit and target-contract proposal
 
 Status: **LOCAL_TARGET_VALIDATION_PENDING**. This records the owner's scientific
-decisions and the bounded local evidence; the streaming target, yield preflight and
-evaluation manifest still need implementation and checks. It is not permission to
-launch training.
+decisions and the bounded local evidence. The streaming target, yield preflight and
+primary evaluation manifest have since been implemented and checked; see the
+[current handoff](2026-11-11__streamed_overlap_copilot_implementation.md) for
+results and limitations. This is not permission to launch training. Earlier
+implementation-status statements in this historical proposal have been superseded.
 
 ## 2026-11-22 owner decisions and current status
 

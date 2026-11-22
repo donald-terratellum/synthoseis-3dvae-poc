@@ -2,6 +2,39 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: post-selection evaluation
+
+The epoch orchestration now also runs frozen retrieval, bounded tokenizer search
+and, for S3, diagnostic evaluation on the actual selected reconstruction checkpoint
+and selected S3 retrieval checkpoint after the final epoch. It verifies the
+reconciled final checkpoint, live selection history, immutable snapshot and alias
+before evaluation. Interrupted attempts remain on disk; completed reports and
+search outputs are checked before reuse. These are opt-in primitives with synthetic
+tests, not a fully wired suite runner. Reconstruction guardrail measurements on
+selected checkpoints, launch inputs, budgeting, and the train/resume/evaluate shell
+modes remain incomplete and blocked. Selected evaluation can repeat an evaluation
+already performed at the final epoch, so budget that work explicitly.
+
+On this continuation, the existing target preflight sampled one set of four
+diagnostic pairs from each of 180 training and 25 primary-validation sources.
+All 820 targets were available; this is a bounded diagnostic, not representative
+yield or a retrieval-query floor. It took 99.47 seconds and 963,723,264 bytes
+peak RSS. The existing bound primary-validation manifest
+`13a5ef4f27c1ec0ab9da53168ee1e765f2e8cc94c74e3761c3e573e9c4c9d6c7`
+verified 3,300 input windows and 300 full-depth event regions in 204.14 seconds
+and 1,003,323,392 bytes peak RSS. These fingerprints do not verify whole stores
+or generation-time provenance.
+
+The no-optimizer real-data MPS smoke
+`streamed-overlap-no-optimizer-mps-smoke-20261122-04` passed with 12 train and 12
+validation pairs, all coverage targets available, and nonzero finite S3 encoder
+and head gradients. It used the existing smoke-only sparse probability and 0.5
+MPS memory fraction; no optimizer step or training occurred. Including startup,
+it took 16.25 seconds, with 1,916,125,184 bytes peak RSS and 2,476,277,760 bytes
+MPS driver allocation sampled afterward. These are not a full-training memory or
+throughput estimate. The portable streamed tests passed: 152 tests, one skipped
+and 21 subtests. The training-launch gate remains closed.
+
 ## Resume locally after the 2026-11-22 session
 
 Reconnect from the MacBook using VS Code **Remote-SSH: Connect to Host**, select
@@ -46,8 +79,8 @@ system Python.
 
 Training is **not ready or authorized**. The epoch helper is not the sequential
 S1/S2/S3 suite runner. Next implement and verify the actual configuration-bound
-suite runner, durable train/resume and logging integration, final selected-checkpoint
-searches and reconstruction guardrails, frozen bounded-search and diagnostics
+suite runner, durable train/resume and logging integration, selected-checkpoint
+reconstruction guardrails, frozen bounded-search and diagnostics
 inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
 smoke and present proposed launch commands, measurements and remaining approval
 gates. A matched streamed S1 reference and independent-seed replication require

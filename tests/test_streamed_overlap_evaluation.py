@@ -12,6 +12,7 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_evaluation import (
     StreamedEpochValidator, evaluate_checkpoint, export_tokenizer_checkpoint, physical_overlap_diagnostics,
 )
+from scripts.streamed_overlap_epoch_runner import complete_selected_checkpoint
 from scripts.streamed_overlap_integrity import input_fingerprints, verify_inputs
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
@@ -404,6 +405,46 @@ class EvaluationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "retrieval selection metric changed"):
                 self.select(report)
         self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 2)
+
+    def test_post_selection_uses_earlier_live_journal_checkpoint(self):
+        last = self.root / "last.pt"
+        self.path.replace(last)
+        self.path = last
+        search, diagnostics = {"searches": []}, {"windows": {}}
+        search["search_manifest_sha256"] = content_hash(search)
+        diagnostics["diagnostic_manifest_sha256"] = content_hash(diagnostics)
+        config = {
+            "final_epoch": 2, "device": "mps", "inference_seed": 1, "encode_batch_size": 4,
+            "max_wall_seconds": 30, "random_seed": 2, "random_repeats": 3,
+            "bootstrap_seed": 4, "bootstrap_repeats": 5, "diagnostic_max_wall_seconds": 30,
+            "search_manifest_sha256": search["search_manifest_sha256"],
+            "diagnostic_manifest_sha256": diagnostics["diagnostic_manifest_sha256"],
+        }
+        state = torch.load(last, weights_only=True)
+        state["hashes"]["formal_evaluation"] = content_hash(config)
+        torch.save(state, last)
+        self.selection_checkpoint(1, 0.1)
+        first = self.select(None)
+        first_hash = first["last"]["checkpoint_sha256"]
+        row: dict[str, object] = dict(self.journal.rows[-1])
+        row.update({"sequence": 2, "event_id": "event-2", "logical_step": 2, "epoch": 2,
+                    "cumulative_exposure": 24})
+        self.journal.append(row)
+        self.selection_checkpoint(2, 0.9)
+        self.select(None)
+        evaluation = self.root / "evaluation"
+        evaluation.mkdir()
+        with patch("scripts.streamed_overlap_epoch_runner.load_manifest", return_value=self.manifest), \
+             patch("scripts.streamed_overlap_epoch_runner._completed",
+                   side_effect=lambda directory, *_: {"done": True} if directory == evaluation else None), \
+             patch("scripts.streamed_overlap_epoch_runner._formal_reports", side_effect=OSError("stop")) as formal:
+            with self.assertRaisesRegex(OSError, "stop"):
+                complete_selected_checkpoint(
+                    last, self.journal, self.root / "manifest.json", self.root, search, diagnostics,
+                    config, selection_kind="reconstruction", evaluation_dir=evaluation,
+                )
+        self.assertEqual(formal.call_args.args[0], self.root / "selection" / "snapshots" / f"{first_hash}.pt")
+        self.assertEqual(formal.call_args.args[5]["step"], 1)
 
     def test_selection_does_not_replace_unrelated_checkpoint(self):
         last = self.root / "last.pt"
