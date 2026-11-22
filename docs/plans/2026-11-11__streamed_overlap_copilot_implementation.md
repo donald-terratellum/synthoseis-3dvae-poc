@@ -12,8 +12,19 @@ It measures the selected immutable snapshot with the frozen full-store producer,
 records a hash-bound completion, and rechecks the stores, runtime and LPIPS state
 before reusing a completed measurement. Interrupted attempts are preserved.
 Synthetic tests cover the producer and recovery; this continuation did not measure
-any real or historical guardrail data. The helper is not yet wired into the suite
-runner or matched S1/P0b comparisons, and its result is not an adoption decision.
+any real or historical guardrail data.
+
+An opt-in `complete_reconstruction_comparison` primitive now checks the
+selected measurement against the frozen P0b reconstruction reference, and also
+against the selected S1 reconstruction reference for S2/S3. The historical report
+hash, checkpoint hash and label must be bound to both final and selected checkpoints
+as `hashes["reconstruction_reference"]`. S1 and the candidate must share run,
+source, target, validation and experiment-seed identities. The helper verifies
+the selected measurement artifacts and preserves a hash-bound numeric comparison.
+Its `PASS_NUMERIC_ONLY` result does not verify matched initialization or sampling
+streams, certify historical provenance, or authorize adoption. Synthetic tests
+exercise the comparison; no actual reference was remeasured or rescored. The
+measurement and comparison helpers are not yet wired into the suite runner.
 
 The epoch orchestration now also runs frozen retrieval, bounded tokenizer search
 and, for S3, diagnostic evaluation on the actual selected reconstruction checkpoint
@@ -21,8 +32,8 @@ and selected S3 retrieval checkpoint after the final epoch. It verifies the
 reconciled final checkpoint, live selection history, immutable snapshot and alias
 before evaluation. Interrupted attempts remain on disk; completed reports and
 search outputs are checked before reuse. These are opt-in primitives with synthetic
-tests, not a fully wired suite runner. Reconstruction guardrail comparisons on
-selected checkpoints, launch inputs, budgeting, and the train/resume/evaluate shell
+tests, not a fully wired suite runner. Reconstruction guardrail comparison wiring,
+launch inputs, budgeting, and the train/resume/evaluate shell
 modes remain incomplete and blocked. Selected evaluation can repeat an evaluation
 already performed at the final epoch, so budget that work explicitly.
 
@@ -91,7 +102,7 @@ system Python.
 Training is **not ready or authorized**. The epoch helper is not the sequential
 S1/S2/S3 suite runner. Next implement and verify the actual configuration-bound
 suite runner, durable train/resume and logging integration, selected-checkpoint
-reconstruction comparisons, frozen bounded-search and diagnostics
+reconstruction comparison wiring, frozen bounded-search and diagnostics
 inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
 smoke and present proposed launch commands, measurements and remaining approval
 gates. A matched streamed S1 reference and independent-seed replication require

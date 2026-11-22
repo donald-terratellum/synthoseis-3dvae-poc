@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import time
 import uuid
@@ -15,9 +16,11 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state
 from scripts.streamed_overlap_diagnostics import diagnostic_report
 from scripts.streamed_overlap_evaluation import _checkpoint_state, _identity, evaluate_checkpoint
-from scripts.streamed_overlap_guardrails import _manifest as _guardrail_manifest, _measurement
+from scripts.streamed_overlap_guardrails import (
+    _manifest as _guardrail_manifest, _measurement, _sha256, compare_reconstruction_guardrails,
+)
 from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
-from scripts.streamed_overlap_journal import _atomic_record, _sync_directory
+from scripts.streamed_overlap_journal import BatchJournal, _atomic_record, _sync_directory
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
 )
@@ -399,6 +402,172 @@ def complete_selected_reconstruction(
     }
     record["sha256"] = content_hash(record)
     _atomic_record(events, record)
+    return record
+
+
+@dataclass(frozen=True)
+class SelectedReconstruction:
+    checkpoint_path: Path
+    journal: BatchJournal
+    manifest_path: Path
+    source_root: Path
+    search_manifest: dict
+    diagnostic_manifest: dict
+    formal_config: dict
+    evaluation_dir: Path
+    selection_kind: str
+
+
+@dataclass(frozen=True)
+class HistoricalReconstruction:
+    report_path: Path
+    report_sha256: str
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    checkpoint_label: str
+
+
+def complete_reconstruction_comparison(
+    candidate: SelectedReconstruction, historical: HistoricalReconstruction, *,
+    s1: SelectedReconstruction | None, guardrail_manifest: dict, guardrail_config: dict, lpips_loss_fn,
+) -> dict:
+    """Compare verified selected measurements; this is not an adoption decision."""
+    reference = {
+        "report_sha256": historical.report_sha256,
+        "checkpoint_sha256": historical.checkpoint_sha256,
+        "checkpoint_label": historical.checkpoint_label,
+    }
+    if (not _sha256(historical.report_sha256) or not _sha256(historical.checkpoint_sha256)
+            or not isinstance(historical.checkpoint_label, str) or not historical.checkpoint_label):
+        raise ValueError("An explicit historical reconstruction reference is required.")
+    reference_hash = content_hash(reference)
+
+    def verify_historical():
+        for path, digest in ((historical.report_path, historical.report_sha256),
+                             (historical.checkpoint_path, historical.checkpoint_sha256)):
+            if ("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in path.resolve().parts
+                    or path.is_symlink() or not path.is_file() or _digest(path) != digest):
+                raise ValueError("Historical reconstruction report or checkpoint is missing or changed.")
+
+    verify_historical()
+    historical_report = json.loads(historical.report_path.read_text(encoding="utf-8"))
+    historical_identity = historical_report.get("checkpoint") if isinstance(historical_report, dict) else None
+    if (not isinstance(historical_identity, dict) or historical_identity.get("arm") != "P0b"
+            or historical_identity.get("checkpoint_sha256") != historical.checkpoint_sha256
+            or historical_identity.get("checkpoint_label") != historical.checkpoint_label):
+        raise ValueError("Historical reconstruction report does not match the frozen reference.")
+
+    def check_reference_binding(selection: SelectedReconstruction) -> dict:
+        if any("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in path.resolve().parts
+               for path in (
+            selection.checkpoint_path, selection.manifest_path, selection.evaluation_dir,
+        )):
+            raise ValueError("The regenerating validation-v2 dataset is not permitted.")
+        state, _ = _checkpoint_state(selection.checkpoint_path)
+        if state.get("hashes", {}).get("reconstruction_reference") != reference_hash:
+            raise ValueError("Checkpoint does not bind the historical reconstruction reference.")
+        return state
+
+    state = check_reference_binding(candidate)
+    arm = state.get("arm")
+    if arm not in {"S1", "S2", "S3"} or (arm == "S1") != (s1 is None):
+        raise ValueError("S1 needs P0b only; S2 and S3 require both matched S1 and P0b.")
+    if s1 is not None:
+        if s1.selection_kind != "reconstruction" or check_reference_binding(s1).get("arm") != "S1":
+            raise ValueError("The matched S1 reference must be the reconstruction selection.")
+
+    def verified_measurement(selection: SelectedReconstruction) -> tuple[dict, str, Path]:
+        record = complete_selected_reconstruction(
+            selection.checkpoint_path, selection.journal, selection.manifest_path, selection.source_root,
+            selection.search_manifest, selection.diagnostic_manifest, selection.formal_config,
+            selection_kind=selection.selection_kind, evaluation_dir=selection.evaluation_dir,
+            guardrail_manifest=guardrail_manifest, guardrail_config=guardrail_config,
+            lpips_loss_fn=lpips_loss_fn,
+        )
+        directory = selection.evaluation_dir / f"guardrail-{selection.selection_kind}"
+        artifact = record["measurement"]
+        path = directory / artifact["path"]
+        if (path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(directory.resolve())
+                or _digest(path) != artifact["sha256"]):
+            raise ValueError("Selected reconstruction measurement is missing or changed.")
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(report, dict) or report.get("checkpoint") != record["checkpoint"]
+                or _digest(path) != artifact["sha256"]):
+            raise ValueError("Selected reconstruction report identity or contents changed.")
+        snapshot = (selection.checkpoint_path.parent / "selection" / "snapshots"
+                    / f"{record['checkpoint']['checkpoint_sha256']}.pt")
+        selected_state, digest = _checkpoint_state(snapshot)
+        if (digest != record["checkpoint"]["checkpoint_sha256"]
+                or selected_state.get("hashes", {}).get("reconstruction_reference") != reference_hash):
+            raise ValueError("Selected checkpoint does not bind the historical reconstruction reference.")
+        return report, artifact["sha256"], path
+
+    candidate_report, candidate_hash, candidate_path = verified_measurement(candidate)
+    if candidate_report["checkpoint"]["arm"] != arm:
+        raise ValueError("Selected reconstruction report has the wrong arm.")
+    references = {"P0b": historical_report}
+    inputs = {"candidate": candidate_hash, "P0b": historical.report_sha256}
+    s1_report: dict | None = None
+    s1_path: Path | None = None
+    if s1 is not None:
+        s1_report, s1_hash, s1_path = verified_measurement(s1)
+        candidate_identity, s1_identity = candidate_report["checkpoint"], s1_report["checkpoint"]
+        if (s1_identity.get("arm") != "S1" or any(
+            candidate_identity.get(key) != s1_identity.get(key) or not candidate_identity.get(key)
+            for key in ("run_id", "source_sha256", "target_sha256", "validation_manifest_sha256")
+        )):
+            raise ValueError("The S1 reference does not match the candidate run, source, target or validation.")
+        references["S1"], inputs["S1"] = s1_report, s1_hash
+    comparison = compare_reconstruction_guardrails(guardrail_manifest, candidate_report, references)
+    verify_historical()
+
+    def verify_selected(selection: SelectedReconstruction, report: dict, path: Path, digest: str) -> None:
+        selected = complete_selected_checkpoint(
+            selection.checkpoint_path, selection.journal, selection.manifest_path, selection.source_root,
+            selection.search_manifest, selection.diagnostic_manifest, selection.formal_config,
+            selection_kind=selection.selection_kind, evaluation_dir=selection.evaluation_dir,
+        )
+        if (selected["checkpoint"] != report["checkpoint"] or path.is_symlink()
+                or not path.is_file() or _digest(path) != digest):
+            raise ValueError("Selected checkpoint or reconstruction measurement changed during comparison.")
+
+    verify_selected(candidate, candidate_report, candidate_path, candidate_hash)
+    if s1 is not None and s1_report is not None and s1_path is not None:
+        verify_selected(s1, s1_report, s1_path, inputs["S1"])
+    directory = candidate.evaluation_dir / f"guardrail-{candidate.selection_kind}" / "comparisons"
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError("Reconstruction comparison directory must be a regular directory.")
+    directory.mkdir(exist_ok=True)
+    _sync_directory(directory.parent)
+    record = {
+        "schema": "streamed-reconstruction-comparison-v1",
+        "checkpoint": candidate_report["checkpoint"], "manifest_sha256": guardrail_manifest["manifest_sha256"],
+        "reference_sha256": reference_hash, "measurement_sha256": inputs,
+        "reference_checkpoints": {name: report["checkpoint"] for name, report in references.items()},
+        "comparison": comparison,
+        "limitation": (
+            "Numeric guardrail only; matched initialization/streams, reference provenance and adoption "
+            "require separate verification."
+        ),
+    }
+    record["sha256"] = content_hash(record)
+    matches = []
+    for path in directory.glob("*.json"):
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(previous, dict) or previous.get("schema") != record["schema"]
+                or previous.get("sha256") != content_hash({
+                    key: value for key, value in previous.items() if key != "sha256"
+                })):
+            raise ValueError("Reconstruction comparison record is invalid.")
+        if (previous.get("checkpoint") == record["checkpoint"]
+                and previous.get("reference_sha256") == reference_hash
+                and previous.get("measurement_sha256") == inputs):
+            matches.append(previous)
+    if len(matches) > 1 or (matches and matches[0] != record):
+        raise ValueError("Reconstruction comparison records are duplicated or inconsistent.")
+    if matches:
+        return matches[0]
+    _atomic_record(directory, record)
     return record
 
 

@@ -1,7 +1,9 @@
 import copy
 import hashlib
+import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +13,10 @@ import torch
 import zarr
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_epoch_runner import complete_selected_reconstruction
+from scripts.streamed_overlap_epoch_runner import (
+    HistoricalReconstruction, SelectedReconstruction, complete_reconstruction_comparison,
+    complete_selected_reconstruction,
+)
 from scripts.streamed_overlap_evaluation import _identity
 from scripts.streamed_overlap_guardrails import compare_reconstruction_guardrails
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
@@ -211,6 +216,153 @@ class SelectedReconstructionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checkpoint changed"):
                 self.run_measurement()
         self.assertEqual(list((self.evaluation / "guardrail-retrieval" / "completed").glob("*.json")), [])
+
+
+class SelectedComparisonTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.manifest = fixture_manifest()
+        p0b_checkpoint = self.root / "p0b.pt"
+        p0b_checkpoint.write_bytes(b"historical checkpoint")
+        checkpoint_hash = hashlib.sha256(p0b_checkpoint.read_bytes()).hexdigest()
+        report = measurement(self.manifest, "P0b", "f", 1.0)
+        report["checkpoint"]["checkpoint_sha256"] = checkpoint_hash
+        p0b_report = self.root / "p0b.json"
+        p0b_report.write_text(json.dumps(report))
+        self.historical = HistoricalReconstruction(
+            p0b_report, hashlib.sha256(p0b_report.read_bytes()).hexdigest(),
+            p0b_checkpoint, checkpoint_hash, "reconstruction-best",
+        )
+        self.reference_hash = content_hash({
+            "report_sha256": self.historical.report_sha256,
+            "checkpoint_sha256": checkpoint_hash,
+            "checkpoint_label": "reconstruction-best",
+        })
+        self.contexts, self.identities, self.states, self.records = {}, {}, {}, {}
+        self.make_selection("S3", "retrieval", 1.02)
+        self.make_selection("S1", "reconstruction", 1.0)
+        self.patches = [
+            patch("scripts.streamed_overlap_epoch_runner._checkpoint_state",
+                  side_effect=lambda path: self.states[path]),
+            patch("scripts.streamed_overlap_epoch_runner.complete_selected_reconstruction",
+                  side_effect=lambda path, *_args, **_kwargs: self.records[path]),
+            patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
+                  side_effect=lambda path, *_args, **_kwargs: {"checkpoint": self.identities[path]}),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def make_selection(self, arm, kind, scale):
+        root = self.root / arm
+        root.mkdir()
+        checkpoint = root / "last.pt"
+        checkpoint.write_bytes(arm.encode())
+        digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        snapshot = root / "selection" / "snapshots" / f"{digest}.pt"
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_bytes(checkpoint.read_bytes())
+        evaluation = root / "evaluation"
+        directory = evaluation / f"guardrail-{kind}" / "attempt"
+        directory.mkdir(parents=True)
+        identity = {
+            "arm": arm, "checkpoint_sha256": digest, "run_id": "run",
+            "attempt_id": "attempt", "step": 1, "epoch": 1, "experiment_seed": 2,
+            "source_sha256": "1" * 64, "target_sha256": "2" * 64,
+            "validation_manifest_sha256": "3" * 64,
+        }
+        report = measurement(self.manifest, arm, "a", scale)
+        report["checkpoint"] = identity
+        path = directory / "measurement.json"
+        path.write_text(json.dumps(report))
+        context = SelectedReconstruction(
+            checkpoint, object(), root / "validation.json", root, {}, {}, {}, evaluation, kind,
+        )
+        state = {"arm": arm, "hashes": {"reconstruction_reference": self.reference_hash}}
+        self.states[checkpoint] = (state, digest)
+        self.states[snapshot] = (state, digest)
+        self.contexts[arm] = context
+        self.identities[checkpoint] = identity
+        self.records[checkpoint] = {
+            "checkpoint": identity,
+            "measurement": {"path": "attempt/measurement.json",
+                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+        }
+
+    def compare(self, *, candidate="S3", s1=True):
+        return complete_reconstruction_comparison(
+            self.contexts[candidate], self.historical, s1=self.contexts["S1"] if s1 else None,
+            guardrail_manifest=self.manifest, guardrail_config={}, lpips_loss_fn=object(),
+        )
+
+    def test_comparison_uses_both_references_and_recovers(self):
+        result = self.compare()
+        self.assertEqual(result["comparison"]["status"], "PASS_NUMERIC_ONLY")
+        self.assertEqual(set(result["comparison"]["comparisons"]), {"S1", "P0b"})
+        self.assertEqual(result["reference_checkpoints"]["P0b"]["checkpoint_label"], "reconstruction-best")
+        self.assertEqual(result["reference_checkpoints"]["S1"], self.identities[self.contexts["S1"].checkpoint_path])
+        self.assertEqual(self.compare(), result)
+        directory = self.contexts["S3"].evaluation_dir / "guardrail-retrieval" / "comparisons"
+        self.assertEqual(len(list(directory.glob("*.json"))), 1)
+
+    def test_requires_matching_s1_and_unchanged_historical_reference(self):
+        with self.assertRaisesRegex(ValueError, "require both"):
+            self.compare(s1=False)
+        self.identities[self.contexts["S1"].checkpoint_path]["source_sha256"] = "4" * 64
+        report_path = self.contexts["S1"].evaluation_dir / "guardrail-reconstruction" / "attempt" / "measurement.json"
+        report = json.loads(report_path.read_text())
+        report["checkpoint"]["source_sha256"] = "4" * 64
+        report_path.write_text(json.dumps(report))
+        self.records[self.contexts["S1"].checkpoint_path]["measurement"]["sha256"] = hashlib.sha256(
+            report_path.read_bytes()
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.compare()
+        self.historical.checkpoint_path.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "missing or changed"):
+            self.compare()
+
+    def test_s1_uses_only_p0b_and_failed_guardrail_is_not_success(self):
+        result = self.compare(candidate="S1", s1=False)
+        self.assertEqual(set(result["comparison"]["comparisons"]), {"P0b"})
+        path = self.contexts["S3"].evaluation_dir / "guardrail-retrieval" / "attempt" / "measurement.json"
+        report = json.loads(path.read_text())
+        for item in report["datasets"]["real"]:
+            item["mae"] = 1.021
+        path.write_text(json.dumps(report))
+        self.records[self.contexts["S3"].checkpoint_path]["measurement"]["sha256"] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        self.assertEqual(self.compare()["comparison"]["status"], "FAIL")
+
+    def test_selected_snapshot_must_bind_the_reference(self):
+        context = self.contexts["S3"]
+        digest = self.identities[context.checkpoint_path]["checkpoint_sha256"]
+        snapshot = context.checkpoint_path.parent / "selection" / "snapshots" / f"{digest}.pt"
+        self.states[snapshot] = ({"arm": "S3", "hashes": {"reconstruction_reference": "f" * 64}}, digest)
+        with self.assertRaisesRegex(ValueError, "Selected checkpoint does not bind"):
+            self.compare()
+
+    def test_comparison_rejects_regenerating_validation_paths_before_loading(self):
+        context = replace(
+            self.contexts["S3"], checkpoint_path=self.root / "fake_data_validation_v2" / "last.pt",
+        )
+        with patch("scripts.streamed_overlap_epoch_runner._checkpoint_state") as load:
+            with self.assertRaisesRegex(ValueError, "validation-v2"):
+                complete_reconstruction_comparison(
+                    context, self.historical, s1=self.contexts["S1"], guardrail_manifest=self.manifest,
+                    guardrail_config={}, lpips_loss_fn=object(),
+                )
+            load.assert_not_called()
+
+    def test_comparison_rejects_changed_completed_record(self):
+        self.compare()
+        directory = self.contexts["S3"].evaluation_dir / "guardrail-retrieval" / "comparisons"
+        next(directory.glob("*.json")).write_text("{}")
+        with self.assertRaisesRegex(ValueError, "comparison record is invalid"):
+            self.compare()
 
 
 class FixtureLPIPS(SliceLPIPSLoss):
@@ -436,6 +588,73 @@ class ReconstructionProducerTests(unittest.TestCase):
             patches[0, 0, 0, 0] = 123
             with self.assertRaisesRegex(ValueError, "differs from its frozen"):
                 measure()
+
+    def test_selected_s1_comparison_uses_real_fixture_measurements(self):
+        manifest = self.freeze()
+        p0b = self.measure(manifest)
+        p0b_report = self.root / "p0b.json"
+        p0b_report.write_text(json.dumps(p0b))
+        historical = HistoricalReconstruction(
+            p0b_report, hashlib.sha256(p0b_report.read_bytes()).hexdigest(),
+            self.checkpoint, self.digest, "reconstruction-best",
+        )
+        reference_hash = content_hash({
+            "report_sha256": historical.report_sha256, "checkpoint_sha256": self.digest,
+            "checkpoint_label": historical.checkpoint_label,
+        })
+        config = {"manifest_sha256": manifest["manifest_sha256"], "device": "cpu", "max_wall_seconds": 60}
+        model = StreamedPairVAE(FixtureVAE(), "S1")
+        checkpoint = self.root / "last.pt"
+        state = {
+            "schema": "streamed-epoch-state-v1", "arm": "S1", "completed_epoch": 1,
+            "batches_per_epoch": 1, "model": model.state_dict(),
+            "sampler": {"split": "train", "batches_drawn": 1, "source_manifest_hash": "b" * 64},
+            "hashes": {
+                "validation_manifest": "a" * 64, "source": "b" * 64, "config": "c" * 64,
+                "target": "d" * 64, "reconstruction_guardrail": content_hash(config),
+                "reconstruction_reference": reference_hash,
+            },
+            "journal": {"event_id": "event-1", "logical_step": 1, "cumulative_exposure": 12},
+        }
+        torch.save(state, checkpoint)
+        digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        snapshots = self.root / "selection" / "snapshots"
+        snapshots.mkdir(parents=True)
+        (snapshots / f"{digest}.pt").write_bytes(checkpoint.read_bytes())
+        (self.root / "best_reconstruction.pt").write_bytes(checkpoint.read_bytes())
+        evaluation = self.root / "evaluation"
+        evaluation.mkdir()
+        journal = BatchJournal(self.root / "batch.csv", STEP_FIELDS, create=True)
+        self.addCleanup(journal.close)
+        journal.reconcile(watermark=None, attempt_id="attempt-1", expected_step=0, expected_exposure=0)
+        row: dict[str, object] = dict.fromkeys(STEP_FIELDS, "")
+        row.update({
+            "sequence": 1, "event_id": "event-1", "attempt_id": "attempt-1",
+            "logical_step": 1, "completed_pairs": 12, "cumulative_exposure": 12,
+            "run_id": "run-1", "arm": "S1", "seed": 3, "epoch": 1, "batch_index": 1,
+        })
+        journal.append(row)
+        identity = _identity(state, digest, journal, "a" * 64)
+        selection = SelectedReconstruction(
+            checkpoint, journal, self.root / "validation.json", self.root,
+            {}, {}, {"device": "cpu"}, evaluation, "reconstruction",
+        )
+
+        def factory(arm, model_seed, head_seed):
+            del model_seed, head_seed
+            return StreamedPairVAE(FixtureVAE(), arm)
+
+        with patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
+                   return_value={"checkpoint": identity}), \
+             patch("scripts.streamed_overlap_reconstruction.load_manifest",
+                   return_value={"manifest_sha256": "a" * 64}), \
+             patch("scripts.streamed_overlap_reconstruction.fresh_e1_model", side_effect=factory):
+            result = complete_reconstruction_comparison(
+                selection, historical, s1=None, guardrail_manifest=manifest,
+                guardrail_config=config, lpips_loss_fn=self.lpips,
+            )
+        self.assertEqual(result["comparison"]["status"], "PASS_NUMERIC_ONLY")
+        self.assertEqual(result["comparison"]["comparisons"]["P0b"]["checkpoint_sha256"], self.digest)
 
     def test_synthetic_smoke_loads_a_real_tokenizer_adapter(self):
         manifest = self.freeze()
