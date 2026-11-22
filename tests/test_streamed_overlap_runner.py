@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from scripts import streamed_overlap_runner as runner
+from scripts import streamed_overlap_integration_smoke as integration_smoke
 from scripts.streamed_overlap_smoke import _validate_config
 from test_streamed_overlap_audit import make_source
 from scripts.streamed_overlap_audit import DEFAULT_SEISMIC_KEY
@@ -222,6 +223,41 @@ class AuditAttemptTests(unittest.TestCase):
             config["source_root"] = str(forbidden)
             with self.assertRaisesRegex(ValueError, "validation-v2"):
                 _validate_config(config, root / "output")
+
+    def test_integration_smoke_rejects_invalid_inputs_before_running(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sources"
+            source.mkdir()
+            manifest_path = root / "manifest.json"
+            manifest_path.touch()
+            config = {
+                "source_root": str(source), "seed": 1, "sparse_probability": 0.5,
+                "mps_memory_fraction": 0.5, "max_wall_seconds": 30,
+                "validation_manifest": str(manifest_path), "validation_manifest_sha256": "a" * 64,
+                "reconstruction_query_ids": ["eligible"], "encode_batch_size": 4,
+                "reconstruction_batch_size": 1,
+            }
+            with mock.patch.object(integration_smoke, "load_manifest",
+                                   return_value={"manifest_sha256": "a" * 64}), \
+                 mock.patch.object(integration_smoke, "_eligible_queries",
+                                   return_value=[{"id": "eligible"}]), \
+                 mock.patch.dict("os.environ", {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+                self.assertEqual(integration_smoke._config(config, root / "output")[0], source.resolve())
+                for changes in (
+                    {"validation_manifest_sha256": "b" * 64},
+                    {"reconstruction_query_ids": ["missing"]},
+                    {"reconstruction_query_ids": ["eligible", "eligible"]},
+                    {"encode_batch_size": 0},
+                    {"reconstruction_batch_size": True},
+                ):
+                    with self.subTest(changes=changes), self.assertRaises(ValueError):
+                        integration_smoke._config({**config, **changes}, root / "output")
+                with self.assertRaisesRegex(ValueError, "validation-v2"):
+                    integration_smoke._config(config, root / "fake_data_validation_v2" / "output")
+                with mock.patch.dict("os.environ", {"PYTORCH_ENABLE_MPS_FALLBACK": "1"}):
+                    with self.assertRaisesRegex(ValueError, "fallback"):
+                        integration_smoke._config(config, root / "output")
 
     def test_smoke_child_cannot_claim_success_with_optimizer_step(self):
         with tempfile.TemporaryDirectory() as temporary:

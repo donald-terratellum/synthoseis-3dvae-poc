@@ -236,8 +236,7 @@ budgeted before launch. The checkpoint volume does not support hard links; a loc
 probe confirmed file/directory fsync and atomic replacement.
 
 The independent-seed provenance check, remaining diagnostic reports, bounded
-tokenizer searches, full runner wiring and an optimizer/epoch/recovery MPS smoke remain.
-Keep launch modes blocked.
+tokenizer searches and full runner wiring remain. Keep launch modes blocked.
 The existing interrupted-checkpoint/replay fixture now also runs on MPS: it uses
 a small synthetic S3 model and synthetic pairs, exercises optimizer steps, epoch
 logging, an injected checkpoint failure and deterministic replay, and never opens
@@ -251,6 +250,37 @@ to train.
 STREAMED_MPS_SMOKE=1 .venv/bin/python -m pytest -q \
   tests/test_streamed_overlap_step.py -k synthetic_epoch_recovery_on_mps
 ```
+The standalone disposable real-data integration smoke now also exercises a full-size
+fresh S3 E1 model on MPS: one 12-pair optimizer step, an injected interruption,
+epoch-boundary checkpoint restoration and replay, fixed train/validation monitors,
+the source-verified 300-query primary validation callback, epoch CSV/TensorBoard,
+and reconstruction checkpoint selection. It explicitly does not score a pair head
+as retrieval or establish a matched S1 reference. It is not wired into the production
+runner and does not implement its train/resume/evaluate modes.
+
+Run `disposable-integration-smoke-20261122-02` used a 0.5 MPS memory fraction, a
+single fixed validation reconstruction query and encode batch size 4, all smoke-only
+settings. It passed in 287.93 seconds including startup, with 1,945,108,480 bytes
+peak RSS, 4,281,207,304 bytes peak macOS memory footprint and 2,329,804,800 bytes
+MPS driver allocation sampled afterward. The last measurement is not a peak-MPS
+measurement; this is not a full-training resource forecast. The selected
+reconstruction alias matched `last.pt`; the persisted report SHA-256 is
+`e18323a07a1dcbeccfa9eb59310dc23ae6ffa253374aa8ede5663c7715d296b1`.
+The 900-second wall-time setting rejects a late result but is not a hard watchdog.
+
+To repeat with a new disposable output directory, provide a private JSON config
+containing `source_root`, `seed`, `sparse_probability`, `mps_memory_fraction`,
+`max_wall_seconds`, `validation_manifest`, `validation_manifest_sha256`,
+`reconstruction_query_ids`, `encode_batch_size` and `reconstruction_batch_size`:
+
+```sh
+.venv/bin/python -u -m scripts.streamed_overlap_integration_smoke \
+  --config <private-smoke-config.json> --output <new-disposable-output-directory>
+```
+
+The code checks the frozen manifest and query IDs before an optimizer step, excludes
+the regenerating validation-v2 dataset, and rejects MPS CPU fallback. Smoke budgets
+and outputs must not be used as approved production settings or scientific results.
 Fourteen synthetic evaluator, selection and guardrail tests used temporary files
 on the checkpoint volume and took 4.06 seconds and about 343 MiB peak RSS
 including startup. This is not a real-data runtime or memory estimate.
