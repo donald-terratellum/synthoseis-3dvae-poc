@@ -4,6 +4,30 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+An opt-in `prepare_arm_initial_checkpoints` helper now prepares a fresh arm
+without an optimizer step. It requires a locked, reconciled, empty step journal,
+the hash-bound matching configuration, fresh seeded E1 model and sampler, and
+fresh approved optimizer, scheduler and early-stopping state. It publishes
+separate byte-identical epoch-zero `initial.pt` and `last.pt`, verifies them,
+and reuses a verified initial snapshot if `last.pt` was never created. Existing
+unrelated or mismatched checkpoints are not overwritten. Source and run
+directories must be separate, and validation-v2 remains excluded.
+
+The checkpoint volume is ExFAT: hard links and exclusive rename to a new name
+are unavailable. Publication uses exclusive file creation, fsync and digest
+verification instead. This is **not atomic**: a hard interruption can leave
+partial checkpoints or temporary files. Partial checkpoints fail closed and
+are preserved for investigation; do not assume automatic recovery or delete
+them without checking their provenance. In-process failures clean up only the
+destination inode created by that attempt. A disposable synthetic ExFAT smoke
+completed in 0.40 seconds at 418,873,344 bytes peak RSS, with two distinct
+15,250,225-byte checkpoints, zero optimizer steps, and subsequent cleanup.
+This is not a training-resource estimate. The helper is not a suite runner or
+a training authorization; it does not persist the complete suite configuration.
+The portable streamed suite passed 195 tests, with one skipped and 42 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`; `.venv/bin/uv`
+was unavailable.
+
 The per-arm runner and matched-record verifier now require a hash-bound
 `streamed-matching-config-v1`, stored in each checkpoint as `hashes["matching"]`.
 It explicitly names the run and experiment seed, model/head/sampler seeds,
