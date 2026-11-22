@@ -45,7 +45,8 @@ from scripts.streamed_overlap_search import run_bounded_searches, verify_search_
 from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
 from scripts.train import (
-    EarlyStoppingState, initialize_streamed_epoch_metrics, streamed_monitor_hash, train_streamed_epoch,
+    EarlyStoppingState, SliceLPIPSLoss, initialize_streamed_epoch_metrics, streamed_monitor_hash,
+    train_streamed_epoch,
 )
 from src.tokenizer.core.model_adapter import choose_torch_device
 
@@ -569,6 +570,65 @@ def _validate_epoch_inputs(
         raise ValueError("Fixed monitor inputs differ from the frozen monitor hash.")
     if lpips_fingerprint(lpips_loss_fn) != guardrail_manifest["protocol"]["lpips_sha256"]:
         raise ValueError("LPIPS does not match the frozen reconstruction guardrail.")
+
+
+def prepare_epoch_inputs(
+    *, manifest_path: Path, source_root: Path, hashes: dict, guardrail_manifest: dict,
+    matching_config: dict, epoch_validation: dict,
+) -> tuple[dict, StreamedEpochValidator, SliceLPIPSLoss, dict[str, str]]:
+    """Build fixed monitors and epoch validation without advancing a training sampler."""
+    matching_config_hash(matching_config)
+    required = {"reconstruction_query_ids", "encode_batch_size", "reconstruction_batch_size", "max_wall_seconds"}
+    if not isinstance(epoch_validation, dict) or set(epoch_validation) != required:
+        raise ValueError("Explicit epoch validation queries, batch sizes and wall limit are required.")
+    ids = epoch_validation["reconstruction_query_ids"]
+    if (not isinstance(ids, list) or not ids or any(not isinstance(item, str) or not item for item in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError("Reconstruction query IDs must be an explicit list of unique nonempty strings.")
+    if (not isinstance(manifest_path, Path) or not isinstance(source_root, Path)
+            or "fake_data_validation_v2" in manifest_path.parts or "fake_data_validation_v2" in source_root.parts):
+        raise ValueError("Explicit primary validation and source paths are required.")
+    root = source_root.resolve(strict=True)
+    path = manifest_path.resolve(strict=True)
+    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
+    if ("fake_data_validation_v2" in root.parts or "fake_data_validation_v2" in path.parts
+            or forbidden.is_relative_to(root) or not root.is_dir() or not path.is_file()
+            or path.is_relative_to(root)):
+        raise ValueError("Validation manifest and source paths must exclude validation-v2 and be separate.")
+    manifest = load_manifest(path)
+    if (manifest.get("manifest_sha256") != hashes.get("validation_manifest")
+            or manifest.get("target_implementation_sha256") != hashes.get("target")):
+        raise ValueError("The validation manifest or target differs from the frozen suite.")
+    if not set(ids) <= {query["id"] for query in _eligible_queries(manifest)}:
+        raise ValueError("Reconstruction queries must belong to the frozen eligible manifest.")
+    if not torch.backends.mps.is_available() or os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "0":
+        raise RuntimeError("Preparing streamed epoch inputs requires MPS without CPU fallback.")
+    with torch.random.fork_rng(devices=[]):
+        lpips = SliceLPIPSLoss().to("mps").eval()
+    if lpips_fingerprint(lpips) != guardrail_manifest["protocol"]["lpips_sha256"]:
+        raise ValueError("LPIPS does not match the frozen reconstruction guardrail.")
+    validator = StreamedEpochValidator(
+        manifest_path, source_root, manifest_sha256=manifest["manifest_sha256"],
+        reconstruction_query_ids=tuple(ids), reconstruction_seed=matching_config["validation_seed"],
+        encode_batch_size=epoch_validation["encode_batch_size"],
+        reconstruction_batch_size=epoch_validation["reconstruction_batch_size"],
+        max_wall_seconds=epoch_validation["max_wall_seconds"], lpips_loss_fn=lpips,
+    )
+    samplers = {
+        split: StreamedPairSampler(root, split, matching_config["monitor_seed"])
+        for split in ("train", "validation")
+    }
+    if any(sampler.source_manifest_hash != hashes.get("source") for sampler in samplers.values()):
+        raise ValueError("Monitor samplers do not match the frozen source manifest.")
+    batches = {
+        split: sampler.load_batch(sampler.next_specs(), sparse_probability=matching_config["sparse_probability"])
+        for split, sampler in samplers.items()
+    }
+    observed = {"monitor": streamed_monitor_hash(batches), "epoch_validation": validator.config_sha256}
+    for key, value in observed.items():
+        if key in hashes and hashes[key] != value:
+            raise ValueError(f"Prepared {key} differs from the frozen suite.")
+    return batches, validator, lpips, observed
 
 
 def _reference_hash(historical: HistoricalReconstruction) -> str:
@@ -1134,7 +1194,8 @@ def run_suite_epochs(
 
 
 def run_suite(
-    suite_dir: Path, *, resume: bool, attempt_id: str, monitor_batches: dict, validate_epoch, lpips_loss_fn,
+    suite_dir: Path, *, resume: bool, attempt_id: str, monitor_batches: dict | None = None,
+    validate_epoch=None, lpips_loss_fn=None, epoch_validation: dict | None = None,
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
     historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
@@ -1147,6 +1208,16 @@ def run_suite(
         character in attempt_id for character in "\r\n"
     ):
         raise ValueError("An explicit fresh/resume mode and single-line attempt ID are required.")
+    if epoch_validation is not None:
+        if any(value is not None for value in (monitor_batches, validate_epoch, lpips_loss_fn)):
+            raise ValueError("Provide either epoch validation settings or prepared epoch inputs, not both.")
+        monitor_batches, validate_epoch, lpips_loss_fn, _ = prepare_epoch_inputs(
+            manifest_path=manifest_path, source_root=source_root, hashes=hashes,
+            guardrail_manifest=guardrail_manifest, matching_config=matching_config,
+            epoch_validation=epoch_validation,
+        )
+    if not isinstance(monitor_batches, dict):
+        raise ValueError("Fixed monitor batches or explicit epoch validation settings are required.")
     _validate_suite_inputs(
         monitor_batches=monitor_batches, validate_epoch=validate_epoch, lpips_loss_fn=lpips_loss_fn,
         manifest_path=manifest_path, source_root=source_root, search_manifest=search_manifest,

@@ -4,6 +4,35 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+`run_suite` can now construct its fixed train/validation monitors, frozen
+epoch validator and LPIPS directly from explicit `epoch_validation` settings:
+`reconstruction_query_ids`, `encode_batch_size`, `reconstruction_batch_size`
+and `max_wall_seconds`. Monitor samplers use `monitor_seed` and are separate
+from the training sampler; the validator uses `validation_seed`. LPIPS must
+match the frozen guardrail fingerprint. The existing prepared-input interface
+is still supported, but cannot be mixed with these settings.
+
+Before freezing the complete launch configuration, callers can use
+`prepare_epoch_inputs` with the same paths, matching configuration, settings,
+guardrail manifest, and source/target/validation-manifest hashes. Its fourth
+return value supplies the `monitor` and `epoch_validation` hashes to bind into
+the suite hashes. `run_suite` reconstructs and checks both hashes on fresh runs
+and resumes; changed monitor batches or validation settings fail instead of
+silently changing the monitors. Preparation reads bounded training and primary-validation pairs; it
+does not train or run validation. The caller must enforce MPS memory limits,
+resource and approval gates before invoking it. This is not a runnable launch
+command: the complete configuration, other frozen inputs, durable launch log,
+resource evidence and explicit training approval are still outstanding.
+
+Synthetic sampler, epoch, suite and joint-step tests passed 77 tests, with one
+skipped and 29 subtests, using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_sampler.py tests/test_streamed_overlap_epoch_runner.py
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_step.py`.
+They took 39.98 seconds and 799,916,032 bytes peak RSS including startup.
+The new preparation integration used real sampler/augmentation code over
+synthetic arrays, with LPIPS and MPS mocked; it is not a training-resource
+measurement. No real data or optimizer step was used for this change.
+
 After all three arms complete, the suite now writes
 `mu_cosine_comparisons.json` in the suite directory using existing checkpoint
 evaluations. It reports S2-S1, S3-S1 and S3-S2 NDCG@10 differences with paired

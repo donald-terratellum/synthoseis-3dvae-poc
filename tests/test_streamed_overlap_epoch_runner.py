@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import torch
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_augmentation import ViewTransform
@@ -14,7 +15,7 @@ from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
     complete_epoch,
-    complete_selected_checkpoint, run_arm_epochs, run_suite, suite_workload,
+    complete_selected_checkpoint, prepare_epoch_inputs, run_arm_epochs, run_suite, suite_workload,
 )
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
 from scripts.streamed_overlap_targets import Window
@@ -85,6 +86,93 @@ class EpochInputBindingTests(unittest.TestCase):
         self.validator.encode_batch_size += 1
         with self.assertRaisesRegex(ValueError, "changed after it was frozen"):
             self.validator(object())
+
+    def test_prepares_repeatable_epoch_inputs_from_separate_monitor_samplers(self):
+        self.manifest_path.touch()
+        source = self.root / "source"
+        source.mkdir()
+        hashes = {"source": "a" * 64, "validation_manifest": "b" * 64, "target": "d" * 64}
+        manifest = {"manifest_sha256": hashes["validation_manifest"], "target_implementation_sha256": hashes["target"]}
+        matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "test", "experiment_seed": 1,
+            "model_seed": 2, "head_seed": 3, "sampler_seed": 4, "monitor_seed": 5, "validation_seed": 6,
+            "final_epoch": 2, "batches_per_epoch": 3, "sparse_probability": 0.5,
+        }
+        settings = {
+            "reconstruction_query_ids": ["query"], "encode_batch_size": 4,
+            "reconstruction_batch_size": 2, "max_wall_seconds": 60,
+        }
+        lpips = Mock()
+        lpips.to.return_value.eval.return_value = lpips
+        samplers = []
+
+        def sampler_factory(root, split, seed):
+            self.assertEqual((root, seed), (source.resolve(), matching["monitor_seed"]))
+            sampler = Mock(source_manifest_hash=hashes["source"])
+            sampler.next_specs.return_value = f"{split}-specs"
+            sampler.load_batch.return_value = self.monitor[split]
+            samplers.append(sampler)
+            return sampler
+
+        arguments = {
+            "manifest_path": self.manifest_path, "source_root": source, "hashes": hashes,
+            "guardrail_manifest": self.guardrail, "matching_config": matching, "epoch_validation": settings,
+        }
+        with patch("scripts.streamed_overlap_epoch_runner.load_manifest", return_value=manifest), \
+             patch("scripts.streamed_overlap_epoch_runner._eligible_queries", return_value=[{"id": "query"}]), \
+             patch("scripts.streamed_overlap_epoch_runner.torch.backends.mps.is_available", return_value=True), \
+             patch("scripts.streamed_overlap_epoch_runner.SliceLPIPSLoss",
+                   side_effect=lambda: (torch.rand(1), lpips)[1]), \
+             patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler", side_effect=sampler_factory):
+            rng = torch.get_rng_state()
+            batches, validator, loss, observed = prepare_epoch_inputs(**arguments)
+            self.assertTrue(torch.equal(torch.get_rng_state(), rng))
+            self.assertIs(loss, lpips)
+            self.assertEqual(batches, self.monitor)
+            self.assertEqual(validator.reconstruction_seed, matching["validation_seed"])
+            self.assertEqual(observed, {
+                "monitor": streamed_monitor_hash(self.monitor), "epoch_validation": validator.config_sha256,
+            })
+            _, _, _, repeated = prepare_epoch_inputs(**{**arguments, "hashes": {**hashes, **observed}})
+            self.assertEqual(repeated, observed)
+            for sampler in samplers:
+                sampler.next_specs.assert_called_once_with()
+                sampler.load_batch.assert_called_once_with(
+                    sampler.next_specs.return_value, sparse_probability=matching["sparse_probability"],
+                )
+            with self.assertRaisesRegex(ValueError, "Prepared monitor differs"):
+                prepare_epoch_inputs(**{**arguments, "hashes": {**hashes, "monitor": "e" * 64}})
+            with self.assertRaisesRegex(ValueError, "Prepared epoch_validation differs"):
+                prepare_epoch_inputs(**{
+                    **arguments, "hashes": {**hashes, **observed},
+                    "epoch_validation": {**settings, "reconstruction_batch_size": 3},
+                })
+            with self.assertRaisesRegex(ValueError, "eligible manifest"):
+                prepare_epoch_inputs(**{**arguments, "epoch_validation": {
+                    **settings, "reconstruction_query_ids": ["not-eligible"],
+                }})
+
+    def test_suite_connects_explicit_epoch_settings_before_bootstrap(self):
+        prepared = (self.monitor, self.validator, self.lpips, {})
+        arguments = {
+            "resume": False, "attempt_id": "test", "manifest_path": self.manifest_path,
+            "source_root": self.root, "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": {}, "guardrail_manifest": self.guardrail, "guardrail_config": {},
+            "historical": object(), "matching_config": {}, "hashes": self.hashes,
+            "epoch_validation": {"settings": "fixture"},
+        }
+        with patch("scripts.streamed_overlap_epoch_runner.prepare_epoch_inputs", return_value=prepared) as prepare, \
+             patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs",
+                   side_effect=ValueError("stop before bootstrap")) as validate:
+            with self.assertRaisesRegex(ValueError, "stop before bootstrap"):
+                run_suite(self.root / "suite", **arguments)
+            prepare.assert_called_once()
+            self.assertIs(validate.call_args.kwargs["monitor_batches"], self.monitor)
+            self.assertIs(validate.call_args.kwargs["validate_epoch"], self.validator)
+            self.assertIs(validate.call_args.kwargs["lpips_loss_fn"], self.lpips)
+            self.assertFalse((self.root / "suite").exists())
+            with self.assertRaisesRegex(ValueError, "either epoch validation"):
+                run_suite(self.root / "suite", **{**arguments, "monitor_batches": self.monitor})
 
 
 class SuiteWorkloadTests(unittest.TestCase):

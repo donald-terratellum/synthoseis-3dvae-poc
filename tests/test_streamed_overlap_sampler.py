@@ -1,12 +1,13 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
 from scripts.streamed_overlap_audit import LABEL_KEYS, Source, canonical_overlap
 from scripts.streamed_overlap_augmentation import ViewTransform, spatial_view
+from scripts.streamed_overlap_epoch_runner import prepare_epoch_inputs
 from scripts.streamed_overlap_sampler import GEOLOGY_SEEDS, StreamedPairSampler
 from scripts.streamed_overlap_targets import Window
 from scripts.streamed_overlap_yield import SEISMIC_KEY
@@ -126,6 +127,43 @@ class StreamedSamplerTests(unittest.TestCase):
         self.assertEqual(original.unavailable_reasons, replay.unavailable_reasons)
         for field in ("input_a", "input_b", "dense_a", "overlap", "coverage", "coverage_valid"):
             np.testing.assert_array_equal(getattr(original, field), getattr(replay, field))
+
+    def test_epoch_inputs_recreate_real_sampler_batches_without_advancing_training(self):
+        training_sampler = self.sampler()
+        initial_state = training_sampler.state_dict()
+        source_hash = training_sampler.source_manifest_hash
+        matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "test", "experiment_seed": 1,
+            "model_seed": 2, "head_seed": 3, "sampler_seed": 41, "monitor_seed": 5, "validation_seed": 6,
+            "final_epoch": 2, "batches_per_epoch": 3, "sparse_probability": 0.5,
+        }
+        manifest = {"manifest_sha256": "b" * 64, "target_implementation_sha256": "d" * 64}
+        lpips = Mock()
+        lpips.to.return_value.eval.return_value = lpips
+        with tempfile.TemporaryDirectory() as manifest_directory:
+            path = Path(manifest_directory) / "manifest.json"
+            path.touch()
+            arguments = {
+                "manifest_path": path, "source_root": self.root,
+                "hashes": {"source": source_hash, "validation_manifest": "b" * 64, "target": "d" * 64},
+                "guardrail_manifest": {"protocol": {"lpips_sha256": "c" * 64}}, "matching_config": matching,
+                "epoch_validation": {"reconstruction_query_ids": ["query"], "encode_batch_size": 4,
+                                     "reconstruction_batch_size": 2, "max_wall_seconds": 60},
+            }
+            with patch("scripts.streamed_overlap_epoch_runner.load_manifest", return_value=manifest), \
+                 patch("scripts.streamed_overlap_epoch_runner._eligible_queries", return_value=[{"id": "query"}]), \
+                 patch("scripts.streamed_overlap_epoch_runner.torch.backends.mps.is_available", return_value=True), \
+                 patch("scripts.streamed_overlap_epoch_runner.SliceLPIPSLoss", return_value=lpips), \
+                 patch("scripts.streamed_overlap_epoch_runner.lpips_fingerprint", return_value="c" * 64):
+                first, _, _, observed = prepare_epoch_inputs(**arguments)
+                second, _, _, repeated = prepare_epoch_inputs(**{**arguments, "hashes": {
+                    **arguments["hashes"], **observed,
+                }})
+            self.assertEqual(observed, repeated)
+            for split in ("train", "validation"):
+                np.testing.assert_array_equal(first[split].input_a, second[split].input_a)
+                self.assertEqual(first[split].provenance, second[split].provenance)
+            self.assertEqual(training_sampler.state_dict(), initial_state)
 
     def test_shared_recorded_geology_seed_across_splits_fails_closed(self):
         train = self.sources[0]
