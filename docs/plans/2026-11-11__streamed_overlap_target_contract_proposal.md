@@ -512,3 +512,107 @@ age-range support, applicable generator/fluid provenance, source-noise filtering
 transient handling, valid-target yield, and evaluation eligibility/thresholds remain
 unresolved as listed in the machine-readable contract. Do not generate semantic labels
 or launch training until those decisions are reviewed and approved.
+
+## 8. Bounded detector and filter-context diagnostics (recommendations are unapproved)
+
+Run `streamed-overlap-target-audit-20261121-03` contains a bounded sensitivity probe.
+It selected 12 training and 6 validation sources spread across each split, read one
+random full-depth `(50,50,Z)` seismic chunk per source, and sampled 25 traces per source:
+450 traces total and 269,820,000 requested bytes. No final-test source, semantic target
+generation, or model training was involved. Aggregate results and the exact sample
+manifest are local in `event_detector_diagnostics.json`.
+
+The probe used SciPy local maxima on each full original trace and on its negation
+(troughs), varying prominence as a fraction of that trace's standard deviation and
+minimum peak spacing. Counts are peaks plus troughs per 1,499-sample trace:
+
+| Prominence | Train p10 / median / p90 | Validation p10 / median / p90 | Median events per 64 samples (train / validation) |
+|---:|---:|---:|---:|
+| 0.25 SD | 112 / 150 / 164 | 110 / 160 / 211 | 6.4 / 6.8 |
+| 0.50 SD | 94 / 117 / 134 | 82 / 123 / 166 | 5.0 / 5.2 |
+| 0.75 SD | 77 / 98 / 113 | 67 / 99 / 139 | 4.2 / 4.2 |
+| 1.00 SD | 62 / 83 / 97 | 51 / 84 / 120 | 3.5 / 3.6 |
+
+No sampled full trace had a zero denominator at these candidate settings. Changing
+minimum spacing from 2 to 4 samples barely changed counts; spacing 6 removed only a
+small number. At 0.50 SD and spacing 3, the median event density in the first/last 64
+samples was 0.25 of interior density in training and 0.44 in validation; the probe did
+not show an event-density spike at source ends. This is a small, deliberately bounded
+sensitivity sample, not ground truth or an estimate of final pair-target yield.
+
+**Recommended detector for owner review:** prominence `0.50 * std(full original trace)`,
+minimum same-polarity spacing of 2 samples, detect positive peaks and negative peaks
+separately on each full source trace before counting events in the canonical overlap.
+Use no artificial crop-edge padding or fixed source-edge exclusion; the detector sees
+the whole trace, and SciPy does not classify the first/last sample as a local peak.
+Keep an explicit nonfinite/zero-scale invalid reason. This moderate setting retains
+about five events per 64 samples in the probe; the data do not establish that it is the
+geologically best prominence, so it remains unapproved.
+
+### Generator-derived index relationship
+
+The 205 source configs record `cube_shape=(300,300,1500)`, `pad_samples=10`,
+`infill_factor=10`, 4 ms sampling and order-4 filters. The current generator constructs
+faulted age/lithology/N/G on the `(300,300,1510)` padded grid. Its property builder uses
+those voxel indices, then trims elastic-property volumes to the first 1,500 samples.
+Zoeppritz reflectivity has 1,499 Z samples because each reflectivity is computed between
+adjacent property samples `z` and `z+1`; filtering and cumulative summation retain this
+length. The plausible coordinate convention is therefore native XYZ, with a seismic
+sample index anchoring the corresponding same-index property/label cell interval;
+never use the padded label tail `1500:1510`. Peaks and troughs in the filtered,
+cumulative trace are not one-to-one geological interfaces.
+
+This generator path is stronger indexing evidence than the old offset heuristic, but
+its persisted per-source worktree is not proven. The heuristic sampled eight sources
+per split: envelope peaks averaged at offset +2 in both splits, but signed-derivative
+curves averaged at +1 in training and -4 in validation; per-volume estimates varied
+widely and often hit the ±15-sample search boundary. It reports `verified=false` and
+must not be treated as an alignment proof. **Recommended mapping for review:** use
+same-index label support for each native crop interval, clip to the non-padded
+property-support range, and do not shift events by the heuristic +1 or +2.
+
+### Fluid validity, noise, and evaluation recommendations
+
+- **Fluid proxy:** all 205 sources have `faulted_net_to_gross`, channel labels, and the
+  three closure arrays, but no `faults/faulted_channel_ng`. Three selected full-volume
+  label scans found binary, mutually exclusive closure masks and channel/hydrocarbon
+  overlaps; they did not verify final elastic properties or all sources. The recorded
+  generator commit is common across sources, while the nearby checkout has unrecorded
+  dirty edits that predate the observed source metadata times. Recommended: retain the
+  already-approved coarse oil/gas/other closure-fraction formula; treat it explicitly
+  as a closure-label proxy (not measured fluid properties), never infer exhaustive
+  brine from `brine_closures`, and make selected-support mask conflicts/non-finite
+  values unavailable. Owner must decide whether this proxy is acceptable despite
+  incomplete generation-time provenance or whether that provenance blocks all such
+  targets.
+- **Added noise:** source metadata spans 3.03–6.00 Hz low cut and 22.69–44.92 Hz high
+  cut, all at 4 ms and filter order 4. The generator uses depth-only zero-phase
+  Butterworth/Gustafsson filtering. The same pole-decay calculation gives per-source
+  impulse-response lengths 446–853 samples (median 589; about 1.8–3.4 seconds).
+  Recommended: preserve the plan's 0.5 application probability and 12–30 dB SNR;
+  generate independent noise in seismic-amplitude space after spatial transforms,
+  filter it with that source's band/order, provide at least its computed `irlen` of
+  random context on each side before taking the crop, then scale it to
+  `10**(-SNR/20)` times pre-noise RMS. Do not re-filter the source signal. A non-finite
+  or exactly zero RMS has no defined SNR; emit an explicit invalid reason and resample
+  or fail, not a silent fallback. The context calculation and low-energy policy require
+  owner approval.
+- **Evaluation:** keep directional pair-head NDCG@10 primary and report mu-cosine
+  separately; also report physical-overlap and event-fraction MAE/RMSE/bias/calibration.
+  Freeze the candidate manifest and require every relevance label to be known. NDCG
+  queries need a valid positive; cross-volume and same-source-disjoint pairs remain
+  zero-target negatives, not positive-query cohorts. Recommended pilot floor: 200
+  eligible positive queries overall and at least 20 queries from five source volumes
+  in each predeclared positive-query cohort. Require +0.01 absolute pair-head NDCG@10
+  over a repeated uniform-random ranking baseline, a positive lower 95% paired
+  source-cluster bootstrap bound, no predeclared cohort loss greater than 0.02, and
+  repeat the direction with an independent seed. Compare mu-cosine against the matched
+  S1 reconstruction-only mu baseline; never score an untrained head. Preserve the
+  separate approved +2% reconstruction guardrail. These practical-effect thresholds
+  are recommendations, not audit-derived facts or training authorization.
+
+The probe suggests usable event counts for the tested traces, but it does not measure
+the valid-target yield of actual sampled pairs, age support, fluid-compatible examples,
+or retrieval queries. Implement a read-only target-yield preflight only after the owner
+approves the complete rules; require the stated query floor before any training
+authorization.

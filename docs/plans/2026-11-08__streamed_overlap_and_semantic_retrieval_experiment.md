@@ -44,6 +44,12 @@ all retain `faulted_net_to_gross` and `faults/faulted_channel_labels`, but none 
 `faults/faulted_channel_ng`. Full results and provenance caveats are in the proposal.
 No final-test crops were read, and Gate 1 and the training-launch gate remain closed.
 
+A bounded detector/filter-context diagnostic is also complete: 450 full-depth traces
+from 12 training and 6 validation sources were sampled. The proposal records its
+sensitivity results and unapproved recommendations. The source generator establishes
+a native property/label index relationship, but the old correlation-based offset probe
+does not verify a universal event-to-age offset. Gate 1 still requires owner review.
+
 Proceed autonomously on the approved decisions below. Do not repeatedly ask about
 settled choices. Only stop for an unresolved scientific contract, failed safety or
 resource prerequisite, conflicting user changes, or an explicit approval gate:
