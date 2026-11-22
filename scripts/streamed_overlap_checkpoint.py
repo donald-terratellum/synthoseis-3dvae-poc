@@ -26,23 +26,35 @@ def _model_device(model) -> str:
     return devices.pop()
 
 
-def save_epoch_state(
-    path: Path, *, model, optimizer, scheduler, sampler, early_stopping,
-    journal: BatchJournal, hashes: dict[str, str], completed_epoch: int, batches_per_epoch: int,
-    selection_state: dict,
-) -> None:
-    if (journal.position is None or not journal.rows or completed_epoch < 1 or batches_per_epoch < 1
-            or journal.rows[-1]["logical_step"] != str(journal.position.logical_step)
-            or journal.rows[-1]["cumulative_exposure"] != str(journal.position.cumulative_exposure)
-            or journal.rows[-1].get("epoch") != str(completed_epoch)
-            or journal.rows[-1].get("batch_index") != str(batches_per_epoch)
-            or ("arm" in journal.rows[-1] and journal.rows[-1]["arm"] != model.arm)):
-        raise ValueError("A completed, reconciled epoch and journal watermark are required.")
+def _validate_hashes(hashes: dict[str, str]) -> None:
     if not {"config", "source", "target", "validation_manifest"} <= hashes.keys() or any(
                          not key or not isinstance(value, str) or len(value) != 64
                          or any(char not in "0123456789abcdef" for char in value)
                          for key, value in hashes.items()):
         raise ValueError("Configuration and manifest hashes must be lowercase SHA256 values.")
+
+
+def save_epoch_state(
+    path: Path, *, model, optimizer, scheduler, sampler, early_stopping,
+    journal: BatchJournal, hashes: dict[str, str], completed_epoch: int, batches_per_epoch: int,
+    selection_state: dict,
+) -> None:
+    if journal.position is None or completed_epoch < 0 or batches_per_epoch < 1:
+        raise ValueError("A completed, reconciled epoch and journal watermark are required.")
+    if completed_epoch == 0:
+        if journal.rows or journal.position.logical_step != 0 or journal.position.cumulative_exposure != 0:
+            raise ValueError("An initial checkpoint requires an empty journal.")
+        event_id = None
+    else:
+        if (not journal.rows
+                or journal.rows[-1]["logical_step"] != str(journal.position.logical_step)
+                or journal.rows[-1]["cumulative_exposure"] != str(journal.position.cumulative_exposure)
+                or journal.rows[-1].get("epoch") != str(completed_epoch)
+                or journal.rows[-1].get("batch_index") != str(batches_per_epoch)
+                or ("arm" in journal.rows[-1] and journal.rows[-1]["arm"] != model.arm)):
+            raise ValueError("A completed, reconciled epoch and journal watermark are required.")
+        event_id = journal.rows[-1]["event_id"]
+    _validate_hashes(hashes)
     sampler_state = sampler.state_dict()
     if hashes["source"] != sampler_state.get("source_manifest_hash"):
         raise ValueError("Checkpoint source identity is incompatible with the sampler.")
@@ -64,7 +76,7 @@ def save_epoch_state(
         "sampler": sampler_state,
         "selection_state": selection_state,
         "journal": {
-            "event_id": journal.rows[-1]["event_id"],
+            "event_id": event_id,
             "logical_step": journal.position.logical_step,
             "cumulative_exposure": journal.position.cumulative_exposure,
         },
@@ -89,7 +101,7 @@ def restore_epoch_state(
             or state.get("hashes") != expected_hashes
             or state.get("batches_per_epoch") != expected_batches_per_epoch):
         raise ValueError("Checkpoint model or configuration is incompatible.")
-    if not isinstance(state.get("completed_epoch"), int) or state["completed_epoch"] < 1:
+    if not isinstance(state.get("completed_epoch"), int) or state["completed_epoch"] < 0:
         raise ValueError("Checkpoint has no completed epoch.")
     sampler_state = state["sampler"]
     current_sampler = sampler.state_dict()

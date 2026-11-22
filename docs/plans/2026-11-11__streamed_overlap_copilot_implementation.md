@@ -106,12 +106,31 @@ state, hashes and journal watermark; synthetic tests reproduce the joint step af
 recovery. A failed optimizer or journal write requires a fresh recovery attempt.
 These are primitives, not an integrated training or resume runner.
 
-The complete epoch loop, monitor and TensorBoard integration, formal evaluation,
-runner wiring and integrated local smoke remain required. In particular, the sampler's
-source-manifest hash covers inventory metadata, not full training-source contents.
-The journal currently reads completed CSV rows into memory; its long-run memory
-behavior must be assessed before launch. Keep train, resume, smoke and evaluate modes
-blocked. No training has been authorized.
+The opt-in epoch helper now draws fresh batches, logs step and epoch components,
+noise and throughput, runs fixed train/validation monitors every 100 steps and at
+epoch boundaries, and schedules on validation MAE plus weighted LPIPS and KL only.
+Monitor inputs, labels and transforms are hash-bound; inference restores model modes
+and Python, NumPy, CPU and device RNG state. An initial full-state checkpoint supports
+replay even if the first epoch is interrupted. Synthetic tests cover epoch checkpoint
+failure, retained stale CSV rows, torn-tail recovery and exact model replay. The
+epoch CSV associates each row with its completed batch event so recovery records
+identify stale attempts; preserved torn bytes require the recovery records when
+parsing history.
+
+A separate real-data MPS monitor smoke used 12 train and 12 primary-validation pairs,
+with no optimizer step. Including startup and loading, it took 17.83 seconds,
+1.64 GiB peak RSS and 2.88 GiB peak memory footprint; monitor inference itself took
+0.49 seconds and sampled MPS driver allocation afterward was 1.29 GiB. CPU and MPS
+RNGs and training mode were restored. The check used a 0.5 MPS memory-fraction
+guard and a test-only sparse-input probability of 0.5; its untrained-head loss
+values are not retrieval results. This does not establish full training headroom.
+
+The epoch helper requires a formal validation callback, but that evaluator,
+retrieval/selection, runner wiring and integrated local smoke are not implemented.
+The sampler's source-manifest hash covers inventory metadata, not full
+training-source contents. The journal currently reads completed CSV rows into
+memory; its long-run memory behavior must be assessed before launch. Keep train,
+resume, smoke and evaluate modes blocked. No training has been authorized.
 
 The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
 180 training and 25 validation sources. All 205 have the required semantic arrays;

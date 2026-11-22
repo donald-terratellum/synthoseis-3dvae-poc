@@ -152,6 +152,27 @@ class CheckpointTests(unittest.TestCase):
             )
         self.assertFalse(self.path.exists())
 
+    def test_initial_checkpoint_replays_first_epoch_after_interruption(self):
+        save_epoch_state(
+            self.path, model=self.model, optimizer=self.optimizer, scheduler=self.scheduler,
+            sampler=self.sampler, early_stopping=self.stop, journal=self.journal,
+            hashes=HASHES, completed_epoch=0, batches_per_epoch=1, selection_state={},
+        )
+        expected = self.step(self.model, self.optimizer, self.scheduler, self.sampler, self.journal, "e1")
+        self.journal.close()
+        model, optimizer, scheduler, sampler, stop = self.components()
+        resumed = BatchJournal(self.root / "batch_metrics.csv", self.fields, create=False)
+        self.addCleanup(resumed.close)
+        state = restore_epoch_state(
+            self.path, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+            early_stopping=stop, journal=resumed, expected_hashes=HASHES,
+            expected_batches_per_epoch=1, attempt_id="second",
+        )
+        self.assertEqual(state["completed_epoch"], 0)
+        self.assertEqual(expected, self.step(model, optimizer, scheduler, sampler, resumed, "e2"))
+        self.assertEqual(resumed.rows[-1]["replay_of_event"], "e1")
+        self.assertEqual(resumed.rows[-1]["cumulative_exposure"], "12")
+
     def test_wrong_device_or_scheduler_rejected_before_reconciliation(self):
         self.step(self.model, self.optimizer, self.scheduler, self.sampler, self.journal, "e1")
         self.save()

@@ -1,6 +1,7 @@
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from numbers import Real
 import random
 import secrets
 import sys
@@ -2015,6 +2016,126 @@ def update_gan_balance_controller(
     return next_gan_weight, next_disc_lr, status, control_acc
 
 
+@contextmanager
+def streamed_inference_context(model, device, seed):
+    """Run reproducible inference without consuming training RNG or changing modes."""
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
+        raise ValueError("Inference seed must be an integer in [0, 2**32).")
+    device = torch.device(device)
+    if {parameter.device.type for parameter in model.parameters()} != {device.type}:
+        raise ValueError("Inference device must match the model device.")
+    modules = [(module, module.training) for module in model.modules()]
+    torch_rng = torch.get_rng_state()
+    numpy_rng = np.random.get_state()
+    python_rng = random.getstate()
+    mps_rng = torch.mps.get_rng_state() if device.type == "mps" else None
+    cuda_rng = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+    try:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.default_generator.manual_seed(seed)
+        if device.type == "mps":
+            torch.mps.manual_seed(seed)
+        elif device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        model.eval()
+        with torch.inference_mode():
+            yield
+    finally:
+        torch.set_rng_state(torch_rng)
+        np.random.set_state(numpy_rng)
+        random.setstate(python_rng)
+        if mps_rng is not None:
+            torch.mps.set_rng_state(mps_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        for module, training in modules:
+            module.training = training
+
+
+def monitor_streamed_pairs(model, lpips_loss_fn, device, batches, writer, *, seed, step):
+    """Log fixed train/validation pair losses; these do not select checkpoints."""
+    import json
+
+    from scripts.streamed_overlap_model import joint_loss
+
+    _validate_streamed_monitors(batches)
+    if step < 1:
+        raise ValueError("A positive monitor step is required.")
+    results = {}
+    started = time.monotonic()
+    with streamed_inference_context(model, device, seed):
+        for split in ("train", "validation"):
+            batch = batches[split]
+            outputs = model(torch.as_tensor(batch.input_a, device=device),
+                            torch.as_tensor(batch.input_b, device=device))
+            losses = joint_loss(
+                outputs, torch.as_tensor(batch.dense_a, device=device), lpips_loss_fn,
+                torch.as_tensor(batch.overlap, device=device),
+                torch.as_tensor(batch.coverage, device=device),
+                torch.as_tensor(batch.coverage_valid, device=device),
+            )
+            results[split] = {
+                "loss": losses.total.item(),
+                "reconstruction_mae": losses.reconstruction.item(),
+                "lpips": losses.lpips.item(),
+                "kl": losses.kl.item(),
+                "overlap": losses.overlap.item() if losses.overlap is not None else None,
+                "coverage": losses.coverage.item() if losses.coverage is not None else None,
+                "valid_coverage": losses.valid_coverage if model.coverage_head is not None else None,
+            }
+    overhead = time.monotonic() - started
+    for split, values in results.items():
+        for name, value in values.items():
+            if value is not None:
+                writer.add_scalar(f"monitor/{split}/{name}", value, step)
+    writer.add_scalar("monitor/overhead_seconds", overhead, step)
+    writer.flush()
+    print(json.dumps({"monitor_step": step, "overhead_seconds": overhead, "losses": results},
+                     sort_keys=True, allow_nan=False), flush=True)
+    return results, overhead
+
+
+def _validate_streamed_monitors(batches):
+    if set(batches) != {"train", "validation"}:
+        raise ValueError("Fixed train and validation monitor batches are required.")
+    for split in ("train", "validation"):
+        batch = batches[split]
+        if (len(batch.provenance) != 12
+                or any(not window.source_id.startswith(split + "/")
+                       for spec in batch.provenance for window in (spec.a, spec.b))):
+            raise ValueError(f"Monitor batch does not belong to {split}.")
+
+
+def streamed_monitor_hash(batches):
+    """Bind the fixed monitor inputs, labels, transforms and canonical pair specs."""
+    from dataclasses import asdict
+    import hashlib
+    import json
+
+    _validate_streamed_monitors(batches)
+    digest = hashlib.sha256()
+    for split in ("train", "validation"):
+        batch = batches[split]
+        metadata = {
+            "split": split, "provenance": [asdict(spec) for spec in batch.provenance],
+            "reasons": batch.unavailable_reasons,
+            "augmentation": [[{**view, "transform": asdict(view["transform"])} for view in pair]
+                             for pair in batch.augmentation_stats],
+        }
+        data = json.dumps(metadata, sort_keys=True, allow_nan=False).encode("utf-8")
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+        for name in ("input_a", "input_b", "dense_a", "overlap", "coverage", "coverage_valid"):
+            array = np.ascontiguousarray(getattr(batch, name))
+            header = json.dumps({"name": name, "shape": array.shape, "dtype": array.dtype.str},
+                                sort_keys=True).encode("utf-8")
+            digest.update(len(header).to_bytes(8, "big"))
+            digest.update(header)
+            digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
 def train_streamed_pair_step(
     model, optimizer, batch, device, lpips_loss_fn, journal, *,
     run_id, seed, epoch, batch_index, data_read_seconds,
@@ -2029,6 +2150,7 @@ def train_streamed_pair_step(
     import uuid
 
     from scripts.streamed_overlap_journal import STEP_FIELDS, _atomic_record, _sync_directory
+    from scripts.streamed_overlap_audit import HOLDOUT_NAMES
     from scripts.streamed_overlap_model import joint_loss
 
     if journal.fields != STEP_FIELDS or journal.position is None or journal.attempt_id is None:
@@ -2048,6 +2170,10 @@ def train_streamed_pair_step(
     if (len(batch.provenance) != 12 or len(batch.unavailable_reasons) != 12
             or len(batch.augmentation_stats) != 12):
         raise ValueError("A streamed step requires exactly 12 labeled pairs.")
+    if any(not window.source_id.startswith("train/")
+           or any(part in HOLDOUT_NAMES for part in window.source_id.split("/"))
+           for spec in batch.provenance for window in (spec.a, spec.b)):
+        raise ValueError("Training pairs must exclude all holdout sources.")
     if (batch.input_a.shape[0] != 12 or batch.input_b.shape[0] != 12
             or batch.dense_a.shape[0] != 12 or batch.overlap.shape != (12,)
             or batch.coverage.shape != (12,) or batch.coverage_valid.shape != (12,)):
@@ -2156,6 +2282,285 @@ def train_streamed_pair_step(
         if not completed:
             journal.position = None
     return row
+
+
+STREAMED_EPOCH_COLUMNS = (*METRICS_CSV_COLUMNS, "attempt_id", "batch_event_id")
+
+
+def initialize_streamed_epoch_metrics(path):
+    """Create the append-only per-arm epoch CSV without replacing existing output."""
+    import os
+    from scripts.streamed_overlap_journal import _sync_directory
+
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(f"Refusing existing epoch CSV: {path}")
+    recovery_dir = path.parent / "epoch_recovery"
+    recovery_dir.mkdir()
+    _sync_directory(path.parent)
+    with path.open("x", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerow(STREAMED_EPOCH_COLUMNS)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _sync_directory(path.parent)
+
+
+def _validate_streamed_epoch_metrics(path, journal):
+    from datetime import timezone
+    import hashlib
+    import json
+    import os
+    from scripts.streamed_overlap_journal import _atomic_record
+
+    path = Path(path)
+    recovery_dir = path.parent / "epoch_recovery"
+    if not recovery_dir.is_dir():
+        raise FileNotFoundError("Epoch CSV recovery directory is missing.")
+    with path.open("rb") as handle:
+        content = handle.read()
+    spans = []
+    for record_path in sorted(recovery_dir.glob("*.json")):
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        start, end = record["start"], record["end"]
+        if (record.get("schema") != "streamed-epoch-tail-v1" or not isinstance(start, int)
+                or not isinstance(end, int) or start < 0 or end <= start or end > len(content)
+                or hashlib.sha256(content[start:end]).hexdigest() != record["sha256"]):
+            raise ValueError("Epoch CSV torn bytes do not match their recovery record.")
+        spans.append((start, end))
+    spans.sort()
+    if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
+        raise ValueError("Overlapping epoch CSV recovery records.")
+    rows = []
+    offset = 0
+    tail = b""
+    pending_delimiter = False
+    for raw in content.splitlines(keepends=True):
+        end = offset + len(raw)
+        covered = [(start, stop) for start, stop in spans if start == offset and stop <= end]
+        if covered:
+            if len(covered) != 1 or raw[covered[0][1] - offset:] not in (b"", b"\n", b"\r\n"):
+                raise ValueError("Invalid epoch CSV recovery delimiter.")
+            if not raw.endswith(b"\n"):
+                pending_delimiter = True
+        elif any(start < end and stop > offset for start, stop in spans):
+            raise ValueError("Epoch CSV torn record is not aligned with a row.")
+        elif not raw.endswith(b"\n"):
+            if not rows:
+                raise ValueError("Epoch CSV header is incomplete.")
+            tail = raw
+            break
+        else:
+            try:
+                rows.append(next(csv.reader([raw.decode("utf-8")], strict=True)))
+            except (UnicodeDecodeError, csv.Error, StopIteration) as error:
+                raise ValueError("Epoch CSV is invalid.") from error
+        offset = end
+    if not rows or rows[0] != list(STREAMED_EPOCH_COLUMNS):
+        raise ValueError("Epoch CSV schema is incompatible.")
+    events = {row["event_id"]: row for row in journal.rows}
+    for row in rows[1:]:
+        if len(row) != len(STREAMED_EPOCH_COLUMNS):
+            raise ValueError("Epoch CSV contains an incomplete row.")
+        values = dict(zip(STREAMED_EPOCH_COLUMNS, row))
+        event = events.get(values["batch_event_id"])
+        if (event is None or event["epoch"] != values["epoch"]
+                or event["attempt_id"] != values["attempt_id"]):
+            raise ValueError("Epoch CSV is not linked to its completed batch event.")
+    if tail:
+        start = len(content) - len(tail)
+        _atomic_record(recovery_dir, {
+            "schema": "streamed-epoch-tail-v1", "start": start, "end": len(content),
+            "sha256": hashlib.sha256(tail).hexdigest(),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        pending_delimiter = True
+    if pending_delimiter:
+        with path.open("ab") as handle:
+            handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _append_streamed_epoch_metrics(path, values):
+    import os
+
+    if set(values) != set(STREAMED_EPOCH_COLUMNS):
+        raise ValueError("Epoch CSV row does not match the declared schema.")
+    with Path(path).open("a", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerow([values[name] if values[name] is not None else ""
+                                     for name in STREAMED_EPOCH_COLUMNS])
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _streamed_augmentation_summary(batch):
+    retained = []
+    noise_snr = []
+    for pair in batch.augmentation_stats:
+        if len(pair) != 2:
+            raise ValueError("Both view augmentation records are required.")
+        for view in pair:
+            fraction = view.get("retained_fraction")
+            if (view.get("input_mode") not in {"extrema", "sparse"}
+                    or not isinstance(fraction, (int, float))
+                    or not math.isfinite(fraction) or not 0 <= fraction <= 1):
+                raise ValueError("Invalid input-mode or retained-fraction metadata.")
+            retained.append(fraction)
+            noise = view.get("noise")
+            if noise is not None:
+                snr = noise.get("snr_db")
+                if not isinstance(snr, (int, float)) or not math.isfinite(snr) or not 12 <= snr <= 60:
+                    raise ValueError("Invalid added-noise SNR metadata.")
+                noise_snr.append(snr)
+    if len(retained) != 24:
+        raise ValueError("A streamed batch requires 24 view augmentation records.")
+    return retained, noise_snr
+
+
+def _streamed_validation_loss(value, name: str) -> float:
+    if (isinstance(value, bool) or not isinstance(value, Real)
+            or not math.isfinite(value) or value < 0):
+        raise ValueError(f"Validation {name} must be finite and nonnegative.")
+    return float(value)
+
+
+def train_streamed_epoch(
+    model, optimizer, scheduler, sampler, journal, lpips_loss_fn, device, writer, *,
+    run_id, seed, epoch, batches_per_epoch, sparse_probability, monitor_batches,
+    monitor_seed, validation_seed, validate_epoch, epoch_csv, checkpoint_path,
+    hashes, early_stopping, selection_state,
+):
+    """Execute one opt-in epoch; formal validation and a launch runner remain separate."""
+    from scripts.streamed_overlap_checkpoint import (
+        _model_device, _validate_hashes, _validate_scheduler, save_epoch_state,
+    )
+    from scripts.streamed_overlap_journal import STEP_FIELDS
+    import json
+
+    if (journal.fields != STEP_FIELDS or journal.position is None
+            or not isinstance(run_id, str) or not run_id or "\r" in run_id or "\n" in run_id
+            or isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+            or not callable(lpips_loss_fn) or not model.training or sampler.split != "train"
+            or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1
+            or isinstance(batches_per_epoch, bool) or not isinstance(batches_per_epoch, int)
+            or batches_per_epoch < 1 or not callable(validate_epoch)
+            or not math.isfinite(sparse_probability) or not 0 <= sparse_probability <= 1):
+        raise ValueError("A valid training sampler, epoch budget, validation and journal are required.")
+    if (journal.position.logical_step != (epoch - 1) * batches_per_epoch
+            or sampler.state_dict()["batches_drawn"] != journal.position.logical_step):
+        raise ValueError("Training must begin at a matching epoch-boundary sampler position.")
+    _validate_streamed_monitors(monitor_batches)
+    _validate_hashes(hashes)
+    if hashes.get("monitor") != streamed_monitor_hash(monitor_batches):
+        raise ValueError("Fixed monitor inputs differ from the frozen monitor hash.")
+    if (any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**32
+            for value in (monitor_seed, validation_seed))
+            or _model_device(model) != torch.device(device).type
+            or not callable(getattr(writer, "add_scalar", None))
+            or not callable(getattr(writer, "flush", None))
+            or not Path(checkpoint_path).parent.is_dir()):
+        raise ValueError("Valid inference seeds, matching device, writer and checkpoint directory are required.")
+    if sampler.source_manifest_hash != hashes["source"]:
+        raise ValueError("Training sampler does not match the source manifest hash.")
+    json.dumps(selection_state, allow_nan=False)
+    _validate_scheduler(scheduler, optimizer)
+    _validate_streamed_epoch_metrics(epoch_csv, journal)
+    epoch_started = time.monotonic()
+    losses = 0.0
+    lpips_sum = 0.0
+    retained_sum = 0.0
+    noise_count = 0
+    completed = False
+    try:
+        for batch_index in range(1, batches_per_epoch + 1):
+            data_started = time.monotonic()
+            specs = sampler.next_specs()
+            batch = sampler.load_batch(specs, sparse_probability=sparse_probability)
+            data_read_seconds = time.monotonic() - data_started
+            retained, noise_snr = _streamed_augmentation_summary(batch)
+            row = train_streamed_pair_step(
+                model, optimizer, batch, device, lpips_loss_fn, journal,
+                run_id=run_id, seed=seed, epoch=epoch, batch_index=batch_index,
+                data_read_seconds=data_read_seconds,
+            )
+            step_wall_seconds = time.monotonic() - data_started
+            step = row["logical_step"]
+            losses += row["reconstruction_mae"] + row["weighted_lpips"] + row["weighted_kl"]
+            lpips_sum += row["lpips"]
+            retained_sum += sum(retained)
+            noise_count += len(noise_snr)
+            for name in (
+                "total_loss", "reconstruction_mae", "lpips", "kl", "weighted_lpips",
+                "weighted_kl", "overlap_loss", "weighted_overlap", "coverage_loss",
+                "weighted_coverage", "valid_coverage", "gradient_norm", "data_read_seconds",
+                "batch_seconds",
+            ):
+                if row[name] is not None:
+                    writer.add_scalar(f"train_step/{name}", row[name], step)
+            for group in optimizer.param_groups:
+                writer.add_scalar(f"train_step/lr/{group['name']}", group["lr"], step)
+            writer.add_scalar("train_step/retained_fraction", sum(retained) / len(retained), step)
+            writer.add_scalar("train_step/added_noise_views", len(noise_snr), step)
+            if noise_snr:
+                writer.add_scalar("train_step/added_noise_snr_db", sum(noise_snr) / len(noise_snr), step)
+            writer.add_scalar("train_step/pairs_per_second", 12 / step_wall_seconds, step)
+            if step % 100 == 0 or batch_index == batches_per_epoch:
+                monitor_streamed_pairs(
+                    model, lpips_loss_fn, device, monitor_batches, writer, seed=monitor_seed, step=step,
+                )
+        with streamed_inference_context(model, device, validation_seed):
+            validation = validate_epoch(model)
+        if (not isinstance(validation, dict)
+                or validation.get("split") != "validation"
+                or validation.get("manifest_sha256") != hashes["validation_manifest"]
+                or not isinstance(validation.get("metrics"), dict)):
+            raise ValueError("Validation must report the frozen primary validation manifest.")
+        val_mae = _streamed_validation_loss(validation.get("reconstruction_mae"), "MAE")
+        val_lpips = _streamed_validation_loss(validation.get("lpips_loss"), "LPIPS")
+        val_kl = _streamed_validation_loss(validation.get("kl"), "KL")
+        if "mu_cosine_ndcg10" not in validation["metrics"]:
+            raise ValueError("Epoch validation must include tokenizer-aligned mu-cosine NDCG@10.")
+        val_loss = val_mae + 0.1 * val_lpips + 0.001 * val_kl
+        for name, value in validation["metrics"].items():
+            if (not isinstance(name, str) or not name
+                    or isinstance(value, bool) or not isinstance(value, Real)
+                    or not math.isfinite(value)):
+                raise ValueError("Validation metrics must have names and finite scalar values.")
+            numeric_value = float(value)
+            if name == "mu_cosine_ndcg10" and not 0 <= numeric_value <= 1:
+                raise ValueError("Validation mu-cosine NDCG@10 must be in [0, 1].")
+            writer.add_scalar(f"validation/{name}", numeric_value, epoch)
+        scheduler.step(val_loss)
+        writer.add_scalar("train/loss", losses / batches_per_epoch, epoch)
+        writer.add_scalar("train/lpips_loss", lpips_sum / batches_per_epoch, epoch)
+        writer.add_scalar("validation/loss", val_loss, epoch)
+        writer.add_scalar("validation/lpips_loss", val_lpips, epoch)
+        epoch_seconds = time.monotonic() - epoch_started
+        writer.add_scalar("train/epoch_seconds", epoch_seconds, epoch)
+        writer.add_scalar("train/pairs_per_second", 12 * batches_per_epoch / epoch_seconds, epoch)
+        writer.add_scalar("train/retained_fraction", retained_sum / (24 * batches_per_epoch), epoch)
+        writer.add_scalar("train/added_noise_fraction", noise_count / (24 * batches_per_epoch), epoch)
+        writer.flush()
+        epoch_row = dict.fromkeys(STREAMED_EPOCH_COLUMNS)
+        epoch_row.update({
+            "epoch": epoch, "examples_this_epoch": 12 * batches_per_epoch,
+            "cumulative_examples": journal.position.cumulative_exposure,
+            "train_loss": losses / batches_per_epoch, "train_lpips_loss": lpips_sum / batches_per_epoch,
+            "val_loss": val_loss, "val_lpips_loss": val_lpips, "kl_weight": 0.001,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "attempt_id": journal.attempt_id, "batch_event_id": journal.rows[-1]["event_id"],
+        })
+        _append_streamed_epoch_metrics(epoch_csv, epoch_row)
+        save_epoch_state(
+            Path(checkpoint_path), model=model, optimizer=optimizer, scheduler=scheduler,
+            sampler=sampler, early_stopping=early_stopping, journal=journal, hashes=hashes,
+            completed_epoch=epoch, batches_per_epoch=batches_per_epoch, selection_state=selection_state,
+        )
+        completed = True
+        return validation
+    finally:
+        if not completed:
+            journal.position = None
 
 
 def train_one_epoch(
