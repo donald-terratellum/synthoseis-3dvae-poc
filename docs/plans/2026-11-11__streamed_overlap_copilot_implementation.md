@@ -135,13 +135,23 @@ and repetition counts are explicit, not approved launch settings. Synthetic test
 exercise the calculations and the existing bound manifest passes the 300-query
 eligibility check without reading source cubes.
 
-These are numeric calculations on supplied scores, not a model evaluator or an
-adoption decision. They do not establish that the semantic head was trained, verify
-source fingerprints immediately before scoring, validate checkpoint identity or
-replication provenance, or apply reconstruction guardrails. No model was scored.
-The epoch helper still requires a formal validation callback, and checkpoint
-selection, bounded tokenizer searches, runner wiring and integrated local smoke are
-not implemented.
+An opt-in checkpoint retrieval evaluator now hashes a completed epoch checkpoint,
+matches its arm and step to the locked journal and obtains seed and attempt from it, rejects
+discarded recovery events, and verifies the bound validation inputs immediately
+before scoring. Each seismic window is checked again when read. Mu-cosine uses the
+tokenizer's actual preprocessing and similarity function. Directional head scoring
+requires S3, committed valid coverage supervision and nonzero saved optimizer
+gradient evidence. Its explicit batch size and wall-time limit must be configured
+before use; timeouts fail rather than returning partial rankings. Synthetic tests
+exercise the evaluator; five focused tests took 1.70 seconds and about 336 MiB
+peak RSS including interpreter startup, using tiny fixture models and arrays.
+These are not real-data evaluation resource estimates. No real checkpoint or model
+has been scored.
+
+This evaluator is not yet a complete formal validation callback or adoption
+decision: reconstruction metrics and guardrails, independent-seed provenance,
+physical-overlap and other requested diagnostic reports, checkpoint selection,
+bounded tokenizer searches, runner wiring and an integrated local smoke remain.
 The sampler's source-manifest hash covers inventory metadata, not full
 training-source contents. The journal currently reads completed CSV rows into
 memory; its long-run memory behavior must be assessed before launch. Keep train,
