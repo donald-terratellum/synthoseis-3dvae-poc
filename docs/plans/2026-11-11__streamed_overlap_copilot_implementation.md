@@ -4,6 +4,20 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+`run_suite_from_record` now connects a pinned `suite_input_record` JSON file to
+the existing fresh/resume suite runner. It requires the separately supplied
+configuration hash and the same suite destination, reconstructs the frozen
+epoch and evaluation arguments, and delegates to `run_suite`, which rechecks the
+saved record on resume. This is a programmatic runner primitive, not a shell
+launch mode: calling it can train, and its caller must enforce launch approval,
+resource limits and durable logging. Those gates remain incomplete; do not call
+it for production training yet. The focused initialization, epoch and step tests
+passed 73 tests, with one skipped and 29 subtests, using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_epoch_runner.py
+tests/test_streamed_overlap_step.py` in 32.25 seconds. The record-driven MPS
+fixture mocked epoch-input preparation and arm execution; it did not train or
+read real source data.
+
 The bounded tokenizer-search manifest can now be frozen from an explicit private
 settings file, without model inference or training:
 

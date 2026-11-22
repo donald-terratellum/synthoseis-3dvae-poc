@@ -1356,3 +1356,50 @@ def run_suite(
             historical=historical, matching_config=matching_config, hashes=hashes,
             suite_initialization=initialization,
         )
+
+
+def run_suite_from_record(
+    record_path: Path, suite_dir: Path, *, expected_config_sha256: str, resume: bool, attempt_id: str,
+) -> dict[str, dict]:
+    """Run a pinned suite record; the caller must enforce approval, resource limits and log capture."""
+    if not isinstance(record_path, Path) or not isinstance(suite_dir, Path) or not _sha256(expected_config_sha256):
+        raise ValueError("A suite record, destination and explicit configuration hash are required.")
+    _permitted_file(record_path)
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    keys = {
+        "schema", "suite_dir", "manifest_path", "source_root", "matching_config", "epoch_validation",
+        "search_manifest", "diagnostic_manifest", "formal_config", "guardrail_manifest", "guardrail_config",
+        "historical", "input_hashes",
+    }
+    if (not isinstance(record, dict) or set(record) != keys or record.get("schema") != "streamed-suite-inputs-v1"
+            or content_hash(record) != expected_config_sha256):
+        raise ValueError("Suite input record does not match the pinned configuration hash.")
+    historical = record["historical"]
+    historical_keys = {"report_path", "report_sha256", "checkpoint_path", "checkpoint_sha256", "checkpoint_label"}
+    if (not isinstance(historical, dict) or set(historical) != historical_keys
+            or not isinstance(record["input_hashes"], dict) or "config" in record["input_hashes"]
+            or any(not isinstance(record[key], dict) for key in (
+                "matching_config", "epoch_validation", "search_manifest", "diagnostic_manifest",
+                "formal_config", "guardrail_manifest", "guardrail_config",
+            ))):
+        raise ValueError("Suite input record has invalid settings or reference identities.")
+    paths = (record["suite_dir"], record["manifest_path"], record["source_root"],
+             historical["report_path"], historical["checkpoint_path"])
+    if (any(not isinstance(path, str) or not path or not Path(path).is_absolute() for path in paths)
+            or record["suite_dir"] != str(suite_dir.resolve())):
+        raise ValueError("Suite input record must use absolute paths and its pinned destination.")
+    hashes = {**record["input_hashes"], "config": expected_config_sha256}
+    _validate_hashes(hashes)
+    reference = HistoricalReconstruction(
+        Path(historical["report_path"]), historical["report_sha256"],
+        Path(historical["checkpoint_path"]), historical["checkpoint_sha256"], historical["checkpoint_label"],
+    )
+    _reference_hash(reference)
+    return run_suite(
+        suite_dir, resume=resume, attempt_id=attempt_id, epoch_validation=record["epoch_validation"],
+        manifest_path=Path(record["manifest_path"]), source_root=Path(record["source_root"]),
+        search_manifest=record["search_manifest"], diagnostic_manifest=record["diagnostic_manifest"],
+        formal_config=record["formal_config"], guardrail_manifest=record["guardrail_manifest"],
+        guardrail_config=record["guardrail_config"], historical=reference,
+        matching_config=record["matching_config"], hashes=hashes,
+    )

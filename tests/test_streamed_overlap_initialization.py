@@ -17,7 +17,7 @@ from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
     ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime, _bind_suite_inputs,
-    run_arm_epochs, run_suite, run_suite_epochs, suite_input_record,
+    run_arm_epochs, run_suite, run_suite_epochs, run_suite_from_record, suite_input_record,
 )
 from scripts.streamed_overlap_evaluation import StreamedEpochValidator
 from scripts.streamed_overlap_initialization import (
@@ -166,6 +166,44 @@ class ArmInitializationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differ"):
             _bind_suite_inputs(self.suite_dir, record, resume=True)
 
+    def test_pinned_record_loads_runner_arguments_and_rejects_changes(self):
+        inputs = self.suite_inputs()
+        record = suite_input_record(self.suite_dir, **inputs)
+        path = self.source.parent / "suite-inputs.json"
+        path.write_text(json.dumps(record))
+        digest = content_hash(record)
+        with patch("scripts.streamed_overlap_epoch_runner.run_suite", return_value={"S1": {}}) as run:
+            result = run_suite_from_record(
+                path, self.suite_dir, expected_config_sha256=digest, resume=False, attempt_id="first",
+            )
+            self.assertEqual(result, {"S1": {}})
+            self.assertEqual(run.call_args.args, (self.suite_dir,))
+            values = run.call_args.kwargs
+            self.assertEqual(values["epoch_validation"], record["epoch_validation"])
+            historical = values["historical"]
+            self.assertEqual(historical.report_path, inputs["historical"].report_path.resolve())
+            self.assertEqual(historical.checkpoint_path, inputs["historical"].checkpoint_path.resolve())
+            self.assertEqual(historical.report_sha256, inputs["historical"].report_sha256)
+            self.assertEqual(historical.checkpoint_sha256, inputs["historical"].checkpoint_sha256)
+            self.assertEqual(historical.checkpoint_label, inputs["historical"].checkpoint_label)
+            self.assertEqual(values["hashes"], {**record["input_hashes"], "config": digest})
+            run.reset_mock()
+            with self.assertRaisesRegex(ValueError, "pinned configuration hash"):
+                run_suite_from_record(
+                    path, self.suite_dir, expected_config_sha256="0" * 64, resume=True, attempt_id="next",
+                )
+            with self.assertRaisesRegex(ValueError, "pinned destination"):
+                run_suite_from_record(
+                    path, self.suite_dir / "other", expected_config_sha256=digest, resume=True, attempt_id="next",
+                )
+            changed = {**record, "input_hashes": {**record["input_hashes"], "config": digest}}
+            path.write_text(json.dumps(changed))
+            with self.assertRaisesRegex(ValueError, "invalid settings"):
+                run_suite_from_record(
+                    path, self.suite_dir, expected_config_sha256=content_hash(changed), resume=True, attempt_id="next",
+                )
+            run.assert_not_called()
+
     def test_suite_bootstrap_recovers_partial_arm_and_pins_evidence(self):
         journals = self.empty_suite_journals()
         def bootstrap():
@@ -259,7 +297,10 @@ class ArmInitializationTests(unittest.TestCase):
     def test_suite_workflow_prepares_and_reopens_three_matched_arms(self):
         suite = self.source.parent / "workflow"
         inputs = self.suite_inputs()
-        self.hashes["config"] = content_hash(suite_input_record(suite, **inputs))
+        record = suite_input_record(suite, **inputs)
+        self.hashes["config"] = content_hash(record)
+        record_path = self.source.parent / "suite-inputs.json"
+        record_path.write_text(json.dumps(record))
         arguments = {
             **inputs, "attempt_id": "first-run", "monitor_batches": {}, "lpips_loss_fn": object(),
         }
@@ -280,7 +321,12 @@ class ArmInitializationTests(unittest.TestCase):
                 run_suite(suite, resume=False, **arguments)
             self.assertFalse(suite.exists())
             self.hashes["config"] = content_hash(suite_input_record(suite, **inputs))
-            result = run_suite(suite, resume=False, **arguments)
+            with patch("scripts.streamed_overlap_epoch_runner.prepare_epoch_inputs",
+                       return_value=({}, inputs["validate_epoch"], arguments["lpips_loss_fn"], {})):
+                result = run_suite_from_record(
+                    record_path, suite, expected_config_sha256=self.hashes["config"],
+                    resume=False, attempt_id="first-run",
+                )
             self.assertEqual(result, {"S1": {"status": "fixture"}})
             self.assertEqual(content_hash(json.loads((suite / "resolved_suite_inputs.json").read_text())),
                              self.hashes["config"])
@@ -298,7 +344,12 @@ class ArmInitializationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "differ"):
                 run_suite(suite, resume=True, **{**arguments, "attempt_id": "changed"})
             record_path.write_text(saved)
-            run_suite(suite, resume=True, **{**arguments, "attempt_id": "resume"})
+            with patch("scripts.streamed_overlap_epoch_runner.prepare_epoch_inputs",
+                       return_value=({}, inputs["validate_epoch"], arguments["lpips_loss_fn"], {})):
+                run_suite_from_record(
+                    record_path, suite, expected_config_sha256=self.hashes["config"],
+                    resume=True, attempt_id="resume",
+                )
             second_journals, resumed = captures[-1]
             self.assertEqual(resumed, first_initialization)
             self.assertTrue(all(journal.lock_fd == -1 for journal in second_journals.values()))
