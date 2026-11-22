@@ -134,7 +134,7 @@ def prepare(config: dict, output: Path, *, mps_memory_fraction: float, max_wall_
         "preparation": {"mps_memory_fraction": mps_memory_fraction, "max_wall_seconds": max_wall_seconds,
                         "elapsed_seconds": elapsed},
         "limitation": (
-            "No optimizer step, full validation preflight, historical-file verification, "
+            "No optimizer step, full validation preflight, historical measurement provenance verification, "
             "launch resource check or approval."
         ),
     }

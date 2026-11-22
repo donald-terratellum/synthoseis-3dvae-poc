@@ -206,6 +206,21 @@ class EpochInputBindingTests(unittest.TestCase):
                          for domain in ("synthetic", "real")},
         }
         guardrail["manifest_sha256"] = content_hash(guardrail)
+        checkpoint = self.root / "checkpoint"
+        checkpoint.write_bytes(b"fixture historical checkpoint")
+        checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        report = {
+            "manifest_sha256": guardrail["manifest_sha256"], "protocol": guardrail["protocol"],
+            "checkpoint": {"arm": "P0b", "checkpoint_sha256": checkpoint_hash, "checkpoint_label": "reference"},
+            "datasets": {
+                domain: [
+                    {**item, "mae": 1.0, **({"lpips": 0.1, "kl": 0.1} if domain == "synthetic" else {})}
+                    for item in records
+                ] for domain, records in guardrail["datasets"].items()
+            },
+        }
+        report_path = self.root / "report"
+        report_path.write_text(json.dumps(report))
         sidecars = {
             "search_manifest": search, "diagnostic_manifest": diagnostic, "guardrail_manifest": guardrail,
         }
@@ -228,8 +243,9 @@ class EpochInputBindingTests(unittest.TestCase):
             },
             "guardrail_config": {"manifest_sha256": guardrail["manifest_sha256"],
                                  "device": "mps", "max_wall_seconds": 60}, **paths,
-            "historical": {"report_path": str(self.root / "report"), "report_sha256": "e" * 64,
-                           "checkpoint_path": str(self.root / "checkpoint"), "checkpoint_sha256": "f" * 64,
+            "historical": {"report_path": str(report_path),
+                           "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+                           "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_hash,
                            "checkpoint_label": "reference"},
         }
         observed = {"monitor": streamed_monitor_hash(self.monitor), "epoch_validation": validator.config_sha256}
@@ -252,6 +268,30 @@ class EpochInputBindingTests(unittest.TestCase):
                 resume=False, attempt_id="fixture",
             )
             self.assertEqual(run.call_args.kwargs["epoch_validation"], settings)
+            changed_report = json.loads(report_path.read_text())
+            changed_report["datasets"]["real"] = []
+            report_path.write_text(json.dumps(changed_report))
+            changed_config = {**config, "historical": {
+                **config["historical"], "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            }}
+            rejected_output = self.root / "rejected-suite-inputs.json"
+            with self.assertRaisesRegex(ValueError, "full real"):
+                prepare(changed_config, rejected_output, mps_memory_fraction=0.5, max_wall_seconds=30)
+            self.assertFalse(rejected_output.exists())
+            with patch("scripts.streamed_overlap_epoch_runner.run_suite", wraps=run_suite), \
+                 patch("scripts.streamed_overlap_epoch_runner.prepare_epoch_inputs",
+                       return_value=(self.monitor, validator, self.lpips, observed)), \
+                 patch("scripts.streamed_overlap_epoch_runner.prepare_suite_initial_checkpoints") as bootstrap, \
+                 patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
+                with self.assertRaisesRegex(ValueError, "Historical reconstruction.*missing or changed"):
+                    run_suite_from_record(
+                        output, self.root / "new-suite", expected_config_sha256=result["config_sha256"],
+                        resume=False, attempt_id="fixture",
+                    )
+                bootstrap.assert_not_called()
+                train.assert_not_called()
+                self.assertFalse((self.root / "new-suite").exists())
+            report_path.write_text(json.dumps(report))
             with self.assertRaises(FileExistsError):
                 prepare(config, output, mps_memory_fraction=0.5, max_wall_seconds=30)
             with self.assertRaisesRegex(ValueError, "must be separate"):
@@ -351,8 +391,24 @@ class EpochCompletionTests(unittest.TestCase):
             "manifest_sha256": self.guardrail_manifest["manifest_sha256"],
             "device": "mps", "max_wall_seconds": 60,
         }
+        historical_checkpoint = self.root / "p0b.pt"
+        historical_checkpoint.write_bytes(b"historical checkpoint")
+        historical_checkpoint_hash = hashlib.sha256(historical_checkpoint.read_bytes()).hexdigest()
+        historical_report = {
+            "manifest_sha256": self.guardrail_manifest["manifest_sha256"],
+            "protocol": self.guardrail_manifest["protocol"],
+            "checkpoint": {"arm": "P0b", "checkpoint_sha256": historical_checkpoint_hash,
+                           "checkpoint_label": "reconstruction-best"},
+            "datasets": {
+                domain: [{**row, "mae": 1.0, **({"lpips": 0.1, "kl": 0.1} if domain == "synthetic" else {})}
+                         for row in rows] for domain, rows in self.guardrail_manifest["datasets"].items()
+            },
+        }
+        historical_report_path = self.root / "p0b.json"
+        historical_report_path.write_text(json.dumps(historical_report))
         self.historical = HistoricalReconstruction(
-            self.root / "p0b.json", "d" * 64, self.root / "p0b.pt", "e" * 64, "reconstruction-best",
+            historical_report_path, hashlib.sha256(historical_report_path.read_bytes()).hexdigest(),
+            historical_checkpoint, historical_checkpoint_hash, "reconstruction-best",
         )
         s1_journal = Mock(spec=BatchJournal)
         s1_journal.path = self.root / "batch_metrics.csv"
@@ -377,7 +433,8 @@ class EpochCompletionTests(unittest.TestCase):
             "matching": content_hash(self.matching_config),
             "reconstruction_guardrail": content_hash(self.guardrail_config),
             "reconstruction_reference": content_hash({
-                "report_sha256": "d" * 64, "checkpoint_sha256": "e" * 64,
+                "report_sha256": self.historical.report_sha256,
+                "checkpoint_sha256": self.historical.checkpoint_sha256,
                 "checkpoint_label": "reconstruction-best",
             }),
         }
@@ -621,6 +678,27 @@ class EpochCompletionTests(unittest.TestCase):
                     initial_checkpoint=self.root / "initial.pt",
                     suite_initialization=self.suite_initialization,
                 )
+            train.assert_not_called()
+
+    def test_changed_historical_checkpoint_stops_before_restore_or_training(self):
+        self.historical.checkpoint_path.write_bytes(b"changed")
+        with patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state") as restore, \
+             patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
+            with self.assertRaisesRegex(ValueError, "Historical reconstruction.*missing or changed"):
+                run_arm_epochs(
+                    SimpleNamespace(arm="S3"), *self.arm_args, run_id="run", seed=1,
+                    attempt_id="resume", batches_per_epoch=2,
+                    sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
+                    validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
+                    hashes=self.hashes, early_stopping=object(), manifest_path=self.root / "manifest",
+                    source_root=self.source, search_manifest=self.search_manifest,
+                    diagnostic_manifest=self.diagnostic_manifest, formal_config=self.config,
+                    evaluation_dir=self.evaluation, guardrail_manifest=self.guardrail_manifest,
+                    guardrail_config=self.guardrail_config, historical=self.historical, s1=self.s1,
+                    matching_config=self.matching_config, initial_checkpoint=self.root / "initial.pt",
+                    suite_initialization=self.suite_initialization,
+                )
+            restore.assert_not_called()
             train.assert_not_called()
 
     def test_guardrails_are_required_before_restoring_or_training(self):

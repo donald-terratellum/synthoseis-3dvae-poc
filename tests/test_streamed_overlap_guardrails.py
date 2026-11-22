@@ -14,7 +14,7 @@ import zarr
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
-    HistoricalReconstruction, SelectedReconstruction, complete_reconstruction_comparison,
+    HistoricalReconstruction, SelectedReconstruction, _verify_historical_reconstruction, complete_reconstruction_comparison,
     complete_selected_reconstruction,
 )
 from scripts.streamed_overlap_evaluation import _identity
@@ -296,6 +296,29 @@ class SelectedComparisonTests(unittest.TestCase):
             self.contexts[candidate], self.historical, s1=self.contexts["S1"] if s1 else None,
             guardrail_manifest=self.manifest, guardrail_config={}, lpips_loss_fn=object(),
         )
+
+    def test_historical_preflight_checks_full_pinned_guardrail_measurement(self):
+        original = json.loads(self.historical.report_path.read_text())
+        self.assertEqual(_verify_historical_reconstruction(self.historical, self.manifest), original)
+        alterations = (
+            ("protocol", lambda report: report["protocol"].update(seed=13), "protocol"),
+            ("coverage", lambda report: report["datasets"]["real"].pop(), "full real"),
+            ("metric", lambda report: report["datasets"]["synthetic"][0].update(lpips=-1), "finite"),
+            ("label", lambda report: report["checkpoint"].update(checkpoint_label="other"), "frozen reference"),
+        )
+        for name, alter, message in alterations:
+            changed = copy.deepcopy(original)
+            alter(changed)
+            self.historical.report_path.write_text(json.dumps(changed))
+            reference = replace(
+                self.historical, report_sha256=hashlib.sha256(self.historical.report_path.read_bytes()).hexdigest(),
+            )
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                _verify_historical_reconstruction(reference, self.manifest)
+        self.historical.report_path.write_text(json.dumps(original))
+        self.historical.checkpoint_path.unlink()
+        with self.assertRaisesRegex(ValueError, "missing or changed"):
+            _verify_historical_reconstruction(self.historical, self.manifest)
 
     def test_comparison_uses_both_references_and_recovers(self):
         result = self.compare()

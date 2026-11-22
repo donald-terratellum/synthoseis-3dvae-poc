@@ -614,6 +614,7 @@ class ArmInitializationTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner._verify_historical_reconstruction"), \
              patch("scripts.streamed_overlap_epoch_runner._reference_hash", return_value="f" * 64), \
              patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
                    side_effect=RuntimeError("restore reached")) as restore, \
@@ -748,6 +749,7 @@ class ArmInitializationTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs") as epoch_gate, \
+             patch("scripts.streamed_overlap_epoch_runner._verify_historical_reconstruction"), \
              patch("scripts.streamed_overlap_epoch_runner.verify_validation_preflight") as validation_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.load_manifest", return_value={
                  "manifest_sha256": self.hashes["validation_manifest"],
@@ -931,6 +933,7 @@ class ArmInitializationTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner._verify_historical_reconstruction"), \
              patch("scripts.streamed_overlap_epoch_runner.suite_workload", return_value={"schema": "fixture"}), \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs") as run_arm:
             with self.assertRaisesRegex(ValueError, "locked journal"):

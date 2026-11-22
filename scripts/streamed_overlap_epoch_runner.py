@@ -643,6 +643,31 @@ def _reference_hash(historical: HistoricalReconstruction) -> str:
     })
 
 
+def _verify_historical_reconstruction(historical: HistoricalReconstruction, guardrail_manifest: dict) -> dict:
+    _reference_hash(historical)
+    paths = ((historical.report_path, historical.report_sha256),
+             (historical.checkpoint_path, historical.checkpoint_sha256))
+
+    def verify_files() -> None:
+        for path, digest in paths:
+            if (not isinstance(path, Path) or "fake_data_validation_v2" in path.parts
+                    or "fake_data_validation_v2" in path.resolve().parts
+                    or path.is_symlink() or not path.is_file() or _digest(path) != digest):
+                raise ValueError("Historical reconstruction report or checkpoint is missing or changed.")
+
+    verify_files()
+    report = json.loads(historical.report_path.read_text(encoding="utf-8"))
+    identity = report.get("checkpoint") if isinstance(report, dict) else None
+    if (not isinstance(identity, dict) or identity.get("arm") != "P0b"
+            or identity.get("checkpoint_sha256") != historical.checkpoint_sha256
+            or identity.get("checkpoint_label") != historical.checkpoint_label):
+        raise ValueError("Historical reconstruction report does not match the frozen reference.")
+    expected = _guardrail_manifest(guardrail_manifest)
+    _measurement(report, guardrail_manifest, expected, "P0b")
+    verify_files()
+    return report
+
+
 def _validate_evaluation_bindings(
     hashes: dict, formal_config: dict, guardrail_config: dict, historical: HistoricalReconstruction,
 ) -> None:
@@ -659,21 +684,7 @@ def complete_reconstruction_comparison(
 ) -> dict:
     """Compare verified selected measurements; this is not an adoption decision."""
     reference_hash = _reference_hash(historical)
-
-    def verify_historical():
-        for path, digest in ((historical.report_path, historical.report_sha256),
-                             (historical.checkpoint_path, historical.checkpoint_sha256)):
-            if ("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in path.resolve().parts
-                    or path.is_symlink() or not path.is_file() or _digest(path) != digest):
-                raise ValueError("Historical reconstruction report or checkpoint is missing or changed.")
-
-    verify_historical()
-    historical_report = json.loads(historical.report_path.read_text(encoding="utf-8"))
-    historical_identity = historical_report.get("checkpoint") if isinstance(historical_report, dict) else None
-    if (not isinstance(historical_identity, dict) or historical_identity.get("arm") != "P0b"
-            or historical_identity.get("checkpoint_sha256") != historical.checkpoint_sha256
-            or historical_identity.get("checkpoint_label") != historical.checkpoint_label):
-        raise ValueError("Historical reconstruction report does not match the frozen reference.")
+    historical_report = _verify_historical_reconstruction(historical, guardrail_manifest)
 
     def check_reference_binding(selection: SelectedReconstruction) -> dict:
         if any("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in path.resolve().parts
@@ -737,7 +748,7 @@ def complete_reconstruction_comparison(
             raise ValueError("The S1 reference does not match the candidate run, source, target or validation.")
         references["S1"], inputs["S1"] = s1_report, s1_hash
     comparison = compare_reconstruction_guardrails(guardrail_manifest, candidate_report, references)
-    verify_historical()
+    _verify_historical_reconstruction(historical, guardrail_manifest)
 
     def verify_selected(selection: SelectedReconstruction, report: dict, path: Path, digest: str) -> None:
         selected = complete_selected_checkpoint(
@@ -887,6 +898,7 @@ def run_arm_epochs(
         monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
         manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
     )
+    _verify_historical_reconstruction(historical, guardrail_manifest)
     if (model.arm not in {"S1", "S2", "S3"}
             or (model.arm == "S1" and s1 is not None)
             or (model.arm in {"S2", "S3"} and (
@@ -1013,6 +1025,7 @@ def _validate_suite_inputs(
     if (hashes.get("matching") != matching_config_hash(matching_config)
             or formal_config["final_epoch"] != matching_config["final_epoch"]):
         raise ValueError("Evaluation and suite budget must match the frozen matching configuration.")
+    _verify_historical_reconstruction(historical, guardrail_manifest)
     return workload
 
 

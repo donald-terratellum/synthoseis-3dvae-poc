@@ -4,6 +4,21 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+Suite preparation and the programmatic suite and arm runners now verify the
+historical P0b report and checkpoint before training can start or resume. The
+check rehashes both files and requires the report's checkpoint identity, frozen
+protocol, complete synthetic and real inputs, and finite metrics to match the
+reconstruction guardrail. Missing, changed or incompatible references fail
+before a suite is initialized or an arm is restored. Evaluation uses the same
+check. This checks file identity and report consistency, not independent
+measurement provenance; it can also require reading the checkpoint more than
+once. It does not authorize training or change the semantic target.
+The focused preparation, epoch, initialization, guardrail and runner tests
+passed 104 tests and 37 subtests using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_guardrails.py
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_runner.py`.
+These used fixture data; no real preparation, training or evaluation ran.
+
 The record-driven suite now has a programmatic evaluation-only option:
 `run_suite_from_record(..., resume=True, evaluate_only=True)`. It requires an
 existing initialized suite, the pinned inputs, and final-epoch checkpoints for
@@ -71,12 +86,13 @@ objects; and a `historical` object with absolute `report_path` and
 `source_manifest_sha256` by the no-optimizer smoke), not a whole-volume hash.
 The three sidecar paths refer to their existing frozen JSON objects. The command
 checks their configuration bindings, prepares the fixed monitors from streamed
-train and validation pairs, and writes the record and prints its logical hash
-and workload. It does not create the suite directory, run an optimizer step, or
+train and validation pairs, verifies the historical reference as described
+above, and writes the record and prints its logical hash and workload. It does
+not create the suite directory, run an optimizer step, or
 approve training. The preparation MPS fraction and time limit are not a launch
 resource approval. The time limit is checked after monitor preparation, not a
 hard watchdog, and excludes initial configuration checks. Full validation
-fingerprinting, historical-file verification, resource checks and launch
+fingerprinting, historical measurement provenance, resource checks and launch
 approval remain outstanding.
 The portable streamed regression passed 243 tests, with one skipped and 59
 subtests, using `.venv/bin/python -m pytest -q tests/test_streamed_*.py` in
