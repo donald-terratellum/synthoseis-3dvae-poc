@@ -4,6 +4,19 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The record-bound suite can now resume a narrowly defined interrupted bootstrap:
+after the suite-input record was saved, but before all three arm directories
+were created. It recreates only a missing suffix of arm directories after
+locking existing journals and verifying they have no recorded or incomplete
+steps, unexpected files, checkpoints or incompatible recovery records.
+Evaluation-only mode cannot use this recovery path. Interruptions inside an
+arm's directory/journal creation, a missing suite-input record, or other
+unexpected files still require investigation; no files are removed or
+overwritten. This is a resume capability, not a training authorization.
+Initialization, epoch and runner fixtures passed 96 tests and 50 subtests;
+the partial-bootstrap fixture also exercised MPS checkpoint initialization
+with a synthetic sampler and a mocked suite coordinator. No training ran.
+
 The future logged runner now has an evaluation-only child in
 `scripts/streamed_overlap_evaluate_child.py`. It checks the pinned record and
 saved suite inputs, requires an explicit MPS memory fraction in `(0, 0.5]`

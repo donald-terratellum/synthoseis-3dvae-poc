@@ -338,6 +338,86 @@ class ArmInitializationTests(unittest.TestCase):
             bootstrap()
         self.assertFalse(last.exists())
 
+    def test_resume_recovers_missing_arm_directories_only_before_bootstrap(self):
+        suite = self.source.parent / "partial-workflow"
+        suite.mkdir()
+        inputs = self.suite_inputs()
+        record = suite_input_record(suite, **inputs)
+        self.hashes["config"] = content_hash(record)
+        _bind_suite_inputs(suite, record, resume=False)
+        first = suite / "S1"
+        first.mkdir()
+        (first / "evaluation").mkdir()
+        journal = BatchJournal(first / "batch_metrics.csv", STEP_FIELDS, create=True)
+        journal.reconcile(watermark=None, attempt_id="bootstrap:first", expected_step=0, expected_exposure=0)
+        journal.close()
+        arguments = {
+            **inputs, "attempt_id": "retry", "monitor_batches": {}, "lpips_loss_fn": object(),
+        }
+        prepared = {
+            "evidence_path": suite / "initialization_evidence.json", "evidence_sha256": "a" * 64,
+            "initial_checkpoints": {arm: suite / arm / "initial.pt" for arm in ("S1", "S2", "S3")},
+        }
+        with patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.torch.backends.mps.is_available", return_value=True), \
+             patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler", return_value=self.sampler), \
+             patch("scripts.streamed_overlap_epoch_runner.prepare_suite_initial_checkpoints",
+                   return_value=prepared) as bootstrap, \
+             patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs",
+                   return_value={"status": "fixture"}) as coordinate:
+            (first / "last.pt").write_bytes(b"unexpected checkpoint")
+            with self.assertRaisesRegex(ValueError, "partial bootstrap"):
+                run_suite(suite, resume=True, **arguments)
+            self.assertFalse((suite / "S2").exists())
+            bootstrap.assert_not_called()
+            coordinate.assert_not_called()
+            (first / "last.pt").unlink()
+            (suite / "suite_metadata.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "partial bootstrap"):
+                run_suite(suite, resume=True, **arguments)
+            (suite / "suite_metadata.json").unlink()
+            (suite / "S3").mkdir()
+            with self.assertRaisesRegex(ValueError, "partial bootstrap"):
+                run_suite(suite, resume=True, **arguments)
+            (suite / "S3").rmdir()
+            journal_path = first / "batch_metrics.csv"
+            original = journal_path.read_bytes()
+            journal_path.write_bytes(original + b"partial")
+            with self.assertRaisesRegex(ValueError, "recorded or incomplete steps"):
+                run_suite(suite, resume=True, **arguments)
+            self.assertFalse((suite / "S2").exists())
+            self.assertEqual(journal_path.read_bytes(), original + b"partial")
+            journal_path.write_bytes(original)
+            with self.assertRaisesRegex(ValueError, "partial bootstrap"):
+                run_suite(suite, resume=True, evaluate_only=True, **arguments)
+            self.assertFalse((suite / "S2").exists())
+            with self.assertRaisesRegex(ValueError, "incompatible recovery records"):
+                run_suite(suite, resume=True, **{**arguments, "attempt_id": "first"})
+            self.assertFalse((suite / "S2").exists())
+            held = BatchJournal(journal_path, STEP_FIELDS, create=False)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    run_suite(suite, resume=True, **arguments)
+                self.assertFalse((suite / "S2").exists())
+            finally:
+                held.close()
+            self.assertEqual(run_suite(suite, resume=True, **arguments), {"status": "fixture"})
+            journals = coordinate.call_args.args[0]
+            self.assertEqual(set(journals), {"S1", "S2", "S3"})
+            self.assertTrue(all(journal.lock_fd == -1 for journal in journals.values()))
+            self.assertTrue(all((suite / arm / "evaluation").is_dir() for arm in journals))
+            self.assertTrue(all((suite / arm / "batch_metrics.csv").is_file() for arm in journals))
+            bootstrap.assert_called_once()
+
+            empty_suite = self.source.parent / "empty-workflow"
+            empty_suite.mkdir()
+            empty_record = suite_input_record(empty_suite, **inputs)
+            self.hashes["config"] = content_hash(empty_record)
+            _bind_suite_inputs(empty_suite, empty_record, resume=False)
+            self.assertEqual(run_suite(empty_suite, resume=True, **arguments), {"status": "fixture"})
+            self.assertTrue(all((empty_suite / arm / "batch_metrics.csv").is_file()
+                                for arm in ("S1", "S2", "S3")))
+
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_suite_bootstrap_prepares_mps_without_optimizer_step(self):
         journals = self.empty_suite_journals()
@@ -439,6 +519,21 @@ class ArmInitializationTests(unittest.TestCase):
             run_suite(interrupted, resume=True, **{**arguments, "attempt_id": "bootstrap-retry"})
             self.assertEqual({arm: (interrupted / arm / "initial.pt").read_bytes() for arm in retained}, retained)
             self.assertTrue((interrupted / "suite_metadata.json").is_file())
+
+            partial = self.source.parent / "partial-arm-workflow"
+            partial.mkdir()
+            partial_record = suite_input_record(partial, **inputs)
+            self.hashes["config"] = content_hash(partial_record)
+            _bind_suite_inputs(partial, partial_record, resume=False)
+            first = partial / "S1"
+            first.mkdir()
+            (first / "evaluation").mkdir()
+            journal = BatchJournal(first / "batch_metrics.csv", STEP_FIELDS, create=True)
+            journal.reconcile(watermark=None, attempt_id="bootstrap:first", expected_step=0, expected_exposure=0)
+            journal.close()
+            run_suite(partial, resume=True, **{**arguments, "attempt_id": "partial-retry"})
+            self.assertTrue((partial / "suite_metadata.json").is_file())
+            self.assertTrue(all((partial / arm / "initial.pt").is_file() for arm in ("S1", "S2", "S3")))
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_default_runtime_constructs_mps_arm_without_optimizer_step(self):

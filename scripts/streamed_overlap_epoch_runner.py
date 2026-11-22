@@ -1492,19 +1492,59 @@ def run_suite(
 
     with ExitStack() as stack:
         journals = {}
-        for arm in ("S1", "S2", "S3"):
+        arms = ("S1", "S2", "S3")
+        missing = [arm for arm in arms if not (suite_dir / arm).exists() and not (suite_dir / arm).is_symlink()]
+        recover_directories = resume and bool(missing)
+        if recover_directories:
+            if (evaluate_only or suite_dir.is_symlink() or not suite_dir.is_dir()
+                    or any((suite_dir / arm).exists() or (suite_dir / arm).is_symlink()
+                           for arm in arms[arms.index(missing[0]):])
+                    or any(path.name not in {"resolved_suite_inputs.json", *arms} for path in suite_dir.iterdir())):
+                raise ValueError("Cannot recover missing arm directories outside a clean partial bootstrap.")
+            for arm in arms[:arms.index(missing[0])]:
+                directory = suite_dir / arm
+                if directory.is_symlink() or not directory.is_dir():
+                    raise ValueError("Cannot recover missing arm directories outside a clean partial bootstrap.")
+                entries = {path.name: path for path in directory.iterdir()}
+                if (set(entries) != {"evaluation", "recovery", "batch_metrics.csv", "batch_metrics.csv.lock"}
+                        or any(path.is_symlink() for path in entries.values())
+                        or not entries["evaluation"].is_dir() or any(entries["evaluation"].iterdir())
+                        or not entries["recovery"].is_dir()
+                        or any(path.is_symlink() or not path.is_file() or path.suffix != ".json"
+                               for path in entries["recovery"].iterdir())
+                        or not entries["batch_metrics.csv"].is_file()
+                        or not entries["batch_metrics.csv.lock"].is_file()):
+                    raise ValueError("Cannot recover missing arm directories outside a clean partial bootstrap.")
+                journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=False)
+                stack.callback(journal.close)
+                journals[arm] = journal
+                if journal._read() or journal.rows:
+                    raise ValueError("Cannot recover missing arm directories with recorded or incomplete steps.")
+                records = journal._records()
+                if (any(record.get("kind") != "checkpoint_reconciliation"
+                        or record.get("checkpoint_watermark") is not None
+                        or record.get("checkpoint_logical_step") != 0
+                        or record.get("checkpoint_cumulative_exposure") != 0
+                        or record.get("uncommitted_event_ids") != [] for record in records)
+                        or any(record.get("attempt_id") == f"bootstrap:{attempt_id}" for record in records)):
+                    raise ValueError("Cannot recover missing arm directories with incompatible recovery records.")
+        for arm in arms:
             directory = suite_dir / arm
-            if not resume:
+            create = not resume or (recover_directories and arm in missing)
+            if create:
                 directory.mkdir()
                 (directory / "evaluation").mkdir()
                 _sync_directory(directory)
                 _sync_directory(suite_dir)
-            journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=not resume)
-            stack.callback(journal.close)
+            if arm not in journals:
+                journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=create)
+                stack.callback(journal.close)
+                journals[arm] = journal
+            else:
+                journal = journals[arm]
             if not resume:
                 journal.reconcile(watermark=None, attempt_id=f"bootstrap:{attempt_id}",
                                   expected_step=0, expected_exposure=0)
-            journals[arm] = journal
         metadata_path = suite_dir / "suite_metadata.json"
         if resume and (metadata_path.exists() or metadata_path.is_symlink()):
             checkpoints = {arm: suite_dir / arm / "initial.pt" for arm in ("S1", "S2", "S3")}
