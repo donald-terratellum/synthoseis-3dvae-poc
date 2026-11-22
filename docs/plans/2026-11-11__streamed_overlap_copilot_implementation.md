@@ -4,7 +4,7 @@ Updated: 2026-11-22.
 
 ## Local implementation status
 
-### Incremental target and yield implementation
+### Incremental target, manifest, and model implementation
 
 The opt-in `scripts.streamed_overlap_targets` module now computes canonical overlap
 and directional event-coverage targets on original seismic and same-index labels.
@@ -24,17 +24,46 @@ manifest. For example, with a new private output path outside the source root:
   --samples-per-source 1
 ```
 
-One local run of this diagnostic sampled all 180 train and 25 existing validation
+The stricter diagnostic sampled all 180 train and 25 existing validation
 sources: all 820 sampled pair targets were available. The 50 positive validation
 **pairs** do not establish the required 200 eligible retrieval **queries**, and this
 small sample is not a representative yield estimate. It does not freeze candidates,
-prove eligibility, or open either approval gate. The bounded-read run took about 61
-seconds and reached about 821 MiB peak RSS on this Mac; this is not a batch-12 MPS
-training measurement. The private output is not committed.
+prove eligibility, or open either approval gate. The stricter run took about 101
+seconds and reached about 863 MiB peak RSS on this Mac. The private output is not
+committed.
 
-The frozen evaluation manifest, trainer integration, augmentation path, durable
-recovery, formal evaluation and local MPS smoke are still required. Keep train, resume,
-smoke and evaluate modes blocked. No training has been authorized.
+The model-independent validation manifest can be generated with:
+
+```sh
+.venv/bin/python -m scripts.streamed_overlap_manifest \
+  --source-root /Volumes/CrucialX9/fake_data \
+  --output <new-private-manifest.json> --seed 20260926 \
+  --queries-per-cohort-source 6
+```
+
+The local candidate manifest contains 300 eligible queries: 150 from 25 sources in
+each of the predeclared shallower/deeper query-depth cohorts. It fixes three overlapping,
+three same-source disjoint and four cross-source candidates per query, with shuffled
+candidate order and known relevance; ties use candidate ID. Its content hash is
+`8d299e067dd54758021ae083c57b4df8da2755a954124eb4169c4fbd1e43ba3b`.
+Generation took about 270 seconds and 907 MiB peak RSS. The private manifest is
+stored on the checkpoint volume, not committed. Its source inventory records metadata,
+not cryptographic hashes of the complete source data; source-content integrity still
+needs verification before model evaluation.
+
+The opt-in pair model and augmentation helpers are implemented and tested, but not
+connected to a trainer. They use a fresh matched residual mu128 VAE, a shared trainable
+encoder, calibrated overlap and ordered coverage heads, and a combined loss. Views
+can use extrema or sparse input masks while reconstructing normalized dense augmented
+A. A guarded local S3 forward/backward smoke used 12 real train pairs, source-band
+noise and LPIPS, without an optimizer step. It took about 10.5 seconds wall time;
+peak process RSS was 1.16 GiB, total peak memory footprint about 3.69 GiB, and MPS
+driver allocation after backward was 2.37 GiB. This is not a training-throughput
+estimate and did not test journal, resume, evaluation or TensorBoard integration.
+
+The streamed sampler/trainer, durable recovery, formal evaluation and integrated
+local smoke remain required. Keep train, resume, smoke and evaluate modes blocked.
+No training has been authorized.
 
 The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
 180 training and 25 validation sources. All 205 have the required semantic arrays;
@@ -54,16 +83,16 @@ Different deepest Z extents are not by themselves a problem: use fully supported
 same-index windows without padding, clipping, or shifts. The owner reports that
 `fake_data` was recreated and is keeping the regenerating `fake_data_validation_v2`
 separate; do not read it until regeneration is complete, then audit separately before
-considering it for any use. The existing validation set remains primary. The executable target,
-target-yield preflight and frozen evaluation manifest remain to be implemented and
-checked. Gate 1 remains closed until those checks pass; the separate training-launch
-approval gate remains closed as well.
+considering it for any use. The existing validation set remains primary. Target and
+diagnostic yield checks and the model-independent candidate manifest now exist, with
+the source-integrity limitation above. Gate 1 and the separate training-launch
+approval gate remain closed.
 
 Local implementation is on `experiment/streamed-overlap-copilot-implementation`.
-The audit tooling and local source inventory exist; pair-target generation, training,
-resume, evaluation, completed-step CSV and automatic trainer/TensorBoard integration
-remain subsequent work. Do not treat this handoff or the current tests as permission
-to launch training.
+The audit tooling, pair-target generation and local source inventory exist; integrated
+training, resume, evaluation, completed-step CSV and automatic trainer/TensorBoard
+integration remain subsequent work. Do not treat this handoff or the current tests as
+permission to launch training.
 
 The cloud prompt below is a future handoff, not a claim that this branch or private
 audit artifacts have been published. Continue from the published implementation branch

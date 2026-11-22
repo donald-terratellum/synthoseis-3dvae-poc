@@ -168,10 +168,11 @@ def keep_trace_extrema_only(x):
     return out
 
 
-def sample_sparse_keep_fraction(fraction_min, fraction_max):
+def sample_sparse_keep_fraction(fraction_min, fraction_max, rng=None):
     if float(fraction_min) == float(fraction_max):
         return np.float32(fraction_min)
-    return np.float32(np.random.uniform(float(fraction_min), float(fraction_max)))
+    random = np.random if rng is None else rng
+    return np.float32(random.uniform(float(fraction_min), float(fraction_max)))
 
 
 def _flat_to_xyz(flat_idx, ny, nz):
@@ -182,7 +183,8 @@ def _flat_to_xyz(flat_idx, ny, nz):
     return x, y, z
 
 
-def _build_sparse_indices_poisson_like(shape, target_count, radius_scale):
+def _build_sparse_indices_poisson_like(shape, target_count, radius_scale, rng=None):
+    random = np.random if rng is None else rng
     nx, ny, nz = (int(shape[0]), int(shape[1]), int(shape[2]))
     nvox = int(nx * ny * nz)
     if target_count >= nvox:
@@ -196,7 +198,7 @@ def _build_sparse_indices_poisson_like(shape, target_count, radius_scale):
     buckets = {}
     selected = []
     selected_mask = np.zeros(nvox, dtype=bool)
-    candidate_stream = np.random.permutation(nvox)
+    candidate_stream = random.permutation(nvox)
     checks = 0
 
     for flat_idx in candidate_stream:
@@ -240,15 +242,16 @@ def _build_sparse_indices_poisson_like(shape, target_count, radius_scale):
 
     if len(selected) < target_count:
         remaining = np.flatnonzero(~selected_mask)
-        np.random.shuffle(remaining)
+        random.shuffle(remaining)
         needed = target_count - len(selected)
         selected.extend(int(v) for v in remaining[:needed])
 
     return np.asarray(selected[:target_count], dtype=np.int64)
 
 
-def _build_sparse_indices_uniform_threshold(shape, keep_fraction):
-    probs = np.random.uniform(0.0, 1.0, tuple(int(v) for v in shape))
+def _build_sparse_indices_uniform_threshold(shape, keep_fraction, rng=None):
+    random = np.random if rng is None else rng
+    probs = random.uniform(0.0, 1.0, tuple(int(v) for v in shape))
     return np.flatnonzero((probs <= float(keep_fraction)).reshape(-1)).astype(np.int64, copy=False)
 
 
@@ -258,19 +261,21 @@ def apply_input_random_sparse_keep(
     fraction_max=0.30,
     method='random',
     poisson_radius_scale=0.85,
+    rng=None,
 ):
+    random = np.random if rng is None else rng
     nx, ny, nz = (int(x.shape[0]), int(x.shape[1]), int(x.shape[2]))
     nvox = int(nx * ny * nz)
-    keep_fraction = float(sample_sparse_keep_fraction(fraction_min, fraction_max))
+    keep_fraction = float(sample_sparse_keep_fraction(fraction_min, fraction_max, rng=rng))
     target_count = int(np.clip(np.rint(keep_fraction * nvox), 1, nvox))
 
     selected_method = method
     if selected_method == 'random':
-        selected_method = 'poisson' if np.random.random() < 0.5 else 'uniform'
+        selected_method = 'poisson' if random.random() < 0.5 else 'uniform'
     if selected_method == 'poisson':
-        selected = _build_sparse_indices_poisson_like((nx, ny, nz), target_count, poisson_radius_scale)
+        selected = _build_sparse_indices_poisson_like((nx, ny, nz), target_count, poisson_radius_scale, rng=rng)
     elif selected_method == 'uniform':
-        selected = _build_sparse_indices_uniform_threshold((nx, ny, nz), keep_fraction)
+        selected = _build_sparse_indices_uniform_threshold((nx, ny, nz), keep_fraction, rng=rng)
     else:
         raise ValueError("method must be one of: 'random', 'poisson', 'uniform'.")
 
