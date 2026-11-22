@@ -646,7 +646,9 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner.open_validation_sources", return_value={}), \
              patch("scripts.streamed_overlap_epoch_runner.verify_search_manifest") as search_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.verify_diagnostics") as diagnostics_preflight, \
-             patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm:
+             patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm, \
+             patch("scripts.streamed_overlap_epoch_runner._suite_cosine_comparisons",
+                   return_value={"fixture": True}) as cosine:
             original = metadata["path"].read_bytes()
             metadata["path"].unlink()
             with self.assertRaisesRegex(ValueError, "regular file"):
@@ -733,7 +735,11 @@ class ArmInitializationTests(unittest.TestCase):
             calls.clear()
             fail_s2 = False
             result = run_suite_epochs(journals, runtime_factory, **arguments)
-            self.assertEqual(result, {arm: {"arm": arm} for arm in ("S1", "S2", "S3")})
+            self.assertEqual(result, {
+                "S1": {"arm": "S1"}, "S2": {"arm": "S2"},
+                "S3": {"arm": "S3", "mu_cosine_comparisons": {"fixture": True}},
+            })
+            cosine.assert_called_once()
             self.assertEqual(calls, [(action, arm) for arm in ("S1", "S2", "S3")
                                      for action in ("open", "run", "close")])
             calls.clear()
@@ -763,7 +769,7 @@ class ArmInitializationTests(unittest.TestCase):
                  patch("scripts.streamed_overlap_epoch_runner.torch.optim.lr_scheduler.ReduceLROnPlateau"), \
                  patch("scripts.streamed_overlap_epoch_runner.SummaryWriter", return_value=writer):
                 result = run_suite_epochs(journals, **arguments)
-                self.assertEqual(result, {arm: {"arm": arm} for arm in ("S1", "S2", "S3")})
+                self.assertEqual(result["S3"]["mu_cosine_comparisons"], {"fixture": True})
                 self.assertEqual(samplers.call_count, 3)
                 self.assertTrue(all(call.args == (self.source, "train", self.config["sampler_seed"])
                                     for call in samplers.call_args_list))

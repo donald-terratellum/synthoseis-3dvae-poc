@@ -1,10 +1,15 @@
 import copy
-from dataclasses import replace
+from dataclasses import asdict, replace
+import hashlib
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
 
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_epoch_runner import SuiteInitialization, _suite_cosine_comparisons
 from scripts.streamed_overlap_metrics import (
     calculate_rankings,
     compare_matched_cosine,
@@ -252,6 +257,86 @@ class RankingMetricTests(unittest.TestCase):
         different_seed = make_report(manifest, arm="S1", scorer="mu_cosine", experiment_seed=2)
         with self.assertRaisesRegex(ValueError, "matched-seed"):
             compare_matched_cosine(candidate, different_seed, bootstrap_seed=4, bootstrap_repeats=20)
+        s2 = make_report(manifest, arm="S2", scorer="mu_cosine", reverse=True)
+        comparison = compare_matched_cosine(candidate, s2, bootstrap_seed=4, bootstrap_repeats=20)
+        self.assertGreater(comparison["mean_ndcg_gain_over_s2"], 0)
+
+    def test_suite_reports_selected_cosine_comparisons_and_detects_changed_report(self):
+        manifest = frozen_fixture()
+        config = {"random_seed": 17, "random_repeats": 5, "bootstrap_seed": 4, "bootstrap_repeats": 20}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initial = {arm: root / arm / "initial.pt" for arm in ("S1", "S2", "S3")}
+            suite = SuiteInitialization(root / "initialization_evidence.json", "unused", initial)
+            results = {}
+            for arm in ("S1", "S2", "S3"):
+                identity = {
+                    "arm": arm, "run_id": "suite", "experiment_seed": 1, "epoch": 2, "step": 2,
+                    "checkpoint_sha256": arm, "config_sha256": "config", "source_sha256": "source",
+                    "target_sha256": "target", "validation_manifest_sha256": manifest["manifest_sha256"],
+                }
+                results[arm] = {"selected_evaluations": {}}
+                kinds = (("final", "reconstruction", "retrieval") if arm == "S3"
+                         else ("final", "reconstruction"))
+                for kind in kinds:
+                    ranking = make_report(manifest, arm=arm, scorer="mu_cosine", reverse=arm != "S2")
+                    report = {
+                        "schema": "streamed-retrieval-evaluation-v1", "checkpoint": identity,
+                        "input_verification": {
+                            "status": "VALIDATION_INPUTS_VERIFIED", "manifest_sha256": manifest["manifest_sha256"],
+                            "verified_windows": 1, "verified_full_depth_event_regions": 1,
+                        },
+                        "scorers": {"mu_cosine": {
+                            "summary": summarize_rankings(ranking, bootstrap_seed=4, bootstrap_repeats=20),
+                            "rows": [asdict(row) for row in ranking.rows],
+                        }},
+                    }
+                    directory = root / arm / "evaluation"
+                    if kind != "final":
+                        directory = directory / f"selected-{kind}"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    path = directory / "retrieval.json"
+                    path.write_text(json.dumps(report), encoding="utf-8")
+                    completion = {
+                        "checkpoint": identity,
+                        "config_sha256": (content_hash(config) if kind == "final" else content_hash({
+                            "formal_evaluation": config, "selection_kind": kind,
+                        })),
+                        "artifacts": {"retrieval": {
+                            "path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }},
+                    }
+                    completion["sha256"] = content_hash(completion)
+                    if kind == "final":
+                        results[arm]["last_epoch"] = completion
+                    else:
+                        results[arm]["selected_evaluations"][kind] = completion
+                if arm != "S1":
+                    matched = {
+                        "status": "MATCHED_RECORDED_STREAMS_ONLY",
+                        "reference": results["S1"]["last_epoch"]["checkpoint"], "candidate": identity,
+                    }
+                    matched["sha256"] = content_hash(matched)
+                    results[arm]["matched_streams"] = {"record": matched}
+            result = _suite_cosine_comparisons(results, suite, manifest, config)
+            self.assertGreater(result["comparisons"]["S2_reconstruction_vs_S1_reconstruction"][
+                "mean_ndcg_gain_over_s1"], 0)
+            self.assertLess(result["comparisons"]["S3_reconstruction_vs_S2_reconstruction"][
+                "mean_ndcg_gain_over_s2"], 0)
+            self.assertLess(result["comparisons"]["S3_final_vs_S2_final"]["mean_ndcg_gain_over_s2"], 0)
+            self.assertEqual(_suite_cosine_comparisons(results, suite, manifest, config), result)
+            matched = results["S2"]["matched_streams"]["record"]
+            original = matched["candidate"]
+            matched["candidate"] = {**original, "step": 3}
+            matched["sha256"] = content_hash({k: v for k, v in matched.items() if k != "sha256"})
+            with self.assertRaisesRegex(ValueError, "matched arm records"):
+                _suite_cosine_comparisons(results, suite, manifest, config)
+            matched["candidate"] = original
+            matched["sha256"] = content_hash({k: v for k, v in matched.items() if k != "sha256"})
+            changed = root / "S3" / "evaluation" / "selected-retrieval" / "retrieval.json"
+            changed.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing, changed or mismatched"):
+                _suite_cosine_comparisons(results, suite, manifest, config)
 
 
 if __name__ == "__main__":

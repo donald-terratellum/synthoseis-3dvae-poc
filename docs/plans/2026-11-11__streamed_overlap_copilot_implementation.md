@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+After all three arms complete, the suite now writes
+`mu_cosine_comparisons.json` in the suite directory using existing checkpoint
+evaluations. It reports S2-S1, S3-S1 and S3-S2 NDCG@10 differences with paired
+source-cluster intervals, separately from the S3 pair-head result. It compares
+the matched final-epoch checkpoints, reconstruction-selected checkpoints for
+all arms, and retrieval-selected S3 against each reconstruction-selected baseline.
+The report identifies each checkpoint and its selection criterion. Different selected epochs,
+and especially different selection criteria, limit interpretation of differences;
+event coverage is a geological proxy, not proof of geological understanding.
+The comparison uses matched recorded streams and the frozen validation cohort;
+it is not an adoption decision. Resuming verifies the same saved comparison.
+No training or evaluation on real data was run for this change.
+Focused metric, suite, epoch and joint-step tests passed 78 tests, with one
+skipped and 29 subtests, using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_metrics.py tests/test_streamed_overlap_initialization.py
+tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_step.py`.
+They took 33.13 seconds and 702,021,632 bytes peak RSS including startup; these
+fixture-test measurements are not training-resource estimates.
+
 `run_suite` now connects fresh S1/S2/S3 checkpoint preparation and journal
 ownership to the sequential coordinator, and reopens the same suite for resume.
 It can finish an interrupted bootstrap when all three journals exist and have

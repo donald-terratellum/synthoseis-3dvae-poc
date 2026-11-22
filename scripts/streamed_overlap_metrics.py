@@ -419,16 +419,17 @@ def _matched_rows(first: RankingReport, second: RankingReport) -> tuple[QueryRan
 
 
 def compare_matched_cosine(
-    candidate: RankingReport, s1: RankingReport, *, bootstrap_seed: int, bootstrap_repeats: int,
+    candidate: RankingReport, baseline: RankingReport, *, bootstrap_seed: int, bootstrap_repeats: int,
 ) -> dict:
-    if (candidate.scorer != "mu_cosine" or s1.scorer != "mu_cosine" or candidate.arm not in {"S2", "S3"}
-            or s1.arm != "S1" or candidate.experiment_seed != s1.experiment_seed):
-        raise ValueError("Cosine comparison requires a matched-seed S1 baseline and S2 or S3 candidate.")
-    matched = _matched_rows(candidate, s1)
-    differences = [row.ndcg - baseline.ndcg for row, baseline in zip(candidate.rows, matched)]
+    if (candidate.scorer != "mu_cosine" or baseline.scorer != "mu_cosine"
+            or (candidate.arm, baseline.arm) not in {("S2", "S1"), ("S3", "S1"), ("S3", "S2")}
+            or candidate.experiment_seed != baseline.experiment_seed):
+        raise ValueError("Cosine comparison requires a matched-seed baseline and later experimental arm.")
+    matched = _matched_rows(candidate, baseline)
+    differences = [row.ndcg - reference.ndcg for row, reference in zip(candidate.rows, matched)]
     interval = paired_source_bootstrap(candidate.rows, differences, seed=bootstrap_seed, repeats=bootstrap_repeats)
     return {
-        "mean_ndcg_gain_over_s1": float(np.mean(differences)),
+        f"mean_ndcg_gain_over_{baseline.arm.lower()}": float(np.mean(differences)),
         "paired_source_bootstrap_95": list(interval),
         "bootstrap_seed": bootstrap_seed,
         "bootstrap_repeats": bootstrap_repeats,
