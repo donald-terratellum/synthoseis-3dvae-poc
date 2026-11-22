@@ -219,6 +219,16 @@ def select_checkpoints(
     if any(record["checkpoint"]["journal_event_id"] == identity["journal_event_id"]
            and record["checkpoint"]["checkpoint_sha256"] != checkpoint_hash for record in live):
         raise ValueError("A journal event cannot identify different checkpoint contents.")
+    same_checkpoint = [
+        record for record in live if record["checkpoint"]["journal_event_id"] == identity["journal_event_id"]
+    ]
+    if any(record["reconstruction"] != reconstruction for record in same_checkpoint):
+        raise ValueError("Checkpoint reconstruction selection metric changed.")
+    previous_retrieval = [record["retrieval"] for record in same_checkpoint if record["retrieval"] is not None]
+    if retrieval is not None and previous_retrieval and any(
+        value != retrieval for value in previous_retrieval
+    ):
+        raise ValueError("Checkpoint retrieval selection metric changed.")
     previous_rec, previous_ret = _best(live, "reconstruction"), _best(live, "retrieval")
     improve_rec = previous_rec is None or reconstruction < previous_rec["reconstruction"]
     improve_ret = retrieval is not None and (previous_ret is None or retrieval > previous_ret["retrieval"])
@@ -230,13 +240,14 @@ def select_checkpoints(
             _copy_verified(checkpoint_path, snapshot, checkpoint_hash)
         if _digest(snapshot) != checkpoint_hash:
             raise ValueError("Checkpoint snapshot differs from its evaluated hash.")
-    count = len(list(events.glob("*.json")))
-    record = {
-        "schema": "streamed-selection-event-v1", "sequence": count + 1,
-        "checkpoint": identity, "reconstruction": reconstruction, "retrieval": retrieval,
-    }
-    record["sha256"] = content_hash(record)
-    _atomic_record(events, record)
+    if not same_checkpoint or (retrieval is not None and not previous_retrieval):
+        count = len(list(events.glob("*.json")))
+        record = {
+            "schema": "streamed-selection-event-v1", "sequence": count + 1,
+            "checkpoint": identity, "reconstruction": reconstruction, "retrieval": retrieval,
+        }
+        record["sha256"] = content_hash(record)
+        _atomic_record(events, record)
     live = _records(events, journal, identity)
     known = {item["checkpoint"]["checkpoint_sha256"] for item in live}
     # Stale selections are still run-owned aliases and may need reconciliation.

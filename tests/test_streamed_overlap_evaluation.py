@@ -364,7 +364,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(restored["best_reconstruction"]["checkpoint"]["step"], 1)
         self.assertEqual(restored["best_retrieval"]["checkpoint"]["step"], 1)
         self.assertEqual(hashlib.sha256((self.root / "best_reconstruction.pt").read_bytes()).hexdigest(), first_hash)
-        self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 3)
+        self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 2)
 
     def test_selection_rejects_mismatched_results_and_recovers_alias_failure(self):
         last = self.root / "last.pt"
@@ -383,9 +383,27 @@ class EvaluationTests(unittest.TestCase):
         result = self.select(report)
         self.assertEqual(result["best_retrieval"]["checkpoint"]["step"], 1)
         self.assertTrue((self.root / "best_retrieval.pt").is_file())
+        self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 1)
         self.selection_checkpoint(1, 0.9)
         with self.assertRaisesRegex(ValueError, "different checkpoint contents"):
             self.select(None)
+
+    def test_selection_retries_and_later_retrieval_enrichment_are_idempotent(self):
+        last = self.root / "last.pt"
+        self.path.replace(last)
+        self.path = last
+        self.selection_checkpoint(1, 1.0)
+        self.select(None)
+        report = self.evaluate()
+        selected = self.select(report)
+        self.assertIsNotNone(selected["best_retrieval"])
+        self.select(report)
+        self.select(None)
+        self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 2)
+        with patch("scripts.streamed_overlap_selection._retrieval", return_value=-0.1):
+            with self.assertRaisesRegex(ValueError, "retrieval selection metric changed"):
+                self.select(report)
+        self.assertEqual(len(list((self.root / "selection" / "events").glob("*.json"))), 2)
 
     def test_selection_does_not_replace_unrelated_checkpoint(self):
         last = self.root / "last.pt"
