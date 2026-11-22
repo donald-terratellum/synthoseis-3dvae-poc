@@ -4,6 +4,28 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+`run_suite` now binds and saves its resolved suite inputs before initializing an
+arm. The record includes the matching and evaluation settings, frozen manifests,
+historical-reference identities, resolved input/output paths and non-config
+checkpoint hashes. Resume requires the same record; a changed or missing record
+stops before journals or checkpoints are opened. The hash detects accidental
+changes, not coordinated replacement of artifacts.
+
+To prepare the binding without training, first use `prepare_epoch_inputs` and
+merge its returned monitor and epoch-validation hashes into the other input
+hashes. Call `suite_input_record` with the returned validator and the same suite
+arguments, then set `hashes["config"] = content_hash(record)` before calling
+`run_suite`. The suite writes `resolved_suite_inputs.json` and binds its hash
+into each checkpoint. Changing the suite path also changes the hash. Existing
+experimental suites without this record cannot use this suite runner to resume.
+This record is not a complete launch configuration: resource limits, approval,
+logging and service ownership remain external, and train/resume/evaluate shell
+modes remain blocked. No training or launch approval is implied.
+The portable streamed suite passed 239 tests, with one skipped and 59 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py` in 46.69 seconds.
+The suite workflow fixture mocked arm execution; no real-data training or
+evaluation was run for this change.
+
 `run_suite` can now construct its fixed train/validation monitors, frozen
 epoch validator and LPIPS directly from explicit `epoch_validation` settings:
 `reconstruction_query_ids`, `encode_batch_size`, `reconstruction_batch_size`

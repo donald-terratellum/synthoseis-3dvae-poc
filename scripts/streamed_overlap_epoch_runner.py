@@ -29,7 +29,7 @@ from scripts.streamed_overlap_integrity import (
     _digest_array, load_manifest, open_validation_sources, verify_validation_preflight,
 )
 from scripts.streamed_overlap_initialization import prepare_suite_initial_checkpoints
-from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record, _sync_directory
+from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record, _publish_exclusive, _sync_directory
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
     verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_run_metadata,
@@ -991,6 +991,53 @@ def _validate_suite_inputs(
     return workload
 
 
+def suite_input_record(
+    suite_dir: Path, *, validate_epoch: StreamedEpochValidator, manifest_path: Path, source_root: Path,
+    search_manifest: dict, diagnostic_manifest: dict, formal_config: dict, guardrail_manifest: dict,
+    guardrail_config: dict, historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
+) -> dict:
+    """Describe the suite inputs for hashing; this does not approve or launch training."""
+    if not isinstance(validate_epoch, StreamedEpochValidator):
+        raise ValueError("A prepared epoch validator is required to describe suite inputs.")
+    _reference_hash(historical)
+    record = {
+        "schema": "streamed-suite-inputs-v1",
+        "suite_dir": str(suite_dir.resolve()),
+        "manifest_path": str(manifest_path.resolve()),
+        "source_root": str(source_root.resolve()),
+        "matching_config": matching_config,
+        "epoch_validation": {
+            "reconstruction_query_ids": list(validate_epoch.reconstruction_query_ids),
+            "encode_batch_size": validate_epoch.encode_batch_size,
+            "reconstruction_batch_size": validate_epoch.reconstruction_batch_size,
+            "max_wall_seconds": validate_epoch.max_wall_seconds,
+        },
+        "search_manifest": search_manifest,
+        "diagnostic_manifest": diagnostic_manifest,
+        "formal_config": formal_config,
+        "guardrail_manifest": guardrail_manifest,
+        "guardrail_config": guardrail_config,
+        "historical": {
+            "report_path": str(historical.report_path.resolve()), "report_sha256": historical.report_sha256,
+            "checkpoint_path": str(historical.checkpoint_path.resolve()),
+            "checkpoint_sha256": historical.checkpoint_sha256, "checkpoint_label": historical.checkpoint_label,
+        },
+        "input_hashes": {key: value for key, value in hashes.items() if key != "config"},
+    }
+    return json.loads(json.dumps(record, sort_keys=True, allow_nan=False))
+
+
+def _bind_suite_inputs(suite_dir: Path, record: dict, *, resume: bool) -> None:
+    path = suite_dir / "resolved_suite_inputs.json"
+    if resume:
+        _permitted_file(path)
+        if content_hash(json.loads(path.read_text(encoding="utf-8"))) != content_hash(record):
+            raise ValueError("Saved suite inputs differ from the requested configuration.")
+    else:
+        data = (json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+        _publish_exclusive(path, lambda handle: handle.write(data))
+
+
 def _suite_cosine_comparisons(results: dict, initialization: SuiteInitialization, manifest: dict,
                               formal_config: dict) -> dict:
     """Compare selected encoder rankings, separately from the trained S3 pair head."""
@@ -1236,6 +1283,14 @@ def run_suite(
             or destination.is_relative_to(source) or source.is_relative_to(destination)):
         raise ValueError("Suite and source paths must be separate and outside validation-v2.")
 
+    record = suite_input_record(
+        suite_dir, validate_epoch=validate_epoch, manifest_path=manifest_path, source_root=source_root,
+        search_manifest=search_manifest, diagnostic_manifest=diagnostic_manifest, formal_config=formal_config,
+        guardrail_manifest=guardrail_manifest, guardrail_config=guardrail_config, historical=historical,
+        matching_config=matching_config, hashes=hashes,
+    )
+    if content_hash(record) != hashes["config"]:
+        raise ValueError("Suite inputs do not match the frozen configuration hash.")
     sampler = None
     if not resume:
         sampler = StreamedPairSampler(source, "train", matching_config["sampler_seed"])
@@ -1243,6 +1298,7 @@ def run_suite(
             raise ValueError("Training sampler does not match the frozen source manifest.")
         suite_dir.mkdir()
         _sync_directory(suite_dir.parent)
+    _bind_suite_inputs(suite_dir, record, resume=resume)
 
     with ExitStack() as stack:
         journals = {}

@@ -16,9 +16,10 @@ import torch
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
-    ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime,
-    run_arm_epochs, run_suite, run_suite_epochs,
+    ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime, _bind_suite_inputs,
+    run_arm_epochs, run_suite, run_suite_epochs, suite_input_record,
 )
+from scripts.streamed_overlap_evaluation import StreamedEpochValidator
 from scripts.streamed_overlap_initialization import (
     _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
 )
@@ -126,6 +127,45 @@ class ArmInitializationTests(unittest.TestCase):
             journals[arm] = journal
         return journals
 
+    def suite_inputs(self):
+        manifest_path = self.source.parent / "manifest"
+        validator = StreamedEpochValidator(
+            manifest_path, self.source, manifest_sha256=self.hashes["validation_manifest"],
+            reconstruction_query_ids=("query",), reconstruction_seed=self.config["validation_seed"],
+            encode_batch_size=1, reconstruction_batch_size=1, max_wall_seconds=10, lpips_loss_fn=lambda x: x,
+        )
+        return {
+            "validate_epoch": validator, "manifest_path": manifest_path, "source_root": self.source,
+            "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": {"final_epoch": self.config["final_epoch"]}, "guardrail_manifest": {},
+            "guardrail_config": {}, "historical": HistoricalReconstruction(
+                self.source.parent / "report", "e" * 64, self.source.parent / "checkpoint", "f" * 64, "reference",
+            ), "matching_config": self.config, "hashes": self.hashes,
+        }
+
+    def test_suite_input_record_binds_settings_and_paths_and_is_immutable(self):
+        inputs = self.suite_inputs()
+        record = suite_input_record(self.suite_dir, **inputs)
+        digest = content_hash(record)
+        self.assertNotEqual(digest, content_hash(suite_input_record(self.suite_dir / "other", **inputs)))
+        _bind_suite_inputs(self.suite_dir, record, resume=False)
+        _bind_suite_inputs(self.suite_dir, record, resume=True)
+        inputs["matching_config"]["final_epoch"] += 1
+        self.assertNotEqual(digest, content_hash(suite_input_record(self.suite_dir, **inputs)))
+        self.assertEqual(record["matching_config"]["final_epoch"], 2)
+        changed = suite_input_record(self.suite_dir, **inputs)
+        with self.assertRaisesRegex(ValueError, "differ"):
+            _bind_suite_inputs(self.suite_dir, changed, resume=True)
+        self.assertEqual(json.loads((self.suite_dir / "resolved_suite_inputs.json").read_text()), record)
+        with self.assertRaises(FileExistsError):
+            _bind_suite_inputs(self.suite_dir, record, resume=False)
+        path = self.suite_dir / "resolved_suite_inputs.json"
+        altered = copy.deepcopy(record)
+        altered["epoch_validation"]["max_wall_seconds"] = 10
+        path.write_text(json.dumps(altered))
+        with self.assertRaisesRegex(ValueError, "differ"):
+            _bind_suite_inputs(self.suite_dir, record, resume=True)
+
     def test_suite_bootstrap_recovers_partial_arm_and_pins_evidence(self):
         journals = self.empty_suite_journals()
         def bootstrap():
@@ -218,12 +258,10 @@ class ArmInitializationTests(unittest.TestCase):
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_suite_workflow_prepares_and_reopens_three_matched_arms(self):
         suite = self.source.parent / "workflow"
+        inputs = self.suite_inputs()
+        self.hashes["config"] = content_hash(suite_input_record(suite, **inputs))
         arguments = {
-            "attempt_id": "first-run", "monitor_batches": {}, "validate_epoch": object(),
-            "lpips_loss_fn": object(), "manifest_path": self.source.parent / "manifest",
-            "source_root": self.source, "search_manifest": {}, "diagnostic_manifest": {},
-            "formal_config": {"final_epoch": self.config["final_epoch"]}, "guardrail_manifest": {},
-            "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
+            **inputs, "attempt_id": "first-run", "monitor_batches": {}, "lpips_loss_fn": object(),
         }
         captures = []
 
@@ -237,8 +275,15 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
              patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs", side_effect=coordinate), \
              patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            self.hashes["config"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "configuration hash"):
+                run_suite(suite, resume=False, **arguments)
+            self.assertFalse(suite.exists())
+            self.hashes["config"] = content_hash(suite_input_record(suite, **inputs))
             result = run_suite(suite, resume=False, **arguments)
             self.assertEqual(result, {"S1": {"status": "fixture"}})
+            self.assertEqual(content_hash(json.loads((suite / "resolved_suite_inputs.json").read_text())),
+                             self.hashes["config"])
             first_journals, first_initialization = captures[-1]
             self.assertTrue(all(journal.lock_fd == -1 for journal in first_journals.values()))
             initial_bytes = {arm: path.read_bytes() for arm, path in first_initialization.initial_checkpoints.items()}
@@ -247,6 +292,12 @@ class ArmInitializationTests(unittest.TestCase):
                 self.assertEqual((suite / arm / "last.pt").read_bytes(), initial_bytes[arm])
             with self.assertRaises(FileExistsError):
                 run_suite(suite, resume=False, **arguments)
+            record_path = suite / "resolved_suite_inputs.json"
+            saved = record_path.read_text()
+            record_path.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "differ"):
+                run_suite(suite, resume=True, **{**arguments, "attempt_id": "changed"})
+            record_path.write_text(saved)
             run_suite(suite, resume=True, **{**arguments, "attempt_id": "resume"})
             second_journals, resumed = captures[-1]
             self.assertEqual(resumed, first_initialization)
@@ -260,6 +311,7 @@ class ArmInitializationTests(unittest.TestCase):
                 journal = BatchJournal(suite / arm / "batch_metrics.csv", STEP_FIELDS, create=False)
                 journal.close()
             interrupted = self.source.parent / "interrupted-workflow"
+            self.hashes["config"] = content_hash(suite_input_record(interrupted, **inputs))
             with patch("scripts.streamed_overlap_initialization.save_suite_run_metadata",
                        side_effect=OSError("interrupted bootstrap")):
                 with self.assertRaisesRegex(OSError, "interrupted bootstrap"):
