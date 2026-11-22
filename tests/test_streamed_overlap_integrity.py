@@ -1,12 +1,16 @@
 import copy
+import tempfile
 import unittest
 from dataclasses import asdict
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_integrity import bind_manifest, input_fingerprints, verify_inputs
+from scripts.streamed_overlap_integrity import (
+    bind_manifest, input_fingerprints, verify_inputs, verify_validation_preflight,
+)
 from scripts.streamed_overlap_targets import Window
 from scripts.streamed_overlap_yield import SEISMIC_KEY
 
@@ -64,6 +68,52 @@ class ValidationIntegrityTests(unittest.TestCase):
         self.source[SEISMIC_KEY][0, 0, 10] += 1
         with self.assertRaisesRegex(ValueError, "fingerprint mismatch: event_traces"):
             verify_inputs(bound, self.groups)
+
+    def test_preflight_checks_frozen_identity_and_validation_content(self):
+        bound = self.bind()
+        bound["target_implementation_sha256"] = "a" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "manifest.json"
+            path.write_text("{}")
+            def verify(**overrides):
+                settings = {
+                    "expected_manifest_sha256": bound["manifest_sha256"],
+                    "expected_target_sha256": "a" * 64,
+                }
+                return verify_validation_preflight(path, root, **{**settings, **overrides})
+
+            with patch("scripts.streamed_overlap_integrity.load_manifest", return_value=bound), \
+                 patch("scripts.streamed_overlap_integrity.open_validation_sources", return_value=self.groups) as opened:
+                report = verify()
+                self.assertEqual(report["status"], "VALIDATION_INPUTS_VERIFIED")
+                self.assertEqual(report["verified_windows"], 2)
+                self.assertEqual(opened.call_count, 2)
+                opened.reset_mock()
+                with self.assertRaisesRegex(ValueError, "manifest or target implementation"):
+                    verify(expected_target_sha256="b" * 64)
+                opened.assert_not_called()
+                self.source[SEISMIC_KEY][0, 0, 10] += 1
+                with self.assertRaisesRegex(ValueError, "fingerprint mismatch: event_traces"):
+                    verify()
+                self.source[SEISMIC_KEY][0, 0, 10] -= 1
+                changed = {**bound, "manifest_sha256": "changed"}
+                with patch("scripts.streamed_overlap_integrity.load_manifest", side_effect=[bound, changed]):
+                    with self.assertRaisesRegex(ValueError, "manifest changed during preflight"):
+                        verify()
+
+    def test_preflight_refuses_validation_v2_before_loading_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "manifest.json"
+            path.write_text("{}")
+            with patch("scripts.streamed_overlap_integrity.load_manifest") as load:
+                with self.assertRaisesRegex(ValueError, "permitted primary"):
+                    verify_validation_preflight(
+                        path, root / "fake_data_validation_v2",
+                        expected_manifest_sha256="a" * 64, expected_target_sha256="b" * 64,
+                    )
+                load.assert_not_called()
 
     def test_unrelated_source_region_is_not_claimed_verified(self):
         original = input_fingerprints(self.plan, self.groups)

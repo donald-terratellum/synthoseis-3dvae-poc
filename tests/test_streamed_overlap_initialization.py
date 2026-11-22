@@ -545,6 +545,7 @@ class ArmInitializationTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs") as epoch_gate, \
+             patch("scripts.streamed_overlap_epoch_runner.verify_validation_preflight") as validation_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm:
             original = metadata["path"].read_bytes()
             metadata["path"].unlink()
@@ -559,6 +560,12 @@ class ArmInitializationTests(unittest.TestCase):
             run_arm.assert_not_called()
             self.assertEqual(calls, [])
             epoch_gate.side_effect = None
+            validation_preflight.side_effect = ValueError("changed validation inputs")
+            with self.assertRaisesRegex(ValueError, "changed validation inputs"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
+            validation_preflight.side_effect = None
             fail_s2 = True
             with self.assertRaisesRegex(RuntimeError, "interrupted S2"):
                 run_suite_epochs(journals, runtime_factory, **arguments)

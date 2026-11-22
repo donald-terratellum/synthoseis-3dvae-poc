@@ -25,7 +25,9 @@ from scripts.streamed_overlap_evaluation import (
 from scripts.streamed_overlap_guardrails import (
     _manifest as _guardrail_manifest, _measurement, _sha256, compare_reconstruction_guardrails,
 )
-from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
+from scripts.streamed_overlap_integrity import (
+    _digest_array, load_manifest, open_validation_sources, verify_validation_preflight,
+)
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record, _sync_directory
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
@@ -867,6 +869,10 @@ def run_suite_epochs(
             raise ValueError("Each arm requires its locked journal and regular evaluation directory.")
         _permitted_file(journal.path)
 
+    verify_validation_preflight(
+        manifest_path, source_root, expected_manifest_sha256=hashes["validation_manifest"],
+        expected_target_sha256=hashes["target"],
+    )
     s1_initial = suite_initialization.initial_checkpoints["S1"]
     s1 = SelectedReconstruction(
         s1_initial.with_name("last.pt"), journals["S1"], manifest_path, source_root,

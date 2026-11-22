@@ -4,6 +4,22 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The prepared-suite coordinator now revalidates the frozen primary-validation
+manifest, target implementation, source metadata, and recorded input
+fingerprints before opening the first arm runtime. It rechecks the manifest
+and source inventory after fingerprinting; changed inputs stop the suite.
+This is a read-only preflight, not a full-source audit, launch authorization,
+or a replacement for the checks performed during evaluation. Budget this
+additional preflight on each suite invocation, including resume.
+
+The local read-only preflight verified 3,300 recorded windows and 300
+full-depth event regions in 198.82 seconds wall time at 1,000,718,336 bytes
+peak RSS. It used the existing primary-validation manifest, not validation-v2
+or final-test crops. Fingerprints do not cover whole source cubes or all
+diagnostic labels; this is not a training-resource estimate. The portable
+streamed suite passed 227 tests, with one skipped and 54 subtests, using
+`.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The prepared-suite and per-arm paths now verify fixed monitor inputs, the
 epoch-validator configuration and manifest/source paths, and the LPIPS state
 against the frozen reconstruction guardrail before opening an arm runtime or

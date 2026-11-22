@@ -199,6 +199,30 @@ def verify_inputs(manifest: dict, groups: dict) -> dict:
     }
 
 
+def verify_validation_preflight(
+    manifest_path: Path, source_root: Path, *, expected_manifest_sha256: str, expected_target_sha256: str,
+) -> dict:
+    """Recheck frozen primary-validation inputs before a suite advances."""
+    if (not isinstance(manifest_path, Path) or not isinstance(source_root, Path)
+            or "fake_data_validation_v2" in manifest_path.parts or "fake_data_validation_v2" in source_root.parts
+            or manifest_path.is_symlink() or not manifest_path.is_file()
+            or "fake_data_validation_v2" in manifest_path.resolve().parts
+            or "fake_data_validation_v2" in source_root.resolve().parts):
+        raise ValueError("Validation preflight requires permitted primary manifest and source paths.")
+    root = source_root.resolve(strict=True)
+    manifest = load_manifest(manifest_path)
+    if (manifest.get("manifest_sha256") != expected_manifest_sha256
+            or manifest.get("target_implementation_sha256") != expected_target_sha256):
+        raise ValueError("Validation manifest or target implementation does not match the frozen suite.")
+    groups = open_validation_sources(root, manifest)
+    report = verify_inputs(manifest, groups)
+    if (load_manifest(manifest_path) != manifest
+            or report["manifest_sha256"] != expected_manifest_sha256):
+        raise ValueError("Validation manifest changed during preflight.")
+    open_validation_sources(root, manifest)
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("bind", "verify"))
