@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import os
 import random
 import tempfile
@@ -15,7 +16,8 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
-    ArmEvidence, _rngs_equal, verify_arm_initial_checkpoint, verify_suite_initialization,
+    ArmEvidence, _rngs_equal, save_suite_initialization, verify_arm_initial_checkpoint,
+    verify_saved_suite_initialization, verify_suite_initialization,
 )
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.train import EarlyStoppingState
@@ -46,7 +48,9 @@ class ArmInitializationTests(unittest.TestCase):
         root = Path(temporary.name)
         self.source = root / "source"
         self.source.mkdir()
-        self.run_dir = root / "arm"
+        self.suite_dir = root / "suite"
+        self.suite_dir.mkdir()
+        self.run_dir = self.suite_dir / "arm"
         self.run_dir.mkdir()
         self.journal = BatchJournal(self.run_dir / "batch_metrics.csv", STEP_FIELDS, create=True)
         self.addCleanup(self.journal.close)
@@ -168,6 +172,89 @@ class ArmInitializationTests(unittest.TestCase):
         with patch.object(journal, "_read", side_effect=AssertionError("must not read")):
             with self.assertRaisesRegex(ValueError, "regular run-owned directory"):
                 verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
+
+    def test_persisted_suite_evidence_is_reused_and_verified_after_advancing(self):
+        arms = self.prepare_suite()
+        result = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        original = result["path"].read_bytes()
+        self.assertEqual(save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        ), result)
+        self.assertEqual(result["path"].read_bytes(), original)
+        state = torch.load(arms["S1"].final_checkpoint, weights_only=True)
+        state["completed_epoch"] = 1
+        torch.save(state, arms["S1"].final_checkpoint)
+        arms["S1"].journal.close()
+        record = verify_saved_suite_initialization(
+            result["path"], {arm: item.initial_checkpoint for arm, item in arms.items()},
+            matching_config=self.config, expected_hashes=self.hashes,
+            expected_evidence_sha256=result["evidence_sha256"],
+        )
+        self.assertEqual(record["matching_config"], self.config)
+        self.assertEqual(record["initialization"]["status"], "MATCHED_INITIALIZATION_ONLY")
+
+    def test_persisted_suite_evidence_detects_tampering_and_wrong_pin(self):
+        arms = self.prepare_suite()
+        result = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        paths = {arm: item.initial_checkpoint for arm, item in arms.items()}
+        def verify(pin=result["evidence_sha256"]):
+            return verify_saved_suite_initialization(
+                result["path"], paths, matching_config=self.config, expected_hashes=self.hashes,
+                expected_evidence_sha256=pin,
+            )
+
+        with self.assertRaisesRegex(ValueError, "pinned configuration"):
+            verify("0" * 64)
+        initial = paths["S2"]
+        original = initial.read_bytes()
+        state = torch.load(initial, weights_only=True)
+        state["training"]["torch_rng"][0] ^= 1
+        torch.save(state, initial)
+        with self.assertRaisesRegex(ValueError, "does not match saved suite evidence"):
+            verify()
+        initial.write_bytes(original)
+        record = json.loads(result["path"].read_text())
+        record["matching_config"]["experiment_seed"] += 1
+        result["path"].write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "pinned configuration"):
+            verify()
+
+    def test_existing_partial_evidence_is_not_overwritten(self):
+        arms = self.prepare_suite()
+        path = self.suite_dir / "initialization_evidence.json"
+        path.write_bytes(b"partial")
+        with self.assertRaises(json.JSONDecodeError):
+            save_suite_initialization(
+                self.suite_dir, arms, matching_config=self.config,
+                expected_hashes=self.hashes, source_root=self.source,
+            )
+        self.assertEqual(path.read_bytes(), b"partial")
+
+    def test_failed_evidence_publication_cleans_owned_file(self):
+        arms = self.prepare_suite()
+        path = self.suite_dir / "initialization_evidence.json"
+        with patch("scripts.streamed_overlap_journal._sync_directory",
+                   side_effect=[OSError("interrupted"), None]):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                save_suite_initialization(
+                    self.suite_dir, arms, matching_config=self.config,
+                    expected_hashes=self.hashes, source_root=self.source,
+                )
+        self.assertFalse(path.exists())
+
+    def test_suite_evidence_rejects_source_directory_and_validation_v2(self):
+        arms = self.prepare_suite()
+        for source in (self.suite_dir, self.source / "fake_data_validation_v2"):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                save_suite_initialization(
+                    self.suite_dir, arms, matching_config=self.config,
+                    expected_hashes=self.hashes, source_root=source,
+                )
+        self.assertFalse((self.suite_dir / "initialization_evidence.json").exists())
 
     def test_publishes_separate_identical_fresh_checkpoints_and_reuses_them(self):
         result = self.prepare()
@@ -295,7 +382,7 @@ class ArmInitializationTests(unittest.TestCase):
                 return os.stat_result(values)
             return stat
 
-        with patch("scripts.streamed_overlap_initialization.os.fstat", side_effect=changing_identity):
+        with patch("scripts.streamed_overlap_journal.os.fstat", side_effect=changing_identity):
             with self.assertRaisesRegex(ValueError, "changed during publication"):
                 _publish_copy(source, destination, "1" * 64)
         self.assertFalse(destination.exists())

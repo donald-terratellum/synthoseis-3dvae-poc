@@ -13,7 +13,7 @@ from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import HOLDOUT_NAMES, PATCH_SHAPE, content_hash
 from scripts.streamed_overlap_checkpoint import _validate_hashes
 from scripts.streamed_overlap_evaluation import _checkpoint_state, _identity
-from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
+from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _publish_exclusive
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.train import EarlyStoppingState, streamed_inference_context
 
@@ -253,6 +253,111 @@ def verify_suite_initialization(
     }
     report["sha256"] = content_hash(report)
     return report
+
+
+def verify_saved_suite_initialization(
+    path: Path, initial_checkpoints: dict[str, Path], *, matching_config: dict,
+    expected_hashes: dict, expected_evidence_sha256: str,
+) -> dict:
+    """Verify pinned initialization evidence and retained snapshots without requiring epoch-zero last files."""
+    config_hash = matching_config_hash(matching_config)
+    _validate_hashes(expected_hashes)
+    if (expected_hashes.get("matching") != config_hash
+            or not isinstance(expected_evidence_sha256, str) or len(expected_evidence_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_evidence_sha256)
+            or not isinstance(initial_checkpoints, dict) or set(initial_checkpoints) != {"S1", "S2", "S3"}):
+        raise ValueError("Pinned evidence, matching configuration and three initial checkpoints are required.")
+    _permitted_file(path)
+    raw = path.read_bytes()
+    file_hash = hashlib.sha256(raw).hexdigest()
+    record = json.loads(raw)
+    if (not isinstance(record, dict)
+            or set(record) != {"schema", "matching_config", "checkpoint_hashes", "initialization", "sha256"}
+            or record["schema"] != "streamed-suite-initialization-evidence-v1"
+            or record["sha256"] != expected_evidence_sha256
+            or record["sha256"] != content_hash({key: value for key, value in record.items() if key != "sha256"})
+            or record["matching_config"] != matching_config or record["checkpoint_hashes"] != expected_hashes):
+        raise ValueError("Saved suite initialization evidence is invalid or does not match the pinned configuration.")
+    report = record["initialization"]
+    if (not isinstance(report, dict) or report.get("schema") != "streamed-suite-initialization-v1"
+            or report.get("status") != "MATCHED_INITIALIZATION_ONLY"
+            or report.get("sha256") != content_hash({key: value for key, value in report.items() if key != "sha256"})
+            or report.get("matching_config_sha256") != config_hash
+            or not isinstance(report.get("initial_checkpoint_sha256"), dict)
+            or set(report["initial_checkpoint_sha256"]) != {"S1", "S2", "S3"}):
+        raise ValueError("Saved suite initialization report is invalid.")
+    root = path.parent.resolve(strict=True)
+    roots = set()
+    snapshots = []
+    for arm in ("S1", "S2", "S3"):
+        initial = initial_checkpoints[arm]
+        _permitted_file(initial)
+        if (initial.name != "initial.pt" or initial.parent.is_symlink()
+                or initial.parent.resolve().parent != root or initial.parent.resolve() in roots):
+            raise ValueError("Retained initial checkpoints must be in separate suite arm directories.")
+        roots.add(initial.parent.resolve())
+        state, digest = _checkpoint_state(initial)
+        if (digest != report["initial_checkpoint_sha256"][arm]
+                or state.get("hashes") != expected_hashes
+                or state.get("batches_per_epoch") != matching_config["batches_per_epoch"]
+                or state.get("device") != report.get("device")):
+            raise ValueError("Retained initial checkpoint does not match saved suite evidence.")
+        _initial_state(
+            state, arm, state, matching_config["model_seed"], matching_config["head_seed"],
+            matching_config["sampler_seed"],
+        )
+        snapshots.append((initial, digest))
+    for initial, digest in snapshots:
+        _permitted_file(initial)
+        if _digest(initial) != digest:
+            raise ValueError("Retained initial checkpoint changed during verification.")
+    _permitted_file(path)
+    if _digest(path) != file_hash:
+        raise ValueError("Suite initialization evidence changed during verification.")
+    return record
+
+
+def save_suite_initialization(
+    suite_dir: Path, arms: dict[str, ArmEvidence], *, matching_config: dict,
+    expected_hashes: dict, source_root: Path,
+) -> dict:
+    """Persist or reverify fresh-suite evidence without overwriting existing files."""
+    if ("fake_data_validation_v2" in suite_dir.parts or "fake_data_validation_v2" in source_root.parts
+            or suite_dir.is_symlink()):
+        raise ValueError("Suite initialization requires directories outside validation-v2.")
+    root = suite_dir.resolve(strict=True)
+    source = source_root.resolve(strict=True)
+    if ("fake_data_validation_v2" in root.parts or "fake_data_validation_v2" in source.parts
+            or not root.is_dir() or not source.is_dir()
+            or root.is_relative_to(source) or source.is_relative_to(root)):
+        raise ValueError("Suite and source directories must be separate and outside validation-v2.")
+    report = verify_suite_initialization(arms, matching_config=matching_config, expected_hashes=expected_hashes)
+    checkpoints = {arm: arms[arm].initial_checkpoint for arm in ("S1", "S2", "S3")}
+    if any(path.parent.resolve().parent != root for path in checkpoints.values()):
+        raise ValueError("Each arm directory must be directly inside the suite directory.")
+    record = {
+        "schema": "streamed-suite-initialization-evidence-v1",
+        "matching_config": dict(matching_config),
+        "checkpoint_hashes": dict(expected_hashes),
+        "initialization": report,
+    }
+    record["sha256"] = content_hash(record)
+    path = suite_dir / "initialization_evidence.json"
+    if not path.exists() and not path.is_symlink():
+        payload = (json.dumps(record, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+        def write(handle):
+            handle.write(payload)
+
+        _publish_exclusive(path, write)
+    saved = verify_saved_suite_initialization(
+        path, checkpoints, matching_config=matching_config, expected_hashes=expected_hashes,
+        expected_evidence_sha256=record["sha256"],
+    )
+    if saved != record or verify_suite_initialization(
+        arms, matching_config=matching_config, expected_hashes=expected_hashes,
+    ) != report:
+        raise ValueError("Suite initialization evidence changed during publication.")
+    return {"path": path, "evidence_sha256": record["sha256"]}
 
 
 def _valid_pair(pair: object, category: str) -> bool:

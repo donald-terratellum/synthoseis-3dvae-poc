@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The opt-in suite-initialization preflight can now persist
+`initialization_evidence.json` with the matching configuration, checkpoint hash
+bindings and hash-bound preflight report. A separate verifier checks a caller-pinned
+evidence hash and each retained initial snapshot even after `last.pt` has advanced.
+The eventual suite runner must persist that evidence hash in its own durable run
+metadata, call these helpers before training and on resume, and bind the complete
+suite configuration; this evidence alone does not establish that the recorded
+initialization was used, verify later streams or authorize training.
+
+Evidence publication is exclusive and fsynced, but not atomic on ExFAT. A hard
+interruption can leave a partial file: later attempts fail closed without overwriting
+it, and it must be investigated. In-process cleanup checks the current identity
+of the still-open file before removing it. Six synthetic ExFAT/MPS evidence and
+recovery tests passed in 7.60 seconds with 465,747,968 bytes peak RSS and
+75,972,608 bytes MPS driver allocation sampled afterward; no optimizer step or
+training occurred. Temporary files were removed. These are not training estimates.
+The portable streamed suite passed 210 tests, with one skipped and 46 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The opt-in, read-only `verify_suite_initialization` preflight checks S1, S2
 and S3 together before any arm advances. It requires separate arm directories,
 locked and reconciled empty journals, fresh configuration-bound E1 snapshots,

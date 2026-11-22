@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+from typing import BinaryIO, Callable
 import uuid
 
 
@@ -33,6 +34,27 @@ def _sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _publish_exclusive(
+    path: Path, write: Callable[[BinaryIO], None], verify: Callable[[], None] | None = None,
+) -> None:
+    with path.open("xb") as handle:
+        complete = False
+        try:
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            if verify is not None:
+                verify()
+            _sync_directory(path.parent)
+            complete = True
+        finally:
+            if not complete and path.exists() and not path.is_symlink():
+                created, current = os.fstat(handle.fileno()), path.stat()
+                if (created.st_dev, created.st_ino) == (current.st_dev, current.st_ino):
+                    path.unlink()
+                    _sync_directory(path.parent)
 
 
 def _atomic_record(directory: Path, record: dict) -> Path:

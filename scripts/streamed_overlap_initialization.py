@@ -1,7 +1,6 @@
 """Publish fresh, recoverable arm checkpoints; this module never starts training."""
 
 import hashlib
-import os
 from pathlib import Path
 import uuid
 
@@ -12,7 +11,7 @@ from scripts.streamed_overlap_checkpoint import (
     _model_device, _validate_hashes, _validate_scheduler, save_epoch_state,
 )
 from scripts.streamed_overlap_evaluation import _checkpoint_state
-from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _sync_directory
+from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _publish_exclusive, _sync_directory
 from scripts.streamed_overlap_matching import (
     _digest, _initial_state, _permitted_file, _rngs_equal, matching_config_hash, verify_arm_initial_checkpoint,
 )
@@ -22,26 +21,18 @@ from scripts.train import streamed_inference_context
 
 def _publish_copy(source: Path, destination: Path, expected: str) -> None:
     digest = hashlib.sha256()
-    with source.open("rb") as reader, destination.open("xb") as writer:
-        complete = False
-        try:
+    with source.open("rb") as reader:
+        def write(writer):
             while chunk := reader.read(1024 * 1024):
                 writer.write(chunk)
                 digest.update(chunk)
-            writer.flush()
-            os.fsync(writer.fileno())
+
+        def verify():
             if (digest.hexdigest() != expected or _digest(source) != expected
                     or _digest(destination) != expected):
                 raise ValueError("Initial checkpoint changed during publication.")
-            _sync_directory(destination.parent)
-            complete = True
-        finally:
-            if not complete and destination.exists() and not destination.is_symlink():
-                created = os.fstat(writer.fileno())
-                current = destination.stat()
-                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
-                    destination.unlink()
-                    _sync_directory(destination.parent)
+
+        _publish_exclusive(destination, write, verify)
 
 
 def prepare_arm_initial_checkpoints(
