@@ -474,6 +474,48 @@ class ArmRuntime:
     writer: SummaryWriter
 
 
+def suite_workload(matching_config: dict, search_manifest: dict) -> dict:
+    """Count clean-run exposure and scheduled evaluations without authorizing a launch."""
+    config_hash = matching_config_hash(matching_config)
+    if (not isinstance(search_manifest, dict)
+            or search_manifest.get("schema") != "streamed-bounded-tokenizer-search-v1"
+            or not isinstance(search_manifest.get("searches"), list) or not search_manifest["searches"]
+            or search_manifest.get("search_manifest_sha256") != content_hash({
+                key: value for key, value in search_manifest.items() if key != "search_manifest_sha256"
+            })):
+        raise ValueError("A nonempty frozen bounded-search manifest is required.")
+    epochs = matching_config["final_epoch"]
+    batches = matching_config["batches_per_epoch"]
+    steps = epochs * batches
+    due_epochs = epochs // 5 + int(epochs % 5 != 0)
+    monitors = epochs + steps // 100 - epochs // (100 // math.gcd(100, batches))
+    epoch_formal = 3 * due_epochs
+    selected_formal = 4
+    return {
+        "schema": "streamed-suite-workload-v1",
+        "matching_config_sha256": config_hash,
+        "search_manifest_sha256": search_manifest["search_manifest_sha256"],
+        "per_arm": {
+            "epochs": epochs, "optimizer_steps": steps, "training_pairs": 12 * steps,
+            "training_encoder_views": 24 * steps, "training_reconstructed_a": 12 * steps,
+            "epoch_validations": epochs, "monitor_runs": monitors,
+            "epoch_formal_evaluations": due_epochs,
+        },
+        "suite": {
+            "optimizer_steps": 3 * steps, "training_pairs": 36 * steps,
+            "training_encoder_views": 72 * steps, "training_reconstructed_a": 36 * steps,
+            "epoch_validations": 3 * epochs, "monitor_runs": 3 * monitors,
+            "epoch_formal_evaluations": epoch_formal, "selected_formal_evaluations": selected_formal,
+            "s3_diagnostic_evaluations": due_epochs + 2,
+            "tokenizer_searches": (epoch_formal + selected_formal) * len(search_manifest["searches"]),
+        },
+        "limitation": (
+            "Clean fresh run only; retries, incomplete attempts, I/O, storage, wall time and memory are not "
+            "estimated. Counts do not authorize training."
+        ),
+    }
+
+
 def _validate_epoch_inputs(
     monitor_batches: dict, validate_epoch, lpips_loss_fn, *, hashes: dict,
     manifest_path: Path, source_root: Path, guardrail_manifest: dict,
@@ -859,6 +901,7 @@ def run_suite_epochs(
         monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
         manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
     )
+    workload = suite_workload(matching_config, search_manifest)
     for arm in ("S1", "S2", "S3"):
         journal = journals[arm]
         initial = suite_initialization.initial_checkpoints[arm]
@@ -873,6 +916,7 @@ def run_suite_epochs(
         manifest_path, source_root, expected_manifest_sha256=hashes["validation_manifest"],
         expected_target_sha256=hashes["target"],
     )
+    print(json.dumps(workload, sort_keys=True), flush=True)
     s1_initial = suite_initialization.initial_checkpoints["S1"]
     s1 = SelectedReconstruction(
         s1_initial.with_name("last.pt"), journals["S1"], manifest_path, source_root,

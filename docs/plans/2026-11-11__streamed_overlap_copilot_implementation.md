@@ -4,6 +4,20 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The prepared-suite coordinator now validates the bounded-search manifest's
+schema, content hash and nonempty search list before opening an arm runtime.
+It prints a `suite_workload` report calculated from explicit matching settings
+and that search list: training exposure, monitors, epoch validation, formal
+evaluations, S3 diagnostics and tokenizer searches. The count includes the
+extra selected-checkpoint evaluations and does not double-count a fifth/final
+epoch or a monitor due both at step 100 and an epoch boundary. These are counts
+for a clean fresh run, not remaining resume work; retries and incomplete
+attempts can add work. They do not validate search regions, estimate disk,
+memory or runtime, choose an epoch/batch budget, or authorize training.
+
+The portable streamed suite passed 230 tests, with one skipped and 54 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The prepared-suite coordinator now revalidates the frozen primary-validation
 manifest, target implementation, source metadata, and recorded input
 fingerprints before opening the first arm runtime. It rechecks the manifest

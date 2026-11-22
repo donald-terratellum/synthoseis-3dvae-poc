@@ -534,10 +534,12 @@ class ArmInitializationTests(unittest.TestCase):
                 raise RuntimeError("interrupted S2")
             return {"arm": arm}
 
+        search: dict = {"schema": "streamed-bounded-tokenizer-search-v1", "searches": [{}]}
+        search["search_manifest_sha256"] = content_hash(search)
         arguments = {
             "attempt_id": "attempt", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
             "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
-            "search_manifest": {}, "diagnostic_manifest": {}, "formal_config": {}, "guardrail_manifest": {},
+            "search_manifest": search, "diagnostic_manifest": {}, "formal_config": {}, "guardrail_manifest": {},
             "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
             "suite_initialization": suite,
         }
@@ -560,6 +562,10 @@ class ArmInitializationTests(unittest.TestCase):
             run_arm.assert_not_called()
             self.assertEqual(calls, [])
             epoch_gate.side_effect = None
+            with self.assertRaisesRegex(ValueError, "frozen bounded-search"):
+                run_suite_epochs(journals, runtime_factory, **{**arguments, "search_manifest": {}})
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
             validation_preflight.side_effect = ValueError("changed validation inputs")
             with self.assertRaisesRegex(ValueError, "changed validation inputs"):
                 run_suite_epochs(journals, runtime_factory, **arguments)
@@ -607,6 +613,7 @@ class ArmInitializationTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.suite_workload", return_value={"schema": "fixture"}), \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs") as run_arm:
             with self.assertRaisesRegex(ValueError, "locked journal"):
                 run_suite_epochs(

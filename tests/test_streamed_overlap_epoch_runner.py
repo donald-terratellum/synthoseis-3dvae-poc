@@ -14,7 +14,7 @@ from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
     complete_epoch,
-    complete_selected_checkpoint, run_arm_epochs,
+    complete_selected_checkpoint, run_arm_epochs, suite_workload,
 )
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
 from scripts.streamed_overlap_targets import Window
@@ -85,6 +85,47 @@ class EpochInputBindingTests(unittest.TestCase):
         self.validator.encode_batch_size += 1
         with self.assertRaisesRegex(ValueError, "changed after it was frozen"):
             self.validator(object())
+
+
+class SuiteWorkloadTests(unittest.TestCase):
+    def setUp(self):
+        self.matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "test", "experiment_seed": 1,
+            "model_seed": 2, "head_seed": 3, "sampler_seed": 4, "monitor_seed": 5, "validation_seed": 6,
+            "final_epoch": 6, "batches_per_epoch": 21, "sparse_probability": 0.5,
+        }
+        self.search: dict = {"schema": "streamed-bounded-tokenizer-search-v1", "searches": [{}, {}]}
+        self.search["search_manifest_sha256"] = content_hash(self.search)
+
+    def test_counts_exposure_monitors_and_final_selected_evaluations(self):
+        result = suite_workload(self.matching, self.search)
+        self.assertEqual(result["per_arm"], {
+            "epochs": 6, "optimizer_steps": 126, "training_pairs": 1512, "training_encoder_views": 3024,
+            "training_reconstructed_a": 1512, "epoch_validations": 6, "monitor_runs": 7,
+            "epoch_formal_evaluations": 2,
+        })
+        self.assertEqual(result["suite"], {
+            "optimizer_steps": 378, "training_pairs": 4536, "training_encoder_views": 9072,
+            "training_reconstructed_a": 4536, "epoch_validations": 18, "monitor_runs": 21,
+            "epoch_formal_evaluations": 6, "selected_formal_evaluations": 4,
+            "s3_diagnostic_evaluations": 4, "tokenizer_searches": 20,
+        })
+
+    def test_epoch_five_and_step_100_are_not_double_counted(self):
+        result = suite_workload({**self.matching, "final_epoch": 5, "batches_per_epoch": 20}, self.search)
+        self.assertEqual(result["per_arm"]["monitor_runs"], 5)
+        self.assertEqual(result["per_arm"]["epoch_formal_evaluations"], 1)
+        self.assertEqual(result["suite"]["tokenizer_searches"], 14)
+
+    def test_rejects_missing_budget_and_changed_search_manifest(self):
+        with self.assertRaisesRegex(ValueError, "matching configuration"):
+            suite_workload({**self.matching, "final_epoch": 0}, self.search)
+        with self.assertRaisesRegex(ValueError, "frozen bounded-search"):
+            suite_workload(self.matching, {**self.search, "searches": [{}]})
+        empty: dict = {"schema": self.search["schema"], "searches": []}
+        empty["search_manifest_sha256"] = content_hash(empty)
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            suite_workload(self.matching, empty)
 
 
 class EpochCompletionTests(unittest.TestCase):
