@@ -9,11 +9,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import HOLDOUT_NAMES, PATCH_SHAPE, content_hash
 from scripts.streamed_overlap_checkpoint import _validate_hashes
 from scripts.streamed_overlap_evaluation import _checkpoint_state, _identity
-from scripts.streamed_overlap_journal import BatchJournal
-from scripts.streamed_overlap_model import fresh_e1_model
+from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
+from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
+from scripts.train import EarlyStoppingState, streamed_inference_context
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,113 @@ def verify_arm_initial_checkpoint(
         if _digest(path) != digest:
             raise ValueError("Initial or current checkpoint changed during verification.")
     return initial_hash
+
+
+def verify_suite_initialization(
+    arms: dict[str, ArmEvidence], *, matching_config: dict, expected_hashes: dict,
+) -> dict:
+    """Verify three fresh, unadvanced arms without starting or authorizing training."""
+    config_hash = matching_config_hash(matching_config)
+    _validate_hashes(expected_hashes)
+    if expected_hashes.get("matching") != config_hash:
+        raise ValueError("Suite initialization must bind the matching configuration.")
+    matching_config = dict(matching_config)
+    expected_hashes = dict(expected_hashes)
+    if matching_config_hash(matching_config) != config_hash:
+        raise ValueError("Matching configuration changed during verification.")
+    if not isinstance(arms, dict) or set(arms) != {"S1", "S2", "S3"}:
+        raise ValueError("Suite initialization requires S1, S2 and S3 evidence.")
+
+    def check_journal(journal: BatchJournal) -> None:
+        if (journal.lock_fd == -1 or journal.fields != STEP_FIELDS or journal.position is None
+                or journal.attempt_id is None or journal.position.logical_step != 0
+                or journal.position.cumulative_exposure != 0 or journal.rows or journal._read()):
+            raise ValueError("Each arm requires an empty, reconciled, locked step journal.")
+
+    identities = {}
+    initial_training = None
+    initial_device = None
+    roots = set()
+    files = []
+    recoveries = []
+    for arm in ("S1", "S2", "S3"):
+        evidence = arms[arm]
+        if not isinstance(evidence, ArmEvidence) or not isinstance(evidence.journal, BatchJournal):
+            raise ValueError("Each arm requires checkpoint and locked journal evidence.")
+        journal = evidence.journal
+        root = journal.path.parent
+        if ("fake_data_validation_v2" in root.parts or root.is_symlink()
+                or "fake_data_validation_v2" in root.resolve().parts or not root.is_dir()
+                or evidence.initial_checkpoint.parent != root or evidence.final_checkpoint.parent != root
+                or evidence.initial_checkpoint.name != "initial.pt" or evidence.final_checkpoint.name != "last.pt"
+                or root.resolve() in roots):
+            raise ValueError("Each arm requires its own regular journal and checkpoint directory.")
+        roots.add(root.resolve())
+        _permitted_file(journal.path)
+        recovery = _recovery_files(journal)
+        check_journal(journal)
+        journal_hash = _digest(journal.path)
+        recoveries.append((journal, recovery))
+        initial_hash = verify_arm_initial_checkpoint(
+            evidence.initial_checkpoint, evidence.final_checkpoint, arm=arm,
+            matching_config=matching_config, expected_hashes=expected_hashes,
+        )
+        state, state_hash = _checkpoint_state(evidence.initial_checkpoint)
+        last, last_hash = _checkpoint_state(evidence.final_checkpoint)
+        if (state_hash != initial_hash or last_hash != initial_hash
+                or type(last.get("completed_epoch")) is not int or last["completed_epoch"] != 0):
+            raise ValueError("Each arm must retain identical epoch-zero checkpoints.")
+
+        device = state["device"]
+        if device == "mps" and not torch.backends.mps.is_available():
+            raise ValueError("MPS is required to verify an MPS initialization.")
+        model = fresh_e1_model(arm, matching_config["model_seed"], matching_config["head_seed"]).to(device)
+        optimizer = build_optimizer(model)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.5, patience=6, min_lr=1e-5,
+        )
+        stopping = EarlyStoppingState(float("inf"), 0)
+        with streamed_inference_context(model, device, matching_config["experiment_seed"]):
+            expected = capture_training_state(optimizer, scheduler, None, stopping)
+        training = state["training"]
+        if (training.get("optimizer") != expected["optimizer"]
+                or training.get("scheduler") != expected["scheduler"]
+                or training.get("early_stopping") != expected["early_stopping"]
+                or not _rngs_equal(training, expected, device)):
+            raise ValueError("Initial optimizer, scheduler, stopping or seeded RNG state is incompatible.")
+        if initial_training is not None and (
+            device != initial_device or not _rngs_equal(training, initial_training, device)
+        ):
+            raise ValueError("Suite arms have different initial devices or RNG states.")
+        initial_training, initial_device = training, device
+        identities[arm] = initial_hash
+        files.extend(((evidence.initial_checkpoint, initial_hash),
+                      (evidence.final_checkpoint, last_hash), (journal.path, journal_hash)))
+
+    for path, digest in files:
+        _permitted_file(path)
+        if _digest(path) != digest:
+            raise ValueError("Suite initialization evidence changed during verification.")
+    for journal, recovery in recoveries:
+        if _recovery_files(journal) != recovery:
+            raise ValueError("Suite journal recovery records changed during verification.")
+        _permitted_file(journal.path)
+        check_journal(journal)
+    if matching_config_hash(matching_config) != config_hash:
+        raise ValueError("Matching configuration changed during verification.")
+    report = {
+        "schema": "streamed-suite-initialization-v1",
+        "status": "MATCHED_INITIALIZATION_ONLY",
+        "matching_config_sha256": config_hash,
+        "initial_checkpoint_sha256": identities,
+        "device": initial_device,
+        "limitation": (
+            "Fresh initialization only; does not verify subsequent streams, source data, "
+            "the full suite configuration or authorize training."
+        ),
+    }
+    report["sha256"] = content_hash(report)
+    return report
 
 
 def _valid_pair(pair: object, category: str) -> bool:

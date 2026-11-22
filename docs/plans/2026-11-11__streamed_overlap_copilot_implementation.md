@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The opt-in, read-only `verify_suite_initialization` preflight checks S1, S2
+and S3 together before any arm advances. It requires separate arm directories,
+locked and reconciled empty journals, fresh configuration-bound E1 snapshots,
+identical per-arm epoch-zero initial/last checkpoints, the approved fresh
+optimizer/scheduler/stopping state and matching experiment-seeded training RNG
+states. It rechecks checkpoint, journal and recovery-record identities before
+returning a hash-bound `MATCHED_INITIALIZATION_ONLY` report. The eventual suite
+runner must persist that report before training and independently verify the
+retained snapshots and committed streams on resume; this preflight is not yet
+wired into the suite runner and does not check source contents, full suite
+configuration, later trajectories or training authorization.
+
+The synthetic CPU/MPS initialization tests passed on ExFAT with no optimizer
+step: 20 tests in 7.90 seconds, 493,944,832 bytes peak RSS and 75,972,608 bytes
+MPS driver allocation sampled afterward. Temporary test files were removed.
+These measurements are not training resource estimates.
+The portable streamed suite passed 205 tests, with one skipped and 44 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The no-training bootstrap now seeds the initial Python, NumPy, CPU and, for an
 MPS arm, MPS training RNGs from the bound `experiment_seed`. It isolates this
 operation from the caller's RNG states and restores the model's training modes,

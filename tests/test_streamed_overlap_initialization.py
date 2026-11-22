@@ -14,7 +14,9 @@ from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
-from scripts.streamed_overlap_matching import _rngs_equal, verify_arm_initial_checkpoint
+from scripts.streamed_overlap_matching import (
+    ArmEvidence, _rngs_equal, verify_arm_initial_checkpoint, verify_suite_initialization,
+)
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.train import EarlyStoppingState
 
@@ -73,6 +75,99 @@ class ArmInitializationTests(unittest.TestCase):
             "hashes": self.hashes, "matching_config": self.config, "source_root": self.source,
         }
         return prepare_arm_initial_checkpoints(**{**arguments, **overrides})
+
+    def prepare_suite(self, device="cpu"):
+        evidence = {}
+        self.model = self.model.to(device)
+        self.optimizer = build_optimizer(self.model)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, factor=0.5, patience=6, min_lr=1e-5,
+        )
+        result = self.prepare()
+        evidence["S3"] = ArmEvidence(result["initial_checkpoint"], result["checkpoint_path"], self.journal)
+        for arm in ("S1", "S2"):
+            directory = self.run_dir.parent / arm
+            directory.mkdir()
+            journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=True)
+            self.addCleanup(journal.close)
+            journal.reconcile(watermark=None, attempt_id=arm, expected_step=0, expected_exposure=0)
+            model = fresh_e1_model(arm, model_seed=2, head_seed=3).to(device)
+            optimizer = build_optimizer(model)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, factor=0.5, patience=6, min_lr=1e-5,
+            )
+            result = self.prepare(model=model, optimizer=optimizer, scheduler=scheduler, journal=journal)
+            evidence[arm] = ArmEvidence(result["initial_checkpoint"], result["checkpoint_path"], journal)
+        return evidence
+
+    def test_suite_preflight_verifies_all_fresh_arms_without_mutating_rng(self):
+        evidence = self.prepare_suite()
+        before = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        report = verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
+        after = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        self.assertTrue(_rngs_equal(before, after, "cpu"))
+        self.assertEqual(report["status"], "MATCHED_INITIALIZATION_ONLY")
+        self.assertEqual(set(report["initial_checkpoint_sha256"]), {"S1", "S2", "S3"})
+        self.assertEqual(report["sha256"], content_hash({
+            key: value for key, value in report.items() if key != "sha256"
+        }))
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_suite_preflight_verifies_mps_rng_without_mutating_it(self):
+        evidence = self.prepare_suite("mps")
+        before = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        report = verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
+        after = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        self.assertEqual(report["device"], "mps")
+        self.assertTrue(_rngs_equal(before, after, "mps"))
+
+    def test_suite_preflight_rejects_changed_rng_and_optimizer(self):
+        evidence = self.prepare_suite()
+        candidate = evidence["S2"]
+        original = candidate.initial_checkpoint.read_bytes()
+        for key in ("rng", "optimizer"):
+            with self.subTest(key=key):
+                state = torch.load(candidate.initial_checkpoint, weights_only=True)
+                if key == "rng":
+                    state["training"]["torch_rng"][0] ^= 1
+                else:
+                    state["training"]["optimizer"]["param_groups"][0]["lr"] = 0.0
+                torch.save(state, candidate.initial_checkpoint)
+                candidate.final_checkpoint.write_bytes(candidate.initial_checkpoint.read_bytes())
+                with self.assertRaisesRegex(ValueError, "optimizer, scheduler, stopping or seeded RNG"):
+                    verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
+                candidate.initial_checkpoint.write_bytes(original)
+                candidate.final_checkpoint.write_bytes(original)
+
+    def test_suite_preflight_rejects_missing_or_advanced_arm_and_unlocked_journal(self):
+        evidence = self.prepare_suite()
+        with self.assertRaisesRegex(ValueError, "requires S1, S2 and S3"):
+            verify_suite_initialization({"S1": evidence["S1"]}, matching_config=self.config,
+                                        expected_hashes=self.hashes)
+        with self.assertRaisesRegex(ValueError, "own regular journal"):
+            verify_suite_initialization({**evidence, "S2": evidence["S1"]},
+                                        matching_config=self.config, expected_hashes=self.hashes)
+        last = evidence["S2"].final_checkpoint
+        original = last.read_bytes()
+        state = torch.load(last, weights_only=True)
+        state["completed_epoch"] = 1
+        torch.save(state, last)
+        with self.assertRaisesRegex(ValueError, "identical epoch-zero"):
+            verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
+        last.write_bytes(original)
+        evidence["S2"].journal.close()
+        with self.assertRaisesRegex(ValueError, "empty, reconciled, locked"):
+            verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
+
+    def test_suite_preflight_rejects_symlinked_recovery_before_reading(self):
+        evidence = self.prepare_suite()
+        journal = evidence["S1"].journal
+        recovery = journal.recovery_dir
+        recovery.rename(recovery.with_name("original-recovery"))
+        recovery.symlink_to(self.run_dir.parent / "fake_data_validation_v2", target_is_directory=True)
+        with patch.object(journal, "_read", side_effect=AssertionError("must not read")):
+            with self.assertRaisesRegex(ValueError, "regular run-owned directory"):
+                verify_suite_initialization(evidence, matching_config=self.config, expected_hashes=self.hashes)
 
     def test_publishes_separate_identical_fresh_checkpoints_and_reuses_them(self):
         result = self.prepare()
