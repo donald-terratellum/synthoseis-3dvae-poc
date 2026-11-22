@@ -13,6 +13,7 @@ from scripts.streamed_overlap_model import (
     fresh_e1_model,
     joint_loss,
 )
+from scripts.streamed_overlap_smoke import _task_encoder_gradient_norm
 from src.model import Decoder, VAE3D
 from src.tokenizer.core.model_adapter import VaeLatentAdapter
 from scripts.train import build_checkpoint_payload
@@ -119,6 +120,19 @@ class StreamedPairModelTests(unittest.TestCase):
             joint_loss(output, a, lambda x, y: F.mse_loss(x, y),
                        torch.zeros(2), torch.tensor([float("nan"), 0]),
                        torch.tensor([True, False]))
+
+    def test_smoke_checks_each_task_gradient_without_accumulating_it(self):
+        encoder = torch.nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            encoder.weight.fill_(1)
+        value = encoder(torch.tensor([[1.0, 2.0]]))
+        norm = _task_encoder_gradient_norm(value.square().sum(), encoder, "coverage")
+        self.assertAlmostEqual(norm, (36 + 144) ** 0.5)
+        self.assertIsNone(encoder.weight.grad)
+        for loss in (value.sum() * 0, value.sum() * float("nan"), value.detach().sum(),
+                     torch.tensor(1.0, requires_grad=True)):
+            with self.subTest(loss=loss), self.assertRaisesRegex(ValueError, "coverage"):
+                _task_encoder_gradient_norm(loss, encoder, "coverage")
 
 
 if __name__ == "__main__":

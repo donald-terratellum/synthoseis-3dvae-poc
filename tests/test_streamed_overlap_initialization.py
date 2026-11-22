@@ -4,6 +4,7 @@ import io
 import json
 import os
 import random
+import socket
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
@@ -253,6 +254,75 @@ class ArmInitializationTests(unittest.TestCase):
         self.assertEqual({path.name for path in suite.iterdir()}, {"resolved_suite_inputs.json"})
         self.assertFalse((logs / "evaluation_receipt.json").exists())
         self.assertFalse((resume_logs / "evaluation_receipt.json").exists())
+
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_MPS_SMOKE") == "1" and torch.backends.mps.is_available(),
+        "Opt-in MPS smoke is unavailable",
+    )
+    def test_runner_mps_bootstrap_interrupt_and_resume_with_tensorboard(self):
+        inputs = self.suite_inputs()
+        suite = self.source.parent / "runner-mps-smoke"
+        record = suite_input_record(suite, **inputs)
+        digest = content_hash(record)
+        record_path = self.source.parent / "runner-inputs.json"
+        record_path.write_text(json.dumps(record))
+        logs = self.source.parent / "runner-logs"
+        logs.mkdir()
+        resume_logs = self.source.parent / "runner-resume-logs"
+        resume_logs.mkdir()
+        options = {
+            "config_sha256": digest, "epochs": 2, "batches_per_epoch": 3,
+            "mps_memory_fraction": 0.5, "min_suite_free_bytes": 1, "min_log_free_bytes": 1,
+        }
+        with socket.socket() as sock:
+            sock.bind((runner.HOST, 0))
+            port = sock.getsockname()[1]
+        start = runner.start_tensorboard
+        owners = []
+        initial_hashes = []
+
+        def start_service(run_dir, log_dir):
+            owner = start(run_dir, log_dir, port=port)
+            owners.append(owner)
+            return owner
+
+        def interrupt(journals, **kwargs):
+            self.assertEqual(set(journals), {"S1", "S2", "S3"})
+            self.assertTrue(all(not journal.rows for journal in journals.values()))
+            initial_hashes.append({
+                arm: runner.file_hash(path)
+                for arm, path in kwargs["suite_initialization"].initial_checkpoints.items()
+            })
+            raise KeyboardInterrupt
+
+        try:
+            with patch("scripts.streamed_overlap_epoch_runner.prepare_epoch_inputs",
+                       return_value=({}, inputs["validate_epoch"], object(), None)), \
+                 patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
+                 patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler",
+                       return_value=FixtureSampler(4, self.hashes["source"])), \
+                 patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs", side_effect=interrupt), \
+                 patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")), \
+                 patch.object(runner, "start_tensorboard", side_effect=start_service), \
+                 patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.training_attempt(record_path, suite, logs, logs, "synthetic", resume=False, **options)
+                self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"], "interrupted")
+                self.assertTrue(runner.ready(owners[0]))
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.training_attempt(record_path, suite, resume_logs, logs, "retry", resume=True, **options)
+                self.assertEqual(json.loads((resume_logs / "run_manifest.json").read_text())["status"],
+                                 "interrupted")
+                self.assertEqual(owners[0]["pid"], owners[1]["pid"])
+                self.assertTrue(runner.ready(owners[1]))
+                self.assertEqual(initial_hashes[0], initial_hashes[1])
+                self.assertNotEqual(json.loads((logs / "run_manifest.json").read_text())["attempt_id"],
+                                    json.loads((resume_logs / "run_manifest.json").read_text())["attempt_id"])
+                self.assertFalse((logs / "evaluation_receipt.json").exists())
+                self.assertFalse((resume_logs / "evaluation_receipt.json").exists())
+        finally:
+            if owners:
+                runner.stop_tensorboard(suite, logs)
 
     def test_evaluation_child_applies_mps_limit_and_never_enables_training(self):
         record = suite_input_record(self.suite_dir, **self.suite_inputs())

@@ -196,6 +196,11 @@ def smoke_attempt(config: Path, output: Path, log_dir: Path, run_id: str) -> int
             report = json.loads(report_path.read_text())
             if report.get("status") != "NO_OPTIMIZER_SMOKE_PASSED" or report.get("optimizer_step") is not False:
                 raise ValueError("Smoke child did not produce the required no-optimizer report.")
+            gradients = report.get("unweighted_task_encoder_gradient_l2")
+            if (not isinstance(gradients, dict) or set(gradients) != {"overlap", "coverage"}
+                    or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                           or not math.isfinite(value) or value <= 0 for value in gradients.values())):
+                raise ValueError("Smoke child did not report finite nonzero downstream encoder gradients.")
             manifest["artifact_sha256"] = {"smoke_report.json": file_hash(report_path)}
             manifest["status"] = "smoke_complete_training_not_authorized"
         else:

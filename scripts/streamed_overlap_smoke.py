@@ -18,6 +18,22 @@ from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.train import SliceLPIPSLoss, monitor_streamed_pairs, streamed_monitor_hash
 
 
+def _task_encoder_gradient_norm(loss: torch.Tensor, encoder: torch.nn.Module, name: str) -> float:
+    if not loss.requires_grad:
+        raise ValueError(f"Smoke requires a differentiable {name} loss.")
+    gradients = torch.autograd.grad(loss, tuple(encoder.parameters()), retain_graph=True, allow_unused=True)
+    if not any(gradient is not None for gradient in gradients):
+        raise ValueError(f"Smoke requires {name} gradients in the encoder.")
+    squared_norm = sum(
+        float(gradient.detach().float().square().sum().item())
+        for gradient in gradients if gradient is not None
+    )
+    norm = math.sqrt(squared_norm)
+    if not math.isfinite(norm) or norm == 0:
+        raise ValueError(f"Smoke requires finite nonzero {name} gradients in the encoder.")
+    return norm
+
+
 def _validate_config(config: dict, output: Path) -> Path:
     if (not isinstance(config, dict)
             or set(config) != {"source_root", "seed", "sparse_probability", "mps_memory_fraction", "max_wall_seconds"}
@@ -38,6 +54,8 @@ def _validate_config(config: dict, output: Path) -> Path:
         raise ValueError("The regenerating validation-v2 dataset is not permitted.")
     if output.resolve().is_relative_to(root):
         raise ValueError("Smoke output must be outside the source root.")
+    if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "0":
+        raise ValueError("The smoke must not enable MPS CPU fallback.")
     return root
 
 
@@ -74,6 +92,12 @@ def run_smoke(config: dict, output: Path) -> dict:
     )
     if losses.valid_coverage == 0:
         raise ValueError("Smoke training pairs have no valid coverage labels.")
+    if losses.overlap is None or losses.coverage is None:
+        raise ValueError("Smoke requires both downstream losses.")
+    task_encoder_gradient_l2 = {
+        "overlap": _task_encoder_gradient_norm(losses.overlap, model.vae.encoder, "overlap"),
+        "coverage": _task_encoder_gradient_norm(losses.coverage, model.vae.encoder, "coverage"),
+    }
     losses.total.backward()
     torch.mps.synchronize()
     if any(parameter.grad is not None and not torch.isfinite(parameter.grad).all()
@@ -107,12 +131,16 @@ def run_smoke(config: dict, output: Path) -> dict:
         "status": "NO_OPTIMIZER_SMOKE_PASSED", "source_manifest_sha256": samplers["train"].source_manifest_hash,
         "pairs": {split: len(batch.provenance) for split, batch in batches.items()},
         "valid_coverage": {split: values["valid_coverage"] for split, values in monitors.items()},
+        "unweighted_task_encoder_gradient_l2": task_encoder_gradient_l2,
         "monitor_sha256": streamed_monitor_hash(batches), "monitor_seconds": monitor_seconds,
         "elapsed_seconds": time.monotonic() - started,
         "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
         "optimizer_step": False,
-        "limitation": "No optimizer, epoch, checkpoint recovery, retrieval scoring or training readiness was tested.",
+        "limitation": (
+            "Unweighted single-batch task gradients do not establish improved representations. "
+            "No optimizer, epoch, checkpoint recovery, retrieval scoring or training readiness was tested."
+        ),
     }
 
 

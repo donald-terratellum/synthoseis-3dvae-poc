@@ -635,7 +635,9 @@ Runner requirements:
 - Audit mode may inspect metadata and bounded training/validation labels; it never
   trains. Print-only mode must have no output-directory, service or training side effects.
 - Smoke uses tiny synthetic fixtures in cloud and a few real streamed training/validation
-  pairs locally. It is not a scientific result and must not bypass a production gate.
+  pairs locally. The no-optimizer smoke checks each downstream loss separately for a
+  finite nonzero encoder gradient; this is a gradient-path check, not a result about
+  improved representations. Smoke must not bypass a production gate.
 - Production train/resume require approved contract and launch config. Check mounted
   volume, readable sources/checkpoints, bounded caches, disk headroom, real batch-12-pair
   forward/backward memory and source exclusions before starting.

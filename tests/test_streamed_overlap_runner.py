@@ -771,10 +771,12 @@ class AuditAttemptTests(unittest.TestCase):
                 output.mkdir()
                 (output / "smoke_report.json").write_text(json.dumps({
                     "status": "NO_OPTIMIZER_SMOKE_PASSED", "optimizer_step": False,
+                    "unweighted_task_encoder_gradient_l2": {"overlap": 1.0, "coverage": 2.0},
                 }))
                 return child
 
             with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                 mock.patch.object(runner.platform, "platform", return_value="fixture-platform"), \
                  mock.patch.object(runner.subprocess, "check_output",
                                    side_effect=["fixture", b"fixture", ""]):
                 self.assertEqual(runner.smoke_attempt(config, output, logs, "fixture"), 0)
@@ -783,6 +785,36 @@ class AuditAttemptTests(unittest.TestCase):
             self.assertFalse(manifest["production_training_allowed"])
             self.assertEqual(manifest["artifact_sha256"]["smoke_report.json"],
                              runner.file_hash(output / "smoke_report.json"))
+
+    def test_smoke_attempt_rejects_missing_or_invalid_task_gradients(self):
+        for gradients in (None, {"overlap": 1.0}, {"overlap": 1.0, "coverage": 0.0},
+                          {"overlap": True, "coverage": 1.0},
+                          {"overlap": float("inf"), "coverage": 1.0}):
+            with self.subTest(gradients=gradients), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                logs = root / "logs"
+                logs.mkdir()
+                config = root / "config.json"
+                config.write_text("{}")
+                output = root / "output"
+                child = mock.Mock()
+                child.wait.return_value = 0
+
+                def start_child(command):
+                    output.mkdir()
+                    (output / "smoke_report.json").write_text(json.dumps({
+                        "status": "NO_OPTIMIZER_SMOKE_PASSED", "optimizer_step": False,
+                        "unweighted_task_encoder_gradient_l2": gradients,
+                    }))
+                    return child
+
+                with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                     mock.patch.object(runner.platform, "platform", return_value="fixture-platform"), \
+                     mock.patch.object(runner.subprocess, "check_output",
+                                       side_effect=["fixture", b"fixture", ""]):
+                    with self.assertRaisesRegex(ValueError, "downstream encoder gradients"):
+                        runner.smoke_attempt(config, output, logs, "fixture")
+                self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"], "failed")
 
     def test_prepare_print_only_and_missing_limits_have_no_side_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -903,6 +935,9 @@ class AuditAttemptTests(unittest.TestCase):
                 "mps_memory_fraction": 0.5, "max_wall_seconds": 30,
             }
             self.assertEqual(_validate_config(config, root / "output"), source.resolve())
+            with mock.patch.dict("os.environ", {"PYTORCH_ENABLE_MPS_FALLBACK": "1"}):
+                with self.assertRaisesRegex(ValueError, "fallback"):
+                    _validate_config(config, root / "output")
             with self.assertRaisesRegex(ValueError, "outside"):
                 _validate_config(config, source / "output")
             forbidden = root / "fake_data_validation_v2"
@@ -966,6 +1001,7 @@ class AuditAttemptTests(unittest.TestCase):
                 return child
 
             with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                 mock.patch.object(runner.platform, "platform", return_value="fixture-platform"), \
                  mock.patch.object(runner.subprocess, "check_output",
                                    side_effect=["fixture", b"fixture", ""]):
                 with self.assertRaisesRegex(ValueError, "no-optimizer"):

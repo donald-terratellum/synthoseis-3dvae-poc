@@ -2,6 +2,43 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: service and encoder-gradient smoke
+
+An opt-in synthetic MPS fixture now runs the record-bound training attempt
+through actual S1/S2/S3 checkpoint initialization and an actual TensorBoard
+server. It interrupts before any optimizer step, resumes with a distinct attempt,
+verifies unchanged initial checkpoint hashes and reuses the same healthy server.
+The fixture stops only its own server. Inputs and validation are mocked, and the
+epoch coordinator is replaced by the interruption; it is not a full suite run.
+On this Mac it passed in 4.21 seconds including startup, with 535,052,288 bytes
+peak process RSS; the TensorBoard child's peak and aggregate memory were not
+measured. To repeat:
+
+```sh
+STREAMED_MPS_SMOKE=1 .venv/bin/python -m pytest -q -s \
+  tests/test_streamed_overlap_initialization.py -k runner_mps_bootstrap_interrupt_and_resume_with_tensorboard
+```
+
+The no-optimizer real-data smoke now separately differentiates the overlap and
+coverage losses through the encoder and requires both gradients to be finite and
+nonzero. Run `encoder-gradient-smoke-20261122` passed through the shell and
+runner using 12 streamed training pairs and 12 primary-validation monitor pairs,
+with CPU fallback disabled and no optimizer step. For that one training batch,
+the **unweighted** encoder gradient L2 norms were 1.1852 for overlap and 1.5890
+for coverage; all 12 training coverage targets were valid. This verifies a
+gradient path, not learning, causal benefit, relative task importance or
+geological understanding. Matched S2-vs-S1 and S3-vs-S2 mu-cosine retrieval,
+reconstruction guardrails and independent-seed replication remain necessary.
+
+The child reported 19.40 seconds, 1,931,411,456 bytes peak process RSS and
+2,505,916,416 bytes MPS driver allocation sampled afterward, not peak MPS or
+aggregate memory. The report hash was verified against its runner manifest;
+the smoke uses a 0.5 per-process MPS fraction and is not a production resource
+forecast or approval. The smoke rejects MPS CPU fallback. Runner, model,
+initialization and step tests passed (97 tests, two skipped, 52 subtests).
+The real-data smoke does not exercise the matched train/resume suite or its
+formal evaluation; public train/resume remain blocked.
+
 ## Local continuation: train/resume shell integration
 
 The public shell can now preview fresh and resume commands for the record-bound
