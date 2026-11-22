@@ -4,6 +4,24 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The no-training `prepare_suite_initial_checkpoints` helper now prepares fresh
+S1/S2/S3 E1 checkpoints sequentially from an explicitly seeded sampler and
+device, then verifies and persists initialization evidence and suite metadata.
+It requires three separate, locked, reconciled, empty journals and verifies all
+existing arm state before writing. It can recover an interrupted fresh bootstrap
+without replacing valid checkpoints; missing files after evidence publication,
+partial records or an advanced arm fail closed. An advanced suite must use
+resume, not bootstrap. The caller still creates and owns the directories and
+journals. The helper does not bind the full launch configuration, validate
+resource gates, call the coordinator, or authorize training.
+
+Three synthetic CPU/MPS bootstrap and recovery tests passed on ExFAT in 9.95
+seconds wall time at 625,344,512 bytes peak RSS. Optimizer steps were prohibited
+in the successful bootstrap checks, no real data was used, and temporary files
+were removed. This is not a training-resource estimate. The portable streamed
+suite passed 223 tests, with one skipped and 54 subtests, using
+`.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 An opt-in `run_suite_epochs` coordinator now calls the existing per-arm runner
 in S1, S2, S3 order. It verifies the pinned suite metadata and all three locked
 journals before opening an arm runtime, releases each runtime context before the
@@ -313,8 +331,8 @@ Private manifests, checkpoints and audit outputs remain on the external volume a
 are not in GitHub. `.venv/bin/uv` was unavailable; use `.venv/bin/python`, not
 system Python.
 
-Training is **not ready or authorized**. The prepared-suite coordinator is not
-a complete launch runner. Next implement suite bootstrap and the complete
+Training is **not ready or authorized**. The bootstrap and prepared-suite
+coordinator are not a complete launch runner. Next implement the complete
 configuration-bound train/resume and logging integration, frozen bounded-search
 and diagnostics inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
 smoke and present proposed launch commands, measurements and remaining approval

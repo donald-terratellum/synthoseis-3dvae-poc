@@ -18,7 +18,9 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
     ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, run_arm_epochs, run_suite_epochs,
 )
-from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
+from scripts.streamed_overlap_initialization import (
+    _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
+)
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _rngs_equal, save_suite_initialization, save_suite_run_metadata, verify_arm_initial_checkpoint,
@@ -110,6 +112,106 @@ class ArmInitializationTests(unittest.TestCase):
             result = self.prepare(model=model, optimizer=optimizer, scheduler=scheduler, journal=journal)
             evidence[arm] = ArmEvidence(result["initial_checkpoint"], result["checkpoint_path"], journal)
         return evidence
+
+    def empty_suite_journals(self):
+        journals = {"S3": self.journal}
+        for arm in ("S1", "S2"):
+            directory = self.suite_dir / arm
+            directory.mkdir()
+            journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=True)
+            self.addCleanup(journal.close)
+            journal.reconcile(watermark=None, attempt_id=arm, expected_step=0, expected_exposure=0)
+            journals[arm] = journal
+        return journals
+
+    def test_suite_bootstrap_recovers_partial_arm_and_pins_evidence(self):
+        journals = self.empty_suite_journals()
+        def bootstrap():
+            return prepare_suite_initial_checkpoints(
+                self.suite_dir, journals, sampler=self.sampler, device="cpu",
+                hashes=self.hashes, matching_config=self.config, source_root=self.source,
+            )
+
+        def interrupt(source, destination, expected):
+            if destination == journals["S2"].path.parent / "last.pt":
+                raise OSError("interrupted S2")
+            return _publish_copy(source, destination, expected)
+
+        with patch("scripts.streamed_overlap_initialization._publish_copy", side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, "interrupted S2"):
+                bootstrap()
+        s1 = journals["S1"].path.parent / "initial.pt"
+        s2 = journals["S2"].path.parent / "initial.pt"
+        original_s1, original_s2 = s1.read_bytes(), s2.read_bytes()
+        self.assertFalse((self.suite_dir / "initialization_evidence.json").exists())
+        self.assertFalse((self.suite_dir / "suite_metadata.json").exists())
+        with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")), \
+             patch("scripts.streamed_overlap_initialization.save_suite_run_metadata",
+                   side_effect=OSError("interrupted metadata")):
+            with self.assertRaisesRegex(OSError, "interrupted metadata"):
+                bootstrap()
+        evidence = (self.suite_dir / "initialization_evidence.json").read_bytes()
+        with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            result = bootstrap()
+        self.assertEqual(result["evidence_path"].read_bytes(), evidence)
+        self.assertEqual(s1.read_bytes(), original_s1)
+        self.assertEqual(s2.read_bytes(), original_s2)
+        self.assertEqual(bootstrap(), result)
+        metadata = verify_suite_run_metadata(
+            self.suite_dir, result["initial_checkpoints"], matching_config=self.config, expected_hashes=self.hashes,
+        )
+        self.assertEqual(metadata["initialization_sha256"], result["evidence_sha256"])
+        self.assertEqual(metadata["sha256"], result["metadata_sha256"])
+        for arm, initial in result["initial_checkpoints"].items():
+            self.assertEqual(initial.read_bytes(), initial.with_name("last.pt").read_bytes(), arm)
+            self.assertEqual(journals[arm].rows, [])
+
+    def test_suite_bootstrap_rejects_unlocked_or_advanced_suite_before_writes(self):
+        journals = self.empty_suite_journals()
+        def bootstrap():
+            return prepare_suite_initial_checkpoints(
+                self.suite_dir, journals, sampler=self.sampler, device="cpu",
+                hashes=self.hashes, matching_config=self.config, source_root=self.source,
+            )
+
+        journals["S3"].close()
+        with self.assertRaisesRegex(ValueError, "empty, reconciled, locked"):
+            bootstrap()
+        self.assertFalse((journals["S1"].path.parent / "initial.pt").exists())
+        journal = BatchJournal(self.run_dir / "batch_metrics.csv", STEP_FIELDS, create=False)
+        self.addCleanup(journal.close)
+        journal.reconcile(watermark=None, attempt_id="reopened", expected_step=0, expected_exposure=0)
+        journals["S3"] = journal
+        result = bootstrap()
+        initial = result["initial_checkpoints"]["S3"]
+        last = initial.with_name("last.pt")
+        state = torch.load(last, weights_only=True)
+        state["completed_epoch"] = 1
+        torch.save(state, last)
+        before = result["metadata_path"].read_bytes()
+        with self.assertRaisesRegex(ValueError, "advanced suite must use resume"):
+            bootstrap()
+        self.assertEqual(result["metadata_path"].read_bytes(), before)
+        last.unlink()
+        with self.assertRaisesRegex(ValueError, "requires all retained"):
+            bootstrap()
+        self.assertFalse(last.exists())
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_suite_bootstrap_prepares_mps_without_optimizer_step(self):
+        journals = self.empty_suite_journals()
+        before = torch.mps.get_rng_state()
+        with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            result = prepare_suite_initial_checkpoints(
+                self.suite_dir, journals, sampler=self.sampler, device="mps",
+                hashes=self.hashes, matching_config=self.config, source_root=self.source,
+            )
+        self.assertTrue(torch.equal(before, torch.mps.get_rng_state()))
+        evidence = verify_saved_suite_initialization(
+            result["evidence_path"], result["initial_checkpoints"], matching_config=self.config,
+            expected_hashes=self.hashes, expected_evidence_sha256=result["evidence_sha256"],
+        )
+        self.assertEqual(evidence["initialization"]["device"], "mps")
 
     def test_suite_preflight_verifies_all_fresh_arms_without_mutating_rng(self):
         evidence = self.prepare_suite()

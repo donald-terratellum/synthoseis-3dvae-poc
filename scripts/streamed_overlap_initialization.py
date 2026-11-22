@@ -1,6 +1,7 @@
 """Publish fresh, recoverable arm checkpoints; this module never starts training."""
 
 import hashlib
+import json
 from pathlib import Path
 import uuid
 
@@ -13,10 +14,12 @@ from scripts.streamed_overlap_checkpoint import (
 from scripts.streamed_overlap_evaluation import _checkpoint_state
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _publish_exclusive, _sync_directory
 from scripts.streamed_overlap_matching import (
-    _digest, _initial_state, _permitted_file, _rngs_equal, matching_config_hash, verify_arm_initial_checkpoint,
+    ArmEvidence, _digest, _initial_state, _permitted_file, _recovery_files, _rngs_equal,
+    _validate_suite_metadata_dir, matching_config_hash, save_suite_initialization, save_suite_run_metadata,
+    verify_arm_initial_checkpoint, verify_saved_suite_initialization, verify_suite_run_metadata,
 )
-from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
-from scripts.train import streamed_inference_context
+from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
+from scripts.train import EarlyStoppingState, streamed_inference_context
 
 
 def _publish_copy(source: Path, destination: Path, expected: str) -> None:
@@ -149,4 +152,108 @@ def prepare_arm_initial_checkpoints(
     return {
         "initial_checkpoint": initial, "checkpoint_path": last,
         "initial_checkpoint_sha256": digest, "matching_config_sha256": config_hash,
+    }
+
+
+def prepare_suite_initial_checkpoints(
+    suite_dir: Path, journals: dict[str, BatchJournal], *, sampler, device: str,
+    hashes: dict, matching_config: dict, source_root: Path,
+) -> dict:
+    """Prepare and pin three fresh arms without training; advanced suites must use resume."""
+    _validate_suite_metadata_dir(suite_dir)
+    _validate_hashes(hashes)
+    if (hashes.get("matching") != matching_config_hash(matching_config)
+            or not isinstance(journals, dict) or set(journals) != {"S1", "S2", "S3"}
+            or device not in {"cpu", "mps"}):
+        raise ValueError("A bound configuration, explicit device and three arm journals are required.")
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is required for an MPS suite initialization.")
+    source = source_root.resolve(strict=True)
+    root = suite_dir.resolve(strict=True)
+    if ("fake_data_validation_v2" in source_root.parts or "fake_data_validation_v2" in source.parts
+            or not source.is_dir() or root.is_relative_to(source) or source.is_relative_to(root)):
+        raise ValueError("Suite and source directories must be separate and outside validation-v2.")
+
+    evidence_path = suite_dir / "initialization_evidence.json"
+    metadata_path = suite_dir / "suite_metadata.json"
+    sealed = any(path.exists() or path.is_symlink() for path in (evidence_path, metadata_path))
+    checkpoints = {}
+    roots = set()
+    for arm in ("S1", "S2", "S3"):
+        journal = journals[arm]
+        if (not isinstance(journal, BatchJournal) or journal.lock_fd == -1 or journal.fields != STEP_FIELDS
+                or journal.position is None or journal.attempt_id is None or journal.position.logical_step != 0
+                or journal.position.cumulative_exposure != 0):
+            raise ValueError("Each arm requires an empty, reconciled, locked step journal.")
+        directory = journal.path.parent
+        if (directory.is_symlink() or not directory.is_dir() or directory.resolve().parent != root
+                or directory.resolve() in roots or journal.path.name != "batch_metrics.csv"):
+            raise ValueError("Each arm requires its own regular directory inside the suite.")
+        roots.add(directory.resolve())
+        _permitted_file(journal.path)
+        _recovery_files(journal)
+        if journal._read() or journal.rows:
+            raise ValueError("Each arm requires an empty, reconciled, locked step journal.")
+        initial, last = directory / "initial.pt", directory / "last.pt"
+        initial_exists = initial.exists() or initial.is_symlink()
+        last_exists = last.exists() or last.is_symlink()
+        if (last_exists and not initial_exists) or (sealed and not (initial_exists and last_exists)):
+            raise ValueError("Existing suite evidence requires all retained initial and last checkpoints.")
+        if initial_exists:
+            _permitted_file(initial)
+            state, _ = _checkpoint_state(initial)
+            if (state.get("hashes") != hashes or state.get("device") != device
+                    or state.get("batches_per_epoch") != matching_config["batches_per_epoch"]):
+                raise ValueError("Existing initial checkpoint does not match the requested suite.")
+            _initial_state(
+                state, arm, state, matching_config["model_seed"], matching_config["head_seed"],
+                matching_config["sampler_seed"],
+            )
+        if last_exists:
+            verify_arm_initial_checkpoint(
+                initial, last, arm=arm, matching_config=matching_config, expected_hashes=hashes,
+            )
+            state, _ = _checkpoint_state(last)
+            if type(state.get("completed_epoch")) is not int or state["completed_epoch"] != 0:
+                raise ValueError("An advanced suite must use resume, not initialization.")
+        checkpoints[arm] = initial
+
+    if metadata_path.exists() or metadata_path.is_symlink():
+        verify_suite_run_metadata(suite_dir, checkpoints, matching_config=matching_config, expected_hashes=hashes)
+    elif evidence_path.exists() or evidence_path.is_symlink():
+        _permitted_file(evidence_path)
+        saved = json.loads(evidence_path.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            raise ValueError("Existing suite initialization evidence is invalid.")
+        pin = saved.get("sha256")
+        if not isinstance(pin, str):
+            raise ValueError("Existing suite initialization evidence is invalid.")
+        verify_saved_suite_initialization(
+            evidence_path, checkpoints, matching_config=matching_config, expected_hashes=hashes,
+            expected_evidence_sha256=pin,
+        )
+
+    arms = {}
+    for arm in ("S1", "S2", "S3"):
+        model = fresh_e1_model(arm, matching_config["model_seed"], matching_config["head_seed"]).to(device)
+        optimizer = build_optimizer(model)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=6, min_lr=1e-5)
+        result = prepare_arm_initial_checkpoints(
+            model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+            early_stopping=EarlyStoppingState(float("inf"), 0), journal=journals[arm],
+            hashes=hashes, matching_config=matching_config, source_root=source_root,
+        )
+        arms[arm] = ArmEvidence(result["initial_checkpoint"], result["checkpoint_path"], journals[arm])
+        del scheduler, optimizer, model
+    saved = save_suite_initialization(
+        suite_dir, arms, matching_config=matching_config, expected_hashes=hashes, source_root=source_root,
+    )
+    metadata = save_suite_run_metadata(
+        suite_dir, checkpoints, matching_config=matching_config, expected_hashes=hashes,
+        initialization_sha256=saved["evidence_sha256"],
+    )
+    return {
+        "evidence_path": saved["path"], "evidence_sha256": saved["evidence_sha256"],
+        "initial_checkpoints": checkpoints, "metadata_path": metadata["path"],
+        "metadata_sha256": metadata["metadata_sha256"],
     }
