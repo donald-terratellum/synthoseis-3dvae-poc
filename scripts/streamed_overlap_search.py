@@ -178,20 +178,10 @@ def _search_results(scores_path: Path, output_path: Path, region: Window, query:
     }
 
 
-def run_bounded_searches(
-    checkpoint_path: Path, journal, manifest_path: Path, source_root: Path, manifest: dict, groups: dict,
-    search_manifest: dict, output: Path,
-) -> dict:
-    """Run the exact tokenizer CLI on verified frozen regions of an evaluated checkpoint."""
-    started = time.monotonic()
-    root = source_root.resolve(strict=True)
-    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
-    destination = output.resolve()
-    if (destination.is_relative_to(root) or forbidden.is_relative_to(destination)
-            or destination.is_relative_to(forbidden) or "fake_data_validation_v2" in destination.parts
-            or "fake_data_validation_v2" in root.parts or forbidden.is_relative_to(root)):
-        raise ValueError("Bounded searches must exclude validation-v2 and write outside the source root.")
-    if (search_manifest.get("schema") != "streamed-bounded-tokenizer-search-v1"
+def verify_search_manifest(manifest: dict, groups: dict, search_manifest: dict) -> None:
+    """Recheck frozen search settings, implementation and source-region fingerprints."""
+    if (not isinstance(search_manifest, dict)
+            or search_manifest.get("schema") != "streamed-bounded-tokenizer-search-v1"
             or search_manifest.get("search_manifest_sha256") != content_hash({
                 key: value for key, value in search_manifest.items() if key != "search_manifest_sha256"
             })
@@ -205,6 +195,22 @@ def run_bounded_searches(
     current = freeze_search_manifest(manifest, groups, plans, **{key: search_manifest[key] for key in keys})
     if current != search_manifest:
         raise ValueError("Bounded source regions differ from the frozen search manifest.")
+
+
+def run_bounded_searches(
+    checkpoint_path: Path, journal, manifest_path: Path, source_root: Path, manifest: dict, groups: dict,
+    search_manifest: dict, output: Path,
+) -> dict:
+    """Run the exact tokenizer CLI on verified frozen regions of an evaluated checkpoint."""
+    started = time.monotonic()
+    root = source_root.resolve(strict=True)
+    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
+    destination = output.resolve()
+    if (destination.is_relative_to(root) or forbidden.is_relative_to(destination)
+            or destination.is_relative_to(forbidden) or "fake_data_validation_v2" in destination.parts
+            or "fake_data_validation_v2" in root.parts or forbidden.is_relative_to(root)):
+        raise ValueError("Bounded searches must exclude validation-v2 and write outside the source root.")
+    verify_search_manifest(manifest, groups, search_manifest)
     if search_manifest["device"] == "mps" and os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "0":
         raise ValueError("MPS CPU fallback is not permitted for bounded searches.")
     verification = verify_inputs(manifest, groups)

@@ -13,7 +13,7 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_integrity import _digest_array, _window_record
 from scripts.streamed_overlap_manifest import _window
 from scripts.streamed_overlap_search import (
-    PATCH_SHAPE, _search_results, freeze_search_manifest, run_bounded_searches,
+    PATCH_SHAPE, _search_results, freeze_search_manifest, run_bounded_searches, verify_search_manifest,
 )
 from scripts.streamed_overlap_yield import SEISMIC_KEY
 from src.tokenizer.core.io_zarr import compute_padding
@@ -59,6 +59,19 @@ class BoundedSearchTests(unittest.TestCase):
         self.data[0, 0, 0] += 1
         with self.assertRaisesRegex(ValueError, "frozen validation"):
             self.freeze()
+
+    def test_verify_rejects_changed_region_outside_query_and_implementation(self):
+        self.plans[0]["region_shape"] = [48, 48, 64]
+        self.settings["max_windows"] = 200
+        frozen = self.freeze()
+        verify_search_manifest(self.manifest, self.groups, frozen)
+        self.data[40, 0, 0] += 1
+        with self.assertRaisesRegex(ValueError, "source regions"):
+            verify_search_manifest(self.manifest, self.groups, frozen)
+        self.data[40, 0, 0] -= 1
+        with patch("scripts.streamed_overlap_search._implementation_hashes", return_value={}):
+            with self.assertRaisesRegex(ValueError, "frozen identity"):
+                verify_search_manifest(self.manifest, self.groups, frozen)
 
     def write_results(self, scores: Path, output: Path):
         padding = compute_padding(PATCH_SHAPE, patch_size=PATCH_SHAPE, base_pad=16)

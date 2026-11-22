@@ -539,7 +539,8 @@ class ArmInitializationTests(unittest.TestCase):
         arguments = {
             "attempt_id": "attempt", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
             "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
-            "search_manifest": search, "diagnostic_manifest": {}, "formal_config": {}, "guardrail_manifest": {},
+            "search_manifest": search, "diagnostic_manifest": {},
+            "formal_config": {"diagnostic_max_wall_seconds": 30}, "guardrail_manifest": {},
             "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
             "suite_initialization": suite,
         }
@@ -548,6 +549,13 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs") as epoch_gate, \
              patch("scripts.streamed_overlap_epoch_runner.verify_validation_preflight") as validation_preflight, \
+             patch("scripts.streamed_overlap_epoch_runner.load_manifest", return_value={
+                 "manifest_sha256": self.hashes["validation_manifest"],
+                 "target_implementation_sha256": self.hashes["target"],
+             }), \
+             patch("scripts.streamed_overlap_epoch_runner.open_validation_sources", return_value={}), \
+             patch("scripts.streamed_overlap_epoch_runner.verify_search_manifest") as search_preflight, \
+             patch("scripts.streamed_overlap_epoch_runner.verify_diagnostics") as diagnostics_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm:
             original = metadata["path"].read_bytes()
             metadata["path"].unlink()
@@ -572,6 +580,26 @@ class ArmInitializationTests(unittest.TestCase):
             run_arm.assert_not_called()
             self.assertEqual(calls, [])
             validation_preflight.side_effect = None
+            search_preflight.side_effect = ValueError("changed search region")
+            with self.assertRaisesRegex(ValueError, "changed search region"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
+            search_preflight.side_effect = None
+            diagnostics_preflight.side_effect = ValueError("changed diagnostic labels")
+            with self.assertRaisesRegex(ValueError, "changed diagnostic labels"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
+            search_preflight.assert_called_with(
+                {"manifest_sha256": self.hashes["validation_manifest"],
+                 "target_implementation_sha256": self.hashes["target"]}, {}, search,
+            )
+            diagnostics_preflight.assert_called_with(
+                {"manifest_sha256": self.hashes["validation_manifest"],
+                 "target_implementation_sha256": self.hashes["target"]}, {}, {}, max_wall_seconds=30,
+            )
+            diagnostics_preflight.side_effect = None
             fail_s2 = True
             with self.assertRaisesRegex(RuntimeError, "interrupted S2"):
                 run_suite_epochs(journals, runtime_factory, **arguments)

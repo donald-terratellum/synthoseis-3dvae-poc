@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state
-from scripts.streamed_overlap_diagnostics import diagnostic_report
+from scripts.streamed_overlap_diagnostics import diagnostic_report, verify_diagnostics
 from scripts.streamed_overlap_evaluation import (
     StreamedEpochValidator, _checkpoint_state, _identity, _validate_evaluation_parameters, evaluate_checkpoint,
 )
@@ -37,7 +37,7 @@ from scripts.streamed_overlap_model import StreamedPairVAE
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
 )
-from scripts.streamed_overlap_search import run_bounded_searches
+from scripts.streamed_overlap_search import run_bounded_searches, verify_search_manifest
 from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
 from scripts.train import EarlyStoppingState, streamed_monitor_hash, train_streamed_epoch
@@ -916,6 +916,23 @@ def run_suite_epochs(
         manifest_path, source_root, expected_manifest_sha256=hashes["validation_manifest"],
         expected_target_sha256=hashes["target"],
     )
+    manifest = load_manifest(manifest_path)
+    if (manifest.get("manifest_sha256") != hashes["validation_manifest"]
+            or manifest.get("target_implementation_sha256") != hashes["target"]):
+        raise ValueError("Validation manifest changed before evaluation-input preflight.")
+    root = source_root.resolve(strict=True)
+    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
+    if "fake_data_validation_v2" in root.parts or forbidden.is_relative_to(root):
+        raise ValueError("Evaluation-input preflight must exclude validation-v2.")
+    groups = open_validation_sources(root, manifest)
+    verify_search_manifest(manifest, groups, search_manifest)
+    verify_diagnostics(
+        manifest, groups, diagnostic_manifest, max_wall_seconds=formal_config["diagnostic_max_wall_seconds"],
+    )
+    if load_manifest(manifest_path) != manifest or source_root.resolve(strict=True) != root:
+        raise ValueError("Validation manifest or source path changed during evaluation-input preflight.")
+    open_validation_sources(root, manifest)
+    del groups
     print(json.dumps(workload, sort_keys=True), flush=True)
     s1_initial = suite_initialization.initial_checkpoints["S1"]
     s1 = SelectedReconstruction(

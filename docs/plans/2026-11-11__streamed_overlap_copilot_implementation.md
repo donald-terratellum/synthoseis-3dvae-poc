@@ -4,6 +4,27 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+Before opening any arm runtime, the prepared-suite coordinator now also
+revalidates each frozen bounded-search region and the diagnostic label
+fingerprints using the same verifiers used during evaluation. It checks the
+validation manifest and source inventory again afterward. The diagnostic
+verification uses the configured diagnostic wall limit; search verification
+can also take time and read the bounded regions. Unavailable diagnostic
+windows retain their recorded unavailable status. These checks do not certify
+whole sources, prevent later changes, establish resource readiness, or authorize
+training; evaluation still repeats its own checks.
+
+The search verifier was extracted from the search runner, changing the
+implementation fingerprint. Previously frozen search manifests therefore fail
+verification and must be regenerated from explicitly selected settings before
+use; none were generated here. The diagnostic implementation did not change.
+No real-data search or diagnostic preflight was run on this continuation.
+The portable streamed suite passed 231 tests, with one skipped and 54 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`; it took 36.87
+seconds wall time and 714,080,256 bytes peak RSS. These test measurements are
+not training-resource estimates. The shell's train, resume and evaluate modes
+remain blocked.
+
 The prepared-suite coordinator now validates the bounded-search manifest's
 schema, content hash and nonempty search list before opening an arm runtime.
 It prints a `suite_workload` report calculated from explicit matching settings
