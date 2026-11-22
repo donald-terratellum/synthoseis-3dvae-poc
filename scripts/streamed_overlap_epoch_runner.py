@@ -834,6 +834,23 @@ def complete_matched_arm(
     return {"path": str(path.relative_to(evaluation_dir)), "record": report}
 
 
+def _require_final_evaluation_checkpoint(
+    checkpoint_path: Path, journal: BatchJournal, *, arm: str, matching_config: dict, hashes: dict,
+) -> None:
+    _permitted_file(checkpoint_path)
+    state, digest = _checkpoint_state(checkpoint_path)
+    if (state.get("arm") != arm or state.get("device") != "mps"
+            or type(state.get("completed_epoch")) is not int
+            or state["completed_epoch"] != matching_config["final_epoch"]
+            or state.get("batches_per_epoch") != matching_config["batches_per_epoch"]
+            or state.get("hashes") != hashes):
+        raise ValueError(f"{arm} requires its completed, configuration-matched final checkpoint for evaluation.")
+    identity = _identity(state, digest, journal, hashes["validation_manifest"])
+    if (identity["run_id"] != matching_config["run_id"]
+            or identity["experiment_seed"] != matching_config["experiment_seed"]):
+        raise ValueError(f"{arm} final checkpoint does not belong to the matched suite.")
+
+
 def run_arm_epochs(
     model, optimizer, scheduler, sampler, journal, lpips_loss_fn, writer, *,
     run_id: str, seed: int, attempt_id: str, batches_per_epoch: int, sparse_probability: float,
@@ -842,9 +859,11 @@ def run_arm_epochs(
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, evaluation_dir: Path, guardrail_manifest: dict, guardrail_config: dict,
     historical: HistoricalReconstruction, s1: SelectedReconstruction | None, matching_config: dict,
-    initial_checkpoint: Path, suite_initialization: SuiteInitialization,
+    initial_checkpoint: Path, suite_initialization: SuiteInitialization, evaluate_only: bool = False,
 ) -> dict:
-    """Resume one arm from its full epoch state and finish evaluation before advancing."""
+    """Resume one arm, or evaluate its final checkpoint without training."""
+    if not isinstance(evaluate_only, bool):
+        raise ValueError("Evaluation-only mode must be explicit.")
     _validate_evaluation_bindings(hashes, formal_config, guardrail_config, historical)
     if (isinstance(formal_config.get("final_epoch"), bool)
             or not isinstance(formal_config.get("final_epoch"), int)
@@ -905,12 +924,18 @@ def run_arm_epochs(
         initial_checkpoint, checkpoint_path, arm=model.arm,
         matching_config=matching_config, expected_hashes=hashes,
     )
+    if evaluate_only:
+        _require_final_evaluation_checkpoint(
+            checkpoint_path, journal, arm=model.arm, matching_config=matching_config, hashes=hashes,
+        )
     restored = restore_epoch_state(
         checkpoint_path, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
         early_stopping=early_stopping, journal=journal, expected_hashes=hashes,
         expected_batches_per_epoch=batches_per_epoch, attempt_id=attempt_id,
     )
     completed = restored["completed_epoch"]
+    if evaluate_only and (type(completed) is not int or completed != formal_config["final_epoch"]):
+        raise ValueError("Evaluation-only mode cannot advance an incomplete arm.")
     if completed > formal_config["final_epoch"]:
         raise ValueError("Checkpoint is beyond the approved final epoch.")
     selection_state = restored["selection_state"]
@@ -1151,15 +1176,16 @@ def run_suite_epochs(
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
     historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
-    suite_initialization: SuiteInitialization,
+    suite_initialization: SuiteInitialization, evaluate_only: bool = False,
 ) -> dict[str, dict]:
-    """Run prepared arms in order; launch approval and resource gates remain external."""
+    """Run or evaluate prepared arms in order; approval and resource gates remain external."""
     if (not isinstance(suite_initialization, SuiteInitialization)
             or not isinstance(suite_initialization.evidence_path, Path)
             or suite_initialization.evidence_path.name != "initialization_evidence.json"
             or not isinstance(journals, dict) or set(journals) != {"S1", "S2", "S3"}
             or (runtime_factory is not None and not callable(runtime_factory)) or not isinstance(attempt_id, str)
-            or not attempt_id or any(character in attempt_id for character in "\r\n")):
+            or not attempt_id or any(character in attempt_id for character in "\r\n")
+            or not isinstance(evaluate_only, bool)):
         raise ValueError("A prepared suite, three journals and an explicit attempt are required.")
     metadata = verify_suite_run_metadata(
         suite_initialization.evidence_path.parent, suite_initialization.initial_checkpoints,
@@ -1183,6 +1209,12 @@ def run_suite_epochs(
             raise ValueError("Each arm requires its locked journal and regular evaluation directory.")
         _permitted_file(journal.path)
 
+    if evaluate_only:
+        for arm in ("S1", "S2", "S3"):
+            _require_final_evaluation_checkpoint(
+                suite_initialization.initial_checkpoints[arm].with_name("last.pt"), journals[arm],
+                arm=arm, matching_config=matching_config, hashes=hashes,
+            )
     verify_validation_preflight(
         manifest_path, source_root, expected_manifest_sha256=hashes["validation_manifest"],
         expected_target_sha256=hashes["target"],
@@ -1233,6 +1265,7 @@ def run_suite_epochs(
                 evaluation_dir=initial.parent / "evaluation", guardrail_manifest=guardrail_manifest,
                 guardrail_config=guardrail_config, historical=historical, s1=None if arm == "S1" else s1,
                 matching_config=matching_config, initial_checkpoint=initial, suite_initialization=suite_initialization,
+                evaluate_only=evaluate_only,
             )
             completed = True
         if not completed:
@@ -1249,15 +1282,16 @@ def run_suite(
     validate_epoch=None, lpips_loss_fn=None, epoch_validation: dict | None = None,
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
-    historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
+    historical: HistoricalReconstruction, matching_config: dict, hashes: dict, evaluate_only: bool = False,
 ) -> dict[str, dict]:
-    """Prepare a fresh suite or reopen an existing one, then run its arms in order.
+    """Prepare or reopen a suite, then run or evaluate its arms in order.
 
-    The caller must enforce launch approval, resource limits and log capture.
+    Evaluation requires resume and completed arms. The caller must enforce
+    launch approval where applicable, resource limits and log capture.
     """
-    if not isinstance(resume, bool) or not isinstance(attempt_id, str) or not attempt_id or any(
-        character in attempt_id for character in "\r\n"
-    ):
+    if (not isinstance(resume, bool) or not isinstance(evaluate_only, bool) or (evaluate_only and not resume)
+            or not isinstance(attempt_id, str) or not attempt_id
+            or any(character in attempt_id for character in "\r\n")):
         raise ValueError("An explicit fresh/resume mode and single-line attempt ID are required.")
     if epoch_validation is not None:
         if any(value is not None for value in (monitor_batches, validate_epoch, lpips_loss_fn)):
@@ -1331,6 +1365,8 @@ def run_suite(
                 suite_dir / "initialization_evidence.json", metadata["initialization_sha256"], checkpoints,
             )
         else:
+            if evaluate_only:
+                raise ValueError("Evaluation-only mode requires an existing initialized suite.")
             if resume:
                 if any(journal._read() or journal.rows for journal in journals.values()):
                     raise ValueError("A suite with recorded or incomplete steps cannot be reinitialized.")
@@ -1354,14 +1390,15 @@ def run_suite(
             search_manifest=search_manifest, diagnostic_manifest=diagnostic_manifest,
             formal_config=formal_config, guardrail_manifest=guardrail_manifest, guardrail_config=guardrail_config,
             historical=historical, matching_config=matching_config, hashes=hashes,
-            suite_initialization=initialization,
+            suite_initialization=initialization, evaluate_only=evaluate_only,
         )
 
 
 def run_suite_from_record(
     record_path: Path, suite_dir: Path, *, expected_config_sha256: str, resume: bool, attempt_id: str,
+    evaluate_only: bool = False,
 ) -> dict[str, dict]:
-    """Run a pinned suite record; the caller must enforce approval, resource limits and log capture."""
+    """Run or evaluate a pinned record; approval, resource limits and logging remain external."""
     if not isinstance(record_path, Path) or not isinstance(suite_dir, Path) or not _sha256(expected_config_sha256):
         raise ValueError("A suite record, destination and explicit configuration hash are required.")
     _permitted_file(record_path)
@@ -1401,5 +1438,5 @@ def run_suite_from_record(
         search_manifest=record["search_manifest"], diagnostic_manifest=record["diagnostic_manifest"],
         formal_config=record["formal_config"], guardrail_manifest=record["guardrail_manifest"],
         guardrail_config=record["guardrail_config"], historical=reference,
-        matching_config=record["matching_config"], hashes=hashes,
+        matching_config=record["matching_config"], hashes=hashes, evaluate_only=evaluate_only,
     )

@@ -4,6 +4,29 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The record-driven suite now has a programmatic evaluation-only option:
+`run_suite_from_record(..., resume=True, evaluate_only=True)`. It requires an
+existing initialized suite, the pinned inputs, and final-epoch checkpoints for
+all three arms. It checks each checkpoint's suite identity and journal watermark
+before evaluating any arm, then rechecks each arm before restoring it. An
+incomplete arm cannot enter the training loop. Normal checkpoint restoration and
+evaluation still perform further checks and may fail after an earlier arm has
+produced reports; this is not an atomic publication of all results.
+
+Evaluation can write journal recovery records, TensorBoard events and evaluation
+reports; it is not read-only and can require substantial MPS time and disk
+space. Its caller still needs resource controls and durable logging. The shell
+train/resume/evaluate modes remain blocked. The existing matched-stream checks
+and separate encoder μ-cosine and S3 pair-head results remain in force; the
+event-coverage proxy alone does not establish geological understanding.
+Checkpoint, matching, initialization and evaluation fixtures passed 108 tests
+and 42 subtests using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_initialization.py
+tests/test_streamed_overlap_checkpoint.py tests/test_streamed_overlap_evaluation.py
+tests/test_streamed_overlap_matching.py`. The new evaluation-only fixtures use
+synthetic checkpoints and mock actual evaluation and MPS runtime; no real suite
+was evaluated or trained.
+
 The existing shell runner can now capture suite-input preparation and its
 preflight output under a new run ID:
 

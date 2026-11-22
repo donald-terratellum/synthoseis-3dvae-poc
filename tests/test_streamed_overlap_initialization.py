@@ -188,6 +188,13 @@ class ArmInitializationTests(unittest.TestCase):
             self.assertEqual(historical.checkpoint_label, inputs["historical"].checkpoint_label)
             self.assertEqual(values["hashes"], {**record["input_hashes"], "config": digest})
             run.reset_mock()
+            run_suite_from_record(
+                path, self.suite_dir, expected_config_sha256=digest, resume=True, attempt_id="evaluate",
+                evaluate_only=True,
+            )
+            self.assertTrue(run.call_args.kwargs["evaluate_only"])
+            self.assertTrue(run.call_args.kwargs["resume"])
+            run.reset_mock()
             with self.assertRaisesRegex(ValueError, "pinned configuration hash"):
                 run_suite_from_record(
                     path, self.suite_dir, expected_config_sha256="0" * 64, resume=True, attempt_id="next",
@@ -939,6 +946,123 @@ class ArmInitializationTests(unittest.TestCase):
                 )
             run_arm.assert_not_called()
             factory.assert_not_called()
+
+    def test_evaluation_only_checks_all_final_journals_before_opening_any_arm(self):
+        arms = self.prepare_suite()
+        evidence = save_suite_initialization(
+            self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
+        )
+        checkpoints = {arm: item.initial_checkpoint for arm, item in arms.items()}
+        save_suite_run_metadata(
+            self.suite_dir, checkpoints, matching_config=self.config, expected_hashes=self.hashes,
+            initialization_sha256=evidence["evidence_sha256"],
+        )
+        total = self.config["final_epoch"] * self.config["batches_per_epoch"]
+        for arm, item in arms.items():
+            (item.initial_checkpoint.parent / "evaluation").mkdir()
+            journal = item.journal
+            for step in range(1, total + 1):
+                row: dict[str, object] = dict.fromkeys(STEP_FIELDS, "")
+                row.update({
+                    "sequence": step, "event_id": f"{arm}-{step}", "attempt_id": journal.attempt_id,
+                    "run_id": self.config["run_id"], "arm": arm, "seed": self.config["experiment_seed"],
+                    "logical_step": step, "completed_pairs": 12, "cumulative_exposure": 12 * step,
+                    "epoch": (step - 1) // self.config["batches_per_epoch"] + 1,
+                    "batch_index": (step - 1) % self.config["batches_per_epoch"] + 1,
+                })
+                journal.append(row)
+            state = torch.load(item.final_checkpoint, weights_only=True)
+            state.update(device="mps", completed_epoch=self.config["final_epoch"])
+            state["sampler"]["batches_drawn"] = total
+            state["journal"] = {
+                "event_id": f"{arm}-{total}", "logical_step": total, "cumulative_exposure": 12 * total,
+            }
+            torch.save(state, item.final_checkpoint)
+
+        calls = []
+
+        @contextmanager
+        def runtime_factory(arm):
+            calls.append(arm)
+            model = Mock(arm=arm)
+            yield ArmRuntime(model, Mock(), Mock(), Mock(), Mock(), Mock())
+
+        arguments = {
+            "attempt_id": "evaluation", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
+            "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
+            "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": {"diagnostic_max_wall_seconds": 30}, "guardrail_manifest": {},
+            "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
+            "suite_initialization": SuiteInitialization(evidence["path"], evidence["evidence_sha256"], checkpoints),
+            "evaluate_only": True,
+        }
+        journals = {arm: item.journal for arm, item in arms.items()}
+        manifest = {"manifest_sha256": self.hashes["validation_manifest"],
+                    "target_implementation_sha256": self.hashes["target"]}
+        with patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs", return_value={}), \
+             patch("scripts.streamed_overlap_epoch_runner.verify_validation_preflight") as preflight, \
+             patch("scripts.streamed_overlap_epoch_runner.load_manifest", return_value=manifest), \
+             patch("scripts.streamed_overlap_epoch_runner.open_validation_sources", return_value={}), \
+             patch("scripts.streamed_overlap_epoch_runner.verify_search_manifest"), \
+             patch("scripts.streamed_overlap_epoch_runner.verify_diagnostics"), \
+             patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", return_value={}) as run_arm, \
+             patch("scripts.streamed_overlap_epoch_runner._suite_cosine_comparisons", return_value={}), \
+             patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train, \
+             patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            path = arms["S3"].final_checkpoint
+            original = path.read_bytes()
+            state = torch.load(path, weights_only=True)
+            for field, value in (
+                ("completed_epoch", 1), ("hashes", {}),
+                ("journal", {"event_id": "missing", "logical_step": total, "cumulative_exposure": 12 * total}),
+                ("sampler", {**state["sampler"], "batches_drawn": total - 1}),
+            ):
+                altered = {**state, field: value}
+                torch.save(altered, path)
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    run_suite_epochs(journals, runtime_factory, **arguments)
+                self.assertEqual(calls, [])
+                preflight.assert_not_called()
+                run_arm.assert_not_called()
+            path.unlink()
+            with self.assertRaises((ValueError, FileNotFoundError)):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            self.assertEqual(calls, [])
+            run_arm.assert_not_called()
+            path.write_bytes(original)
+            result = run_suite_epochs(journals, runtime_factory, **arguments)
+            self.assertEqual(calls, ["S1", "S2", "S3"])
+            self.assertEqual(result["S3"]["mu_cosine_comparisons"], {})
+            self.assertTrue(all(call.kwargs["evaluate_only"] for call in run_arm.call_args_list))
+            train.assert_not_called()
+
+    def test_evaluation_only_does_not_initialize_missing_suite_metadata(self):
+        inputs = self.suite_inputs()
+        self.hashes["config"] = content_hash(suite_input_record(self.suite_dir, **inputs))
+        for arm in ("S1", "S2", "S3"):
+            directory = self.suite_dir / arm
+            directory.mkdir()
+            journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=True)
+            journal.close()
+        _bind_suite_inputs(self.suite_dir, suite_input_record(self.suite_dir, **inputs), resume=False)
+        arguments = {
+            **inputs, "attempt_id": "evaluation", "monitor_batches": {}, "lpips_loss_fn": object(),
+            "evaluate_only": True,
+        }
+        with patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.torch.backends.mps.is_available", return_value=True), \
+             patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}), \
+             patch("scripts.streamed_overlap_epoch_runner.prepare_suite_initial_checkpoints") as bootstrap, \
+             patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs") as coordinate:
+            with self.assertRaises(ValueError):
+                run_suite(self.suite_dir, resume=False, **arguments)
+            with self.assertRaisesRegex(ValueError, "existing initialized suite"):
+                run_suite(self.suite_dir, resume=True, **arguments)
+            bootstrap.assert_not_called()
+            coordinate.assert_not_called()
+        self.assertFalse((self.suite_dir / "suite_metadata.json").exists())
+        self.assertTrue(all(not list((self.suite_dir / arm / "recovery").glob("*.json"))
+                            for arm in ("S1", "S2", "S3")))
 
     def test_persisted_suite_evidence_detects_tampering_and_wrong_pin(self):
         arms = self.prepare_suite()

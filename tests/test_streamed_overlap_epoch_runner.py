@@ -560,6 +560,47 @@ class EpochCompletionTests(unittest.TestCase):
         self.assertEqual(compare.call_count, 2)
         self.assertTrue(all(call.kwargs["s1"] is self.s1 for call in compare.call_args_list))
 
+    def test_evaluation_only_rejects_incomplete_restore_and_never_trains(self):
+        hashes = {**self.hashes, "validation_manifest": "c" * 64}
+        self.state = {
+            "arm": "S3", "device": "mps", "completed_epoch": 6,
+            "batches_per_epoch": 2, "hashes": hashes,
+        }
+        arguments = {
+            "run_id": "run", "seed": 1, "attempt_id": "evaluation", "batches_per_epoch": 2,
+            "sparse_probability": 0.5, "monitor_batches": {}, "monitor_seed": 1, "validation_seed": 1,
+            "validate_epoch": object(), "epoch_csv": self.root / "epoch.csv", "checkpoint_path": self.checkpoint,
+            "hashes": hashes, "early_stopping": object(), "manifest_path": self.root / "manifest",
+            "source_root": self.source, "search_manifest": self.search_manifest,
+            "diagnostic_manifest": self.diagnostic_manifest, "formal_config": self.config,
+            "evaluation_dir": self.evaluation, "guardrail_manifest": self.guardrail_manifest,
+            "guardrail_config": self.guardrail_config, "historical": self.historical, "s1": self.s1,
+            "matching_config": self.matching_config, "initial_checkpoint": self.root / "initial.pt",
+            "suite_initialization": self.suite_initialization, "evaluate_only": True,
+        }
+        with patch("scripts.streamed_overlap_epoch_runner._identity",
+                   return_value={"run_id": "run", "experiment_seed": 1}), \
+             patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
+                   return_value={"completed_epoch": 5, "selection_state": {}}) as restore, \
+             patch("scripts.streamed_overlap_epoch_runner.complete_epoch", return_value={"done": True}) as finish, \
+             patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint", return_value={"done": True}), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_reconstruction_comparison",
+                   return_value={"comparison": {"status": "PASS_NUMERIC_ONLY"}}), \
+             patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
+            self.state["completed_epoch"] = 5
+            with self.assertRaisesRegex(ValueError, "completed, configuration-matched"):
+                run_arm_epochs(SimpleNamespace(arm="S3"), *self.arm_args, **arguments)
+            restore.assert_not_called()
+            self.state["completed_epoch"] = 6
+            with self.assertRaisesRegex(ValueError, "cannot advance an incomplete arm"):
+                run_arm_epochs(SimpleNamespace(arm="S3"), *self.arm_args, **arguments)
+            finish.assert_not_called()
+            restore.return_value = {"completed_epoch": 6, "selection_state": {}}
+            result = run_arm_epochs(SimpleNamespace(arm="S3"), *self.arm_args, **arguments)
+            self.assertEqual(set(result["selected_evaluations"]), {"reconstruction", "retrieval"})
+            finish.assert_called_once()
+            train.assert_not_called()
+
     def test_pending_evaluation_failure_prevents_next_epoch(self):
         with patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
                    return_value={"completed_epoch": 4, "selection_state": {}}), \
