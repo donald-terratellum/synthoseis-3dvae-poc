@@ -4,6 +4,18 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+Journal recovery now reads completed rows incrementally and hashes recorded torn
+tails in bounded chunks instead of loading and splitting the whole CSV. It still
+retains all parsed rows and event IDs; reconciliation may hold both old and new
+rows, and the suite opens three journals. Long-run memory is therefore not bounded
+or approved by this change.
+
+On this Mac, opening a synthetic 10,000-row journal made from a real disposable
+smoke row (6,987,872 bytes) used 41,873,298 bytes of peak traced Python allocations
+before the change and 28,202,281 bytes afterward. These are `tracemalloc` readings,
+not total RSS, MPS use, reconciliation peaks or a full-suite memory forecast.
+No training or evaluation ran; shell train/resume/evaluate remain blocked.
+
 The record-bound suite can now resume a narrowly defined interrupted bootstrap:
 after the suite-input record was saved, but before all three arm directories
 were created. It recreates only a missing suffix of arm directories after

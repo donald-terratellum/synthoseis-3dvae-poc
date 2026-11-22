@@ -130,6 +130,41 @@ class BatchJournalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "torn journal bytes"):
             BatchJournal(self.path, FIELDS, create=False)
 
+    def test_multiple_torn_tails_recover_without_reading_whole_journal(self):
+        self.append(self.journal, 1, "e1", "first", 1, 12)
+        with self.path.open("ab") as handle:
+            handle.write(b"first partial")
+        resumed = self.reopen()
+        resumed.reconcile(watermark="e1", attempt_id="second", expected_step=1, expected_exposure=12)
+        self.append(resumed, 2, "e2", "second", 2, 24)
+        with self.path.open("ab") as handle:
+            handle.write(b"x" * (1024 * 1024 + 17))
+        resumed.close()
+        real_read_bytes = Path.read_bytes
+
+        def no_full_journal_read(path):
+            if path == self.path:
+                raise AssertionError("Journal must be read incrementally.")
+            return real_read_bytes(path)
+
+        with patch.object(Path, "read_bytes", no_full_journal_read):
+            again = BatchJournal(self.path, FIELDS, create=False)
+            self.addCleanup(again.close)
+            again.reconcile(watermark="e2", attempt_id="third", expected_step=2, expected_exposure=24)
+            self.append(again, 3, "e3", "third", 3, 36)
+            again.close()
+            final = BatchJournal(self.path, FIELDS, create=False)
+            self.addCleanup(final.close)
+            self.assertEqual([row["event_id"] for row in final.rows], ["e1", "e2", "e3"])
+
+    def test_existing_crlf_journal_remains_readable(self):
+        self.append(self.journal, 1, "e1", "first", 1, 12)
+        self.journal.close()
+        self.path.write_bytes(self.path.read_bytes().replace(b"\n", b"\r\n"))
+        reopened = BatchJournal(self.path, FIELDS, create=False)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.rows[0]["event_id"], "e1")
+
     def test_second_writer_cannot_open_locked_journal(self):
         with self.assertRaises(BlockingIOError):
             BatchJournal(self.path, FIELDS, create=False)

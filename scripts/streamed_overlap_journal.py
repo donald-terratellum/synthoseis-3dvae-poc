@@ -143,54 +143,71 @@ class BatchJournal:
         return records
 
     def _read(self) -> bytes:
-        data = self.path.read_bytes()
         self.pending_delimiter = False
         spans = []
-        for record in self._records():
-            torn = record.get("torn_tail")
-            if torn is None:
-                continue
-            start, end = torn["start"], torn["end"]
-            if (not isinstance(start, int) or not isinstance(end, int)
-                    or start < 0 or end <= start or end > len(data)
-                    or hashlib.sha256(data[start:end]).hexdigest() != torn["sha256"]):
-                raise ValueError("Recorded torn journal bytes do not match the journal.")
-            spans.append((start, end))
-        spans.sort()
-        if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
-            raise ValueError("Overlapping torn journal recovery records.")
-        rows = []
-        offset = 0
-        tail = b""
-        for raw in data.splitlines(keepends=True):
-            end = offset + len(raw)
-            covered = [(start, stop) for start, stop in spans if start == offset and stop <= end]
-            if covered:
-                if len(covered) != 1 or raw[covered[0][1] - offset:] not in (b"", b"\n"):
-                    raise ValueError("Invalid torn journal delimiter.")
-                if not raw.endswith(b"\n"):
-                    self.pending_delimiter = True
-            elif any(start < end and stop > offset for start, stop in spans):
-                raise ValueError("Torn journal record is not aligned with a row.")
-            elif not raw.endswith(b"\n"):
-                if not rows:
-                    raise ValueError("Journal header is incomplete.")
-                tail = raw
-                break
-            else:
-                try:
-                    parsed = next(csv.reader([raw.decode("utf-8")], strict=True))
-                except (UnicodeDecodeError, csv.Error, StopIteration) as error:
-                    raise ValueError("Invalid journal CSV row.") from error
-                if not rows:
-                    if parsed != list(self.fields):
-                        raise ValueError("Journal schema differs from the expected schema.")
-                    rows.append(None)
-                elif len(parsed) != len(self.fields):
-                    raise ValueError("Invalid completed journal row.")
+        with self.path.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            for record in self._records():
+                torn = record.get("torn_tail")
+                if torn is None:
+                    continue
+                start, end = torn["start"], torn["end"]
+                if (not isinstance(start, int) or not isinstance(end, int)
+                        or start < 0 or end <= start or end > size):
+                    raise ValueError("Recorded torn journal bytes do not match the journal.")
+                handle.seek(start)
+                digest = hashlib.sha256()
+                remaining = end - start
+                while remaining:
+                    chunk = handle.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise ValueError("Recorded torn journal bytes do not match the journal.")
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if digest.hexdigest() != torn["sha256"]:
+                    raise ValueError("Recorded torn journal bytes do not match the journal.")
+                spans.append((start, end))
+            spans.sort()
+            if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
+                raise ValueError("Overlapping torn journal recovery records.")
+            handle.seek(0)
+            rows = []
+            offset = 0
+            span_index = 0
+            tail = b""
+            for raw in handle:
+                end = offset + len(raw)
+                span = spans[span_index] if span_index < len(spans) else None
+                if span is not None and span[0] == offset and span[1] <= end:
+                    if raw[span[1] - offset:] not in (b"", b"\n"):
+                        raise ValueError("Invalid torn journal delimiter.")
+                    if not raw.endswith(b"\n"):
+                        self.pending_delimiter = True
+                    span_index += 1
+                elif span is not None and span[0] < end and span[1] > offset:
+                    raise ValueError("Torn journal record is not aligned with a row.")
+                elif not raw.endswith(b"\n"):
+                    if not rows:
+                        raise ValueError("Journal header is incomplete.")
+                    tail = raw
+                    break
                 else:
-                    rows.append(dict(zip(self.fields, parsed)))
-            offset = end
+                    content = raw[:-2] if raw.endswith(b"\r\n") else raw
+                    if b"\r" in content:
+                        raise ValueError("Invalid journal CSV row.")
+                    try:
+                        parsed = next(csv.reader([raw.decode("utf-8")], strict=True))
+                    except (UnicodeDecodeError, csv.Error, StopIteration) as error:
+                        raise ValueError("Invalid journal CSV row.") from error
+                    if not rows:
+                        if parsed != list(self.fields):
+                            raise ValueError("Journal schema differs from the expected schema.")
+                        rows.append(None)
+                    elif len(parsed) != len(self.fields):
+                        raise ValueError("Invalid completed journal row.")
+                    else:
+                        rows.append(dict(zip(self.fields, parsed)))
+                offset = end
         if not rows:
             raise ValueError("Journal has no valid header.")
         completed = rows[1:]
