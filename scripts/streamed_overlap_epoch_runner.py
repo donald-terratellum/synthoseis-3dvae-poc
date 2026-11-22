@@ -297,13 +297,7 @@ def complete_selected_checkpoint(
     return completion
 
 
-def complete_selected_reconstruction(
-    checkpoint_path: Path, journal, manifest_path: Path, source_root: Path,
-    search_manifest: dict, diagnostic_manifest: dict, formal_config: dict, *,
-    selection_kind: str, evaluation_dir: Path, guardrail_manifest: dict,
-    guardrail_config: dict, lpips_loss_fn,
-) -> dict:
-    """Measure a verified selection on the frozen reconstruction guardrail inputs."""
+def _validate_reconstruction_config(guardrail_manifest: dict, guardrail_config: dict, formal_config: dict) -> dict:
     required = {"manifest_sha256", "device", "max_wall_seconds"}
     if (not isinstance(formal_config, dict) or not isinstance(guardrail_config, dict)
             or set(guardrail_config) != required or not isinstance(guardrail_manifest, dict)
@@ -317,6 +311,17 @@ def complete_selected_reconstruction(
     if (guardrail_manifest["manifest_sha256"] != guardrail_config["manifest_sha256"]
             or guardrail_manifest["protocol"].get("device") != guardrail_config["device"]):
         raise ValueError("Reconstruction manifest and frozen configuration disagree.")
+    return expected
+
+
+def complete_selected_reconstruction(
+    checkpoint_path: Path, journal, manifest_path: Path, source_root: Path,
+    search_manifest: dict, diagnostic_manifest: dict, formal_config: dict, *,
+    selection_kind: str, evaluation_dir: Path, guardrail_manifest: dict,
+    guardrail_config: dict, lpips_loss_fn,
+) -> dict:
+    """Measure a verified selection on the frozen reconstruction guardrail inputs."""
+    expected = _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
     config_hash = content_hash(guardrail_config)
     last_state, last_hash = _checkpoint_state(checkpoint_path)
     if last_state.get("hashes", {}).get("reconstruction_guardrail") != config_hash:
@@ -427,20 +432,24 @@ class HistoricalReconstruction:
     checkpoint_label: str
 
 
+def _reference_hash(historical: HistoricalReconstruction) -> str:
+    if (not isinstance(historical, HistoricalReconstruction)
+            or not _sha256(historical.report_sha256) or not _sha256(historical.checkpoint_sha256)
+            or not isinstance(historical.checkpoint_label, str) or not historical.checkpoint_label):
+        raise ValueError("An explicit historical reconstruction reference is required.")
+    return content_hash({
+        "report_sha256": historical.report_sha256,
+        "checkpoint_sha256": historical.checkpoint_sha256,
+        "checkpoint_label": historical.checkpoint_label,
+    })
+
+
 def complete_reconstruction_comparison(
     candidate: SelectedReconstruction, historical: HistoricalReconstruction, *,
     s1: SelectedReconstruction | None, guardrail_manifest: dict, guardrail_config: dict, lpips_loss_fn,
 ) -> dict:
     """Compare verified selected measurements; this is not an adoption decision."""
-    reference = {
-        "report_sha256": historical.report_sha256,
-        "checkpoint_sha256": historical.checkpoint_sha256,
-        "checkpoint_label": historical.checkpoint_label,
-    }
-    if (not _sha256(historical.report_sha256) or not _sha256(historical.checkpoint_sha256)
-            or not isinstance(historical.checkpoint_label, str) or not historical.checkpoint_label):
-        raise ValueError("An explicit historical reconstruction reference is required.")
-    reference_hash = content_hash(reference)
+    reference_hash = _reference_hash(historical)
 
     def verify_historical():
         for path, digest in ((historical.report_path, historical.report_sha256),
@@ -577,7 +586,8 @@ def run_arm_epochs(
     monitor_batches: dict, monitor_seed: int, validation_seed: int, validate_epoch,
     epoch_csv: Path, checkpoint_path: Path, hashes: dict, early_stopping,
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
-    formal_config: dict, evaluation_dir: Path,
+    formal_config: dict, evaluation_dir: Path, guardrail_manifest: dict, guardrail_config: dict,
+    historical: HistoricalReconstruction, s1: SelectedReconstruction | None,
 ) -> dict:
     """Resume one arm from its full epoch state and finish evaluation before advancing."""
     if hashes.get("formal_evaluation") != content_hash(formal_config):
@@ -586,6 +596,16 @@ def run_arm_epochs(
             or not isinstance(formal_config.get("final_epoch"), int)
             or formal_config["final_epoch"] < 1):
         raise ValueError("An explicit positive final epoch is required.")
+    _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
+    if (hashes.get("reconstruction_guardrail") != content_hash(guardrail_config)
+            or hashes.get("reconstruction_reference") != _reference_hash(historical)):
+        raise ValueError("The arm must bind the frozen reconstruction configuration and reference.")
+    if (model.arm not in {"S1", "S2", "S3"}
+            or (model.arm == "S1" and s1 is not None)
+            or (model.arm in {"S2", "S3"} and (
+                not isinstance(s1, SelectedReconstruction) or s1.selection_kind != "reconstruction"
+            ))):
+        raise ValueError("S1 needs P0b only; S2 and S3 require the selected S1 reconstruction reference.")
     restored = restore_epoch_state(
         checkpoint_path, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
         early_stopping=early_stopping, journal=journal, expected_hashes=hashes,
@@ -623,4 +643,17 @@ def run_arm_epochs(
             checkpoint_path, journal, manifest_path, source_root, search_manifest,
             diagnostic_manifest, formal_config, selection_kind=kind, evaluation_dir=evaluation_dir,
         )
-    return {"last_epoch": last_completion, "selected_evaluations": selected_evaluations}
+    comparisons = {}
+    for kind in kinds:
+        candidate = SelectedReconstruction(
+            checkpoint_path, journal, manifest_path, source_root, search_manifest, diagnostic_manifest,
+            formal_config, evaluation_dir, kind,
+        )
+        comparisons[kind] = complete_reconstruction_comparison(
+            candidate, historical, s1=s1, guardrail_manifest=guardrail_manifest,
+            guardrail_config=guardrail_config, lpips_loss_fn=lpips_loss_fn,
+        )
+    return {
+        "last_epoch": last_completion, "selected_evaluations": selected_evaluations,
+        "reconstruction_comparisons": comparisons,
+    }
