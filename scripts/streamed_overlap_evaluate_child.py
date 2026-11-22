@@ -52,6 +52,29 @@ def evaluate(
         hashes[key] = report["sha256"]
     _read_pinned_suite_record(record_path, suite_dir, config_sha256)
     _bind_suite_inputs(suite_dir, record, resume=True)
+    cosine = results["S3"]["mu_cosine_comparisons"]
+    head = results["S3"]["pair_head_metric_checks"]["checks"]["final"]["metric_gate"]
+    summary = {
+        "status": "VALIDATION_SUMMARY_NOT_ADOPTION",
+        "encoder_mu_cosine_ndcg_at_10": {
+            arm: cosine["sources"][f"{arm}_final"]["ndcg_at_10"] for arm in ("S1", "S2", "S3")
+        },
+        "matched_final_encoder_comparisons": {
+            name: cosine["comparisons"][name] for name in ("S2_final_vs_S1_final", "S3_final_vs_S2_final")
+        },
+        "s3_pair_head_vs_random": {
+            "status": head["status"], "ndcg_at_10": head["primary"]["ndcg_at_10"],
+            "random_ndcg_at_10": head["primary"]["random_ndcg_at_10"],
+            "gain": head["primary"]["gain"],
+            "paired_source_bootstrap_95": head["primary"]["paired_source_bootstrap_95"],
+        },
+        "limitation": (
+            "Held-out validation event-coverage proxy, not proof of geological understanding. "
+            "The pair head is not the encoder; independent-seed replication, reconstruction guardrails "
+            "and final-test evaluation are separate."
+        ),
+    }
+    print(json.dumps(summary, sort_keys=True, allow_nan=False), flush=True)
     return {
         "schema": "streamed-evaluation-child-result-v1", "status": "REPORTS_COMPUTED_NOT_ADOPTION",
         "suite_config_sha256": config_sha256, "suite_dir": str(suite_dir.resolve()), "attempt_id": attempt_id,

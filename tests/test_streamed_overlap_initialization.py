@@ -1,11 +1,12 @@
 import copy
 import hashlib
+import io
 import json
 import os
 import random
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, create_autospec, patch
@@ -218,10 +219,28 @@ class ArmInitializationTests(unittest.TestCase):
         path = self.source.parent / "evaluation-inputs.json"
         path.write_text(json.dumps(record))
         _bind_suite_inputs(self.suite_dir, record, resume=False)
-        reports = {}
-        for key in ("mu_cosine_comparisons", "pair_head_metric_checks"):
-            reports[key] = {"schema": key}
-            reports[key]["sha256"] = content_hash(reports[key])
+        reports = {
+            "mu_cosine_comparisons": {
+                "schema": "mu_cosine_comparisons",
+                "sources": {f"{arm}_final": {"ndcg_at_10": value}
+                            for arm, value in (("S1", 0.4), ("S2", 0.5), ("S3", 0.55))},
+                "comparisons": {
+                    "S2_final_vs_S1_final": {"mean_ndcg_gain_over_s1": 0.1, "paired_source_bootstrap_95": [0.02, 0.18]},
+                    "S3_final_vs_S2_final": {"mean_ndcg_gain_over_s2": 0.05, "paired_source_bootstrap_95": [-0.01, 0.11]},
+                },
+            },
+            "pair_head_metric_checks": {
+                "schema": "pair_head_metric_checks",
+                "checks": {"final": {"metric_gate": {
+                    "status": "PENDING", "primary": {
+                        "ndcg_at_10": 0.7, "random_ndcg_at_10": 0.3, "gain": 0.4,
+                        "paired_source_bootstrap_95": [0.2, 0.6],
+                    },
+                }}},
+            },
+        }
+        for report in reports.values():
+            report["sha256"] = content_hash(report)
         results = {
             arm: {"last_epoch": {"checkpoint": {"arm": arm, "config_sha256": digest}}}
             for arm in ("S1", "S2", "S3")
@@ -233,7 +252,16 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_evaluate_child.run_suite_from_record", return_value=results) as run, \
              patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")), \
              patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
-            receipt = evaluate_child(path, self.suite_dir, **options)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                receipt = evaluate_child(path, self.suite_dir, **options)
+            summary = json.loads(output.getvalue())
+            self.assertEqual(summary["encoder_mu_cosine_ndcg_at_10"], {"S1": 0.4, "S2": 0.5, "S3": 0.55})
+            self.assertEqual(summary["matched_final_encoder_comparisons"]["S3_final_vs_S2_final"][
+                "paired_source_bootstrap_95"], [-0.01, 0.11])
+            self.assertEqual(summary["s3_pair_head_vs_random"]["gain"], 0.4)
+            self.assertEqual(summary["s3_pair_head_vs_random"]["status"], "PENDING")
+            self.assertIn("not the encoder", summary["limitation"])
             self.assertEqual(receipt["status"], "REPORTS_COMPUTED_NOT_ADOPTION")
             self.assertEqual(receipt["report_sha256"], {key: value["sha256"] for key, value in reports.items()})
             set_limit.assert_called_once_with(0.4)
@@ -256,7 +284,8 @@ class ArmInitializationTests(unittest.TestCase):
             results["S3"]["pair_head_metric_checks"]["sha256"] = "0" * 64
             with self.assertRaisesRegex(ValueError, "invalid pair_head_metric_checks"):
                 evaluate_child(path, self.suite_dir, **options)
-            results["S3"]["pair_head_metric_checks"]["sha256"] = content_hash({"schema": "pair_head_metric_checks"})
+            head = results["S3"]["pair_head_metric_checks"]
+            head["sha256"] = content_hash({key: value for key, value in head.items() if key != "sha256"})
             def change_record(*args, **kwargs):
                 path.write_text("{}")
                 return results

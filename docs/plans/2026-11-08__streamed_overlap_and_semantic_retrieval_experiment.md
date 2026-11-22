@@ -616,8 +616,10 @@ Implement `scripts/streamed_overlap_experiment.sh`, with documented modes:
 --print-commands
 ```
 
-Audit and TensorBoard lifecycle modes are implemented; train/resume/smoke/evaluate
-remain explicitly blocked pending target approval and trainer integration. See the
+Audit, no-optimizer smoke, preparation, evaluation-only and TensorBoard lifecycle
+modes are implemented; train/resume remain explicitly blocked pending runner
+integration and training approval. Evaluation requires a completed suite and
+explicit resource review. See the
 [handoff's runnable commands](2026-11-11__streamed_overlap_copilot_implementation.md).
 Reuse repository helpers rather than introduce a second trainer.
 

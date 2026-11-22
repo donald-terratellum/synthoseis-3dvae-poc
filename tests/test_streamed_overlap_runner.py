@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -420,7 +421,7 @@ class EvaluationAttemptTests(unittest.TestCase):
 class AuditAttemptTests(unittest.TestCase):
     def test_incomplete_execution_modes_remain_blocked_without_side_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for mode in ("train", "resume", "evaluate"):
+            for mode in ("train", "resume"):
                 result = subprocess.run(
                     ["bash", "scripts/streamed_overlap_experiment.sh", "--mode", mode,
                      "--run-id", "blocked-fixture", "--output-root", temporary],
@@ -429,6 +430,117 @@ class AuditAttemptTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("TRAINING_NOT_READY", result.stderr)
             self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_evaluate_shell_routes_and_confirms_only_after_successful_capture(self):
+        Path("logs").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            config = root / "record.json"
+            config.write_text("{}")
+            suite = root / "suite"
+            suite.mkdir()
+            calls = root / "calls"
+            python = root / "python-fixture"
+            python.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    print('fixture python'); sys.exit(0)\n"
+                "action = sys.argv[sys.argv.index('--action') + 1]\n"
+                "with open(os.environ['FIXTURE_CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "print('stdout ' + action, flush=True)\n"
+                "print('stderr ' + action, file=sys.stderr, flush=True)\n"
+                "sys.exit(int(os.environ.get('FIXTURE_FAILURE', '0')) if action == 'evaluate-attempt' else 0)\n"
+            )
+            python.chmod(0o755)
+            env = {**os.environ, "PYTHON": str(python), "FIXTURE_CALLS": str(calls)}
+            for failure in ("none", "child", "tee"):
+                with self.subTest(failure=failure), \
+                     tempfile.TemporaryDirectory(prefix="streamed-eval-test-", dir="logs") as log_name:
+                    log_dir = Path(log_name)
+                    run_id = log_dir.name
+                    log_dir.rmdir()
+                    args = [
+                        "bash", "scripts/streamed_overlap_experiment.sh", "--mode", "evaluate",
+                        "--run-id", run_id, "--config", str(config), "--run-dir", str(suite),
+                        "--config-sha256", "a" * 64, "--mps-memory-fraction", "0.4",
+                        "--min-suite-free-bytes", "100", "--min-log-free-bytes", "200",
+                        "--acknowledge-evaluation-resources",
+                    ]
+                    calls.unlink(missing_ok=True)
+                    attempt_env = dict(env)
+                    if failure == "child":
+                        attempt_env["FIXTURE_FAILURE"] = "7"
+                    if failure == "tee":
+                        bin_dir = root / "bin"
+                        bin_dir.mkdir(exist_ok=True)
+                        tee = bin_dir / "tee"
+                        tee.write_text("#!/bin/sh\ncat >/dev/null\nexit 23\n")
+                        tee.chmod(0o755)
+                        attempt_env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                    result = subprocess.run(args + ["--print-commands"], env=attempt_env,
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("--action evaluate-attempt", result.stdout)
+                    self.assertIn("--action confirm-evaluation-log", result.stdout)
+                    self.assertFalse(log_dir.exists())
+                    self.assertFalse(calls.exists())
+                    result = subprocess.run(args, env=attempt_env, capture_output=True, text=True, check=False)
+                    commands = [json.loads(line) for line in calls.read_text().splitlines()]
+                    actions = [command[command.index("--action") + 1] for command in commands]
+                    first = commands[0]
+                    for flag, value in (("--config", str(config)), ("--run-dir", str(suite)),
+                                        ("--config-sha256", "a" * 64), ("--mps-memory-fraction", "0.4"),
+                                        ("--min-suite-free-bytes", "100"), ("--min-log-free-bytes", "200")):
+                        self.assertEqual(first[first.index(flag) + 1], value)
+                    if failure == "none":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(actions, ["evaluate-attempt", "confirm-evaluation-log"])
+                        self.assertIn("Evaluation log confirmed", result.stdout)
+                        log = (log_dir / "training.log").read_text()
+                        self.assertIn("stdout evaluate-attempt", log)
+                        self.assertIn("stderr evaluate-attempt", log)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(actions, ["evaluate-attempt"])
+                        self.assertNotIn("Evaluation log confirmed", result.stdout)
+
+    def test_evaluate_requires_explicit_resources_before_creating_logs(self):
+        args = [
+            "bash", "scripts/streamed_overlap_experiment.sh", "--mode", "evaluate",
+            "--run-id", "evaluation-rejected-fixture", "--config", "record.json", "--run-dir", "suite",
+            "--config-sha256", "a" * 64, "--mps-memory-fraction", "0.4",
+            "--min-suite-free-bytes", "100", "--min-log-free-bytes", "200",
+        ]
+        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--acknowledge-evaluation-resources", result.stderr)
+        self.assertFalse((Path("logs") / "evaluation-rejected-fixture").exists())
+
+    def test_evaluate_shell_real_runner_rejects_invalid_record(self):
+        Path("logs").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory() as temporary, \
+             tempfile.TemporaryDirectory(prefix="streamed-eval-test-", dir="logs") as log_name:
+            root = Path(temporary).resolve()
+            config = root / "record.json"
+            config.write_text("{}")
+            suite = root / "suite"
+            suite.mkdir()
+            log_dir = Path(log_name)
+            run_id = log_dir.name
+            log_dir.rmdir()
+            result = subprocess.run(
+                ["bash", "scripts/streamed_overlap_experiment.sh", "--mode", "evaluate",
+                 "--run-id", run_id, "--config", str(config), "--run-dir", str(suite),
+                 "--config-sha256", "a" * 64, "--mps-memory-fraction", "0.4",
+                 "--min-suite-free-bytes", "100", "--min-log-free-bytes", "200",
+                 "--acknowledge-evaluation-resources"],
+                env={**os.environ, "PYTHON": sys.executable}, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pinned configuration hash", (log_dir / "training.log").read_text())
+            self.assertFalse((log_dir / "run_manifest.json").exists())
+            self.assertEqual(list(suite.iterdir()), [])
 
     def test_smoke_attempt_requires_no_optimizer_report(self):
         with tempfile.TemporaryDirectory() as temporary:

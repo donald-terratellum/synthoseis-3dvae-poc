@@ -4,6 +4,34 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The shell now connects evaluation of an **already completed** matched suite to
+the evaluation-only runner, combined log capture and log confirmation:
+
+```sh
+bash scripts/streamed_overlap_experiment.sh --mode evaluate \
+  --config <prepared-suite-inputs.json> --run-dir <completed-suite-directory> \
+  --run-id <new-evaluation-attempt-id> --config-sha256 <prepared-config-sha256> \
+  --mps-memory-fraction <limit> --min-suite-free-bytes <bytes> \
+  --min-log-free-bytes <bytes> --acknowledge-evaluation-resources
+```
+
+The acknowledgement means the caller has reviewed memory, concurrent tokenizer
+subprocesses, disk, logs and reserve; the runner does **not** establish aggregate
+memory headroom. The disk floors are caller estimates, not reservations, and
+must account for combined use when paths share storage. Evaluation can write
+reports, journal recovery records and TensorBoard events; it does not start
+TensorBoard, is not atomic, and cannot train or finish an incomplete arm.
+The output includes final S2-vs-S1 and S3-vs-S2 mu-cosine NDCG comparisons with
+source-cluster intervals, separately from the S3 pair-head-vs-random metric.
+These are validation proxy measurements, not proof of geological understanding
+or an adoption decision. Summary output is preliminary until log confirmation
+and report checks succeed. Independent-seed replication, reconstruction
+guardrails and untouched final-test evaluation remain separate.
+
+No real suite was evaluated. Shell train/resume remain blocked and production
+training still requires separate approval. Later entries describe historical
+implementation states, not the current availability of evaluation mode.
+
 Journal recovery now reads completed rows incrementally and hashes recorded torn
 tails in bounded chunks instead of loading and splitting the whole CSV. It still
 retains all parsed rows and event IDs; reconciliation may hold both old and new
@@ -14,7 +42,7 @@ On this Mac, opening a synthetic 10,000-row journal made from a real disposable
 smoke row (6,987,872 bytes) used 41,873,298 bytes of peak traced Python allocations
 before the change and 28,202,281 bytes afterward. These are `tracemalloc` readings,
 not total RSS, MPS use, reconciliation peaks or a full-suite memory forecast.
-No training or evaluation ran; shell train/resume/evaluate remain blocked.
+No training or evaluation ran during that recovery change.
 
 The record-bound suite can now resume a narrowly defined interrupted bootstrap:
 after the suite-input record was saved, but before all three arm directories
