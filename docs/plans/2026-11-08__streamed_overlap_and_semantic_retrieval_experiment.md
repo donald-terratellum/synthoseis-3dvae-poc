@@ -637,7 +637,9 @@ Runner requirements:
 - Smoke uses tiny synthetic fixtures in cloud and a few real streamed training/validation
   pairs locally. The no-optimizer smoke checks each downstream loss separately for a
   finite nonzero encoder gradient; this is a gradient-path check, not a result about
-  improved representations. Smoke must not bypass a production gate.
+  improved representations. A disposable matched-step smoke also checks identical
+  real training tensors and S3 replay across the three arms; it does not replace
+  the integrated suite and evaluation smoke. Smoke must not bypass a production gate.
 - Production train/resume require approved contract and launch config. Check mounted
   volume, readable sources/checkpoints, bounded caches, disk headroom, real batch-12-pair
   forward/backward memory and source exclusions before starting.

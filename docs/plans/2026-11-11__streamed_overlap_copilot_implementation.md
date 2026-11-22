@@ -2,6 +2,45 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: real matched-step and replay smoke
+
+An opt-in disposable MPS fixture now prepares the actual fresh S1/S2/S3
+checkpoints and runs one 12-pair optimizer step per arm on streamed **training**
+sources. It repeats S3's step after restoring the epoch-zero checkpoint and
+journal. All four loads produced identical hashes of the actual input, dense
+target, overlap target, coverage target and validity tensors. The encoder and
+each enabled head changed; S3 had valid coverage targets. The replay matched
+the tracked encoder and head weights and the encoder's tracked AdamW state to
+the stated test tolerance. Existing matched-record verification confirmed equal
+committed streams, exposure and RNG/sampler states for S1-vs-S2 and S1-vs-S3.
+
+The repeatable smoke uses the existing explicit smoke config:
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_MATCHED_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_initialization.py \
+  -k real_matched_steps_and_interrupted_replay_on_mps
+```
+
+The final run took 26.63 seconds inside the fixture, with 1,835,696,128 bytes
+peak RSS, 4,248,406,464 bytes peak macOS memory footprint including startup and
+2,476,277,760 bytes MPS driver allocation sampled afterward. The latter is not
+peak MPS, and none is an aggregate tokenizer-process or production forecast.
+The smoke made four optimizer calls but committed only one step per arm; its
+temporary checkpoints and journals were removed. The one-epoch, one-batch
+settings and placeholder evaluation hashes are smoke-only, not a proposed or
+approved production configuration. The wall-time limit is checked between
+operations, not enforced as a watchdog.
+
+This tests actual matched training inputs and replay for one batch; it does not
+invoke the full suite/arm coordinator, formal retrieval, reconstruction
+guardrails or real resume through the shell. It cannot establish improved
+geological understanding. Initialization, matching, step, epoch, metrics and
+runner regressions passed (148 tests, three skipped, 84 subtests); metric tests
+are synthetic. Full integrated train/resume/evaluate validation, resource review
+and separate launch approval remain outstanding.
+
 ## Local continuation: service and encoder-gradient smoke
 
 An opt-in synthetic MPS fixture now runs the record-bound training attempt

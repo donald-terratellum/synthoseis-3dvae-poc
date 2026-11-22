@@ -2,12 +2,15 @@ import copy
 import hashlib
 import io
 import json
+import math
 import os
 import random
+import resource
 import socket
 import tempfile
+import time
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, create_autospec, patch
@@ -18,6 +21,7 @@ import torch
 from scripts import streamed_overlap_runner as runner
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_checkpoint import restore_epoch_state, save_epoch_state
 from scripts.streamed_overlap_epoch_runner import (
     ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime, _bind_suite_inputs,
     run_arm_epochs, run_suite, run_suite_epochs, run_suite_from_record, suite_input_record,
@@ -30,11 +34,13 @@ from scripts.streamed_overlap_initialization import (
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _rngs_equal, save_suite_initialization, save_suite_run_metadata, verify_arm_initial_checkpoint,
-    verify_saved_suite_initialization, verify_suite_initialization, verify_suite_run_metadata,
+    verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_initialization,
+    verify_suite_run_metadata,
 )
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_sampler import StreamedPairSampler
-from scripts.train import EarlyStoppingState
+from scripts.streamed_overlap_smoke import _validate_config
+from scripts.train import EarlyStoppingState, SliceLPIPSLoss, train_streamed_pair_step
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -323,6 +329,135 @@ class ArmInitializationTests(unittest.TestCase):
         finally:
             if owners:
                 runner.stop_tensorboard(suite, logs)
+
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_MATCHED_SMOKE_CONFIG") and torch.backends.mps.is_available(),
+        "Explicit real-data matched MPS smoke configuration is required",
+    )
+    def test_real_matched_steps_and_interrupted_replay_on_mps(self):
+        config_path = Path(os.environ["STREAMED_REAL_MATCHED_SMOKE_CONFIG"])
+        config = json.loads(config_path.read_text())
+        suite = self.source.parent / "real-matched-smoke"
+        source = _validate_config(config, suite)
+        started = time.monotonic()
+        torch.mps.set_per_process_memory_fraction(config["mps_memory_fraction"])
+        seed = config["seed"]
+        matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "disposable-matched-smoke",
+            "experiment_seed": seed, "model_seed": seed, "head_seed": (seed + 1) % 2**32,
+            "sampler_seed": seed, "monitor_seed": seed, "validation_seed": seed,
+            "final_epoch": 1, "batches_per_epoch": 1, "sparse_probability": config["sparse_probability"],
+        }
+        sampler = StreamedPairSampler(source, "train", matching["sampler_seed"])
+        hashes = {
+            "config": content_hash({"smoke_config": config, "matching": matching}),
+            "source": sampler.source_manifest_hash,
+            "target": content_hash({"smoke_only": "no target implementation binding"}),
+            "validation_manifest": content_hash({"smoke_only": "no validation manifest"}),
+            "matching": content_hash(matching),
+        }
+        suite.mkdir()
+        with ExitStack() as stack:
+            journals = {}
+            for arm in ("S1", "S2", "S3"):
+                directory = suite / arm
+                directory.mkdir()
+                journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=True)
+                stack.callback(journal.close)
+                journal.reconcile(watermark=None, attempt_id=f"bootstrap-{arm}", expected_step=0, expected_exposure=0)
+                journals[arm] = journal
+            prepared = prepare_suite_initial_checkpoints(
+                suite, journals, sampler=sampler, device="mps", hashes=hashes,
+                matching_config=matching, source_root=source,
+            )
+            lpips = SliceLPIPSLoss().to("mps").eval()
+            loaded_hashes = []
+            for arm in ("S1", "S2", "S3"):
+                model = fresh_e1_model(arm, matching["model_seed"], matching["head_seed"]).to("mps")
+                optimizer = build_optimizer(model)
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, factor=0.5, patience=6, min_lr=1e-5,
+                )
+                sampler = StreamedPairSampler(source, "train", matching["sampler_seed"])
+                stop = EarlyStoppingState(float("inf"), 0)
+                journal = journals[arm]
+                checkpoint = suite / arm / "last.pt"
+                restore_epoch_state(
+                    checkpoint, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+                    early_stopping=stop, journal=journal, expected_hashes=hashes,
+                    expected_batches_per_epoch=1, attempt_id=f"{arm}-first",
+                )
+                tracked = {"encoder": model.vae.encoder.fc_mu.weight}
+                if model.overlap_head is not None:
+                    tracked["overlap"] = model.overlap_head.raw_scale
+                if model.coverage_head is not None:
+                    tracked["coverage"] = model.coverage_head.network[-1].weight
+                before = {name: parameter.detach().clone() for name, parameter in tracked.items()}
+
+                def step():
+                    read_started = time.monotonic()
+                    batch = sampler.load_batch(sampler.next_specs(), sparse_probability=matching["sparse_probability"])
+                    digest = hashlib.sha256()
+                    for values in (batch.input_a, batch.input_b, batch.dense_a,
+                                   batch.overlap, batch.coverage, batch.coverage_valid):
+                        digest.update(values.tobytes())
+                    loaded_hashes.append(digest.hexdigest())
+                    return train_streamed_pair_step(
+                        model, optimizer, batch, "mps", lpips, journal, run_id=matching["run_id"],
+                        seed=seed, epoch=1, batch_index=1, data_read_seconds=time.monotonic() - read_started,
+                    )
+
+                first = step()
+                if arm == "S3":
+                    self.assertGreater(first["valid_coverage"], 0)
+                    stale_weights = {name: parameter.detach().clone() for name, parameter in tracked.items()}
+                    stale_optimizer = {
+                        key: value.detach().clone()
+                        for key, value in optimizer.state[tracked["encoder"]].items()
+                    }
+                    restore_epoch_state(
+                        checkpoint, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+                        early_stopping=stop, journal=journal, expected_hashes=hashes,
+                        expected_batches_per_epoch=1, attempt_id="S3-replay",
+                    )
+                    replay = step()
+                    self.assertEqual(replay["replay_of_event"], first["event_id"])
+                    self.assertTrue(math.isclose(replay["total_loss"], first["total_loss"],
+                                                 rel_tol=1e-6, abs_tol=1e-6))
+                    for name, parameter in tracked.items():
+                        torch.testing.assert_close(parameter, stale_weights[name], rtol=1e-6, atol=1e-6)
+                    for key, value in optimizer.state[tracked["encoder"]].items():
+                        torch.testing.assert_close(value, stale_optimizer[key], rtol=1e-6, atol=1e-6)
+                for name, parameter in tracked.items():
+                    self.assertFalse(torch.equal(before[name], parameter), name)
+                save_epoch_state(
+                    checkpoint, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+                    early_stopping=stop, journal=journal, hashes=hashes, completed_epoch=1,
+                    batches_per_epoch=1, selection_state={},
+                )
+                del optimizer, scheduler, model
+                if time.monotonic() - started > config["max_wall_seconds"]:
+                    raise TimeoutError("Matched smoke time limit exceeded.")
+            self.assertEqual(len(loaded_hashes), 4)
+            self.assertEqual(len(set(loaded_hashes)), 1)
+            reference = ArmEvidence(prepared["initial_checkpoints"]["S1"], suite / "S1" / "last.pt", journals["S1"])
+            for arm in ("S2", "S3"):
+                candidate = ArmEvidence(
+                    prepared["initial_checkpoints"][arm], suite / arm / "last.pt", journals[arm],
+                )
+                report = verify_matched_arm_records(reference, candidate, matching_config=matching)
+                self.assertEqual((report["status"], report["steps"]), ("MATCHED_RECORDED_STREAMS_ONLY", 1))
+            torch.mps.synchronize()
+            if time.monotonic() - started > config["max_wall_seconds"]:
+                raise TimeoutError("Matched smoke time limit exceeded.")
+            print(json.dumps({
+                "status": "DISPOSABLE_MATCHED_STEPS_PASSED", "pairs_per_arm": 12,
+                "optimizer_steps": 4, "committed_steps_per_arm": 1, "s3_replayed": True,
+                "loaded_tensor_hashes_match": True,
+                "elapsed_seconds": time.monotonic() - started,
+                "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
+            }, sort_keys=True), flush=True)
 
     def test_evaluation_child_applies_mps_limit_and_never_enables_training(self):
         record = suite_input_record(self.suite_dir, **self.suite_inputs())
