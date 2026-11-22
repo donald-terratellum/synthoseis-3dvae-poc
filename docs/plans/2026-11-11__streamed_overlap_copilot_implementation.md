@@ -2,6 +2,74 @@
 
 Updated: 2026-11-22.
 
+## Resume locally after the 2026-11-22 session
+
+Reconnect from the MacBook using VS Code **Remote-SSH: Connect to Host**, select
+the existing Mac mini SSH host, and reopen
+`/Users/donaldpg/synthoseis-3dvae-poc`. Keep the Mac mini powered on, connected to
+the network and awake; ensure the CrucialX9 volume is mounted. On the Mac mini,
+`pmset -g` reported system sleep set to 0 and a local SSH connection received an
+OpenSSH banner. These checks do not prove that the MacBook can reach the host after
+a network change, sleep or reboot. If reconnection fails, check the network and
+macOS System Settings > General > Sharing > Remote Login on the Mac mini; do not
+change machine-wide settings or stop unrelated processes without approval.
+
+Start a new chat in the remote workspace and paste:
+
+```text
+Continue the streamed overlap experiment locally on the Mac mini. First inspect
+the branch and worktree; read the authoritative 2026-11-08 execution plan, the
+target-contract proposal, and the 2026-11-11 Copilot handoff, especially its
+2026-11-22 resume section. Continue on
+experiment/streamed-overlap-copilot-implementation without changing production
+tokenizer defaults. Preserve existing untracked work and private data. Finish
+the remaining runner and evaluation work, validate it, and stop before production
+training for separate launch approval. Do not select an epoch/batch budget.
+```
+
+Verify the starting point without altering the worktree:
+
+```sh
+git --no-pager status --short --branch
+git --no-pager log -5 --oneline
+test -d /Volumes/CrucialX9/fake_data && echo "primary sources mounted"
+```
+
+The branch includes `afe3c4b` (bounded search and diagnostics) and `09116ae`
+(recoverable epoch-evaluation primitives). The earlier commit `afe3c4b` has a
+mistyped Copilot co-author email; do not rewrite history without explicit approval.
+Preserve the pre-existing untracked `studies/` and
+`docs/sessions/2026-11-15-latent-mu-cosine-study.md`; do not stage or alter them.
+Private manifests, checkpoints and audit outputs remain on the external volume and
+are not in GitHub. `.venv/bin/uv` was unavailable; use `.venv/bin/python`, not
+system Python.
+
+Training is **not ready or authorized**. The epoch helper is not the sequential
+S1/S2/S3 suite runner. Next implement and verify the actual configuration-bound
+suite runner, durable train/resume and logging integration, final selected-checkpoint
+searches and reconstruction guardrails, frozen bounded-search and diagnostics
+inputs, and disk/memory budgeting. Then run the permitted integrated real-data MPS
+smoke and present proposed launch commands, measurements and remaining approval
+gates. A matched streamed S1 reference and independent-seed replication require
+later training. No production thin-run threshold or training budget has been chosen.
+
+The primary bound validation manifest is
+`/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json`
+with logical SHA-256
+`13a5ef4f27c1ec0ab9da53168ee1e765f2e8cc94c74e3761c3e573e9c4c9d6c7`.
+Reverify it before scoring. Do not read or audit the regenerating
+`/Volumes/CrucialX9/fake_data_validation_v2` until completion is confirmed and it
+is separately audited; never use final-test crops for training or target-yield
+preflight. Keep the fresh E1 mu128, shared trainable encoder and joint optimization
+contract in the authoritative plan.
+
+Most recent portable regression: 186 passed, one skipped and 17 subtests passed;
+subsequent focused diagnostics/search/epoch tests passed (17 tests and three
+subtests). A disposable real-data bounded-search MPS smoke passed in 244.96 seconds,
+with 1,253,982,208 bytes parent peak RSS; tokenizer, window-score and Hann-map
+hashes were independently verified. These smoke settings and measurements are not
+a production budget or peak child/MPS memory forecast. Pylance requests timed out.
+
 ## Local implementation status
 
 ### Incremental target, manifest, and model implementation
