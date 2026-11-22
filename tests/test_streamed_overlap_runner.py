@@ -417,6 +417,166 @@ class EvaluationAttemptTests(unittest.TestCase):
             runner.main()
             confirm.assert_called_once_with(self.logs)
 
+    def test_training_attempt_and_resume_use_pinned_suite_and_confirm_logs(self):
+        self.record["matching_config"] = {"run_id": "training", "final_epoch": 2, "batches_per_epoch": 3}
+        self.config_hash = content_hash(self.record)
+        self.path.write_text(json.dumps(self.record))
+        (self.suite / "resolved_suite_inputs.json").unlink()
+        self.suite.rmdir()
+        options = {
+            "config_sha256": self.config_hash, "epochs": 2, "batches_per_epoch": 3,
+            "mps_memory_fraction": 0.4, "min_suite_free_bytes": 1, "min_log_free_bytes": 1,
+        }
+        calls = []
+
+        def execute(record_path, suite_dir, **kwargs):
+            self.assertEqual(record_path, self.path)
+            self.assertEqual(suite_dir, self.suite)
+            calls.append(kwargs)
+            if not kwargs["resume"]:
+                suite_dir.mkdir()
+                (suite_dir / "resolved_suite_inputs.json").write_text(json.dumps(self.record))
+            kwargs["on_suite_bound"]()
+            final = {}
+            for arm in ("S1", "S2", "S3"):
+                directory = suite_dir / arm
+                directory.mkdir(exist_ok=True)
+                checkpoint = directory / "last.pt"
+                if not checkpoint.exists():
+                    checkpoint.write_bytes(f"{arm} checkpoint".encode())
+                final[arm] = {
+                    "arm": arm, "config_sha256": self.config_hash, "epoch": 2, "step": 6,
+                    "checkpoint_sha256": runner.file_hash(checkpoint),
+                }
+            reports = {
+                "mu_cosine_comparisons": {"sources": {f"{arm}_final": {"checkpoint": final[arm]}
+                                                       for arm in final}},
+                "pair_head_metric_checks": {"checks": {"final": {"source": {"checkpoint": final["S3"]}}}},
+            }
+            for key, report in reports.items():
+                report["sha256"] = content_hash(report)
+                (suite_dir / f"{key}.json").write_text(json.dumps(report))
+            result = {arm: {"last_epoch": {"checkpoint": final[arm]}} for arm in final}
+            result["S3"].update(reports)
+            return result
+
+        with mock.patch("scripts.streamed_overlap_epoch_runner.run_suite_from_record", side_effect=execute), \
+             mock.patch("torch.backends.mps.is_available", return_value=True), \
+             mock.patch("torch.mps.set_per_process_memory_fraction") as set_limit, \
+             mock.patch.object(runner, "start_tensorboard") as start_service, \
+             mock.patch.object(runner.platform, "platform", return_value="fixture-platform"), \
+             mock.patch.object(runner.subprocess, "check_output",
+                               side_effect=["fixture", b"fixture", "", "fixture", b"fixture", ""]), \
+             mock.patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+            runner.training_attempt(
+                self.path, self.suite, self.logs, self.logs, "training", resume=False, **options,
+            )
+            manifest = json.loads((self.logs / "run_manifest.json").read_text())
+            self.assertEqual(manifest["status"], "suite_complete_log_unconfirmed")
+            (self.logs / "training.log").write_text("first captured log")
+            checkpoint = self.suite / "S3" / "last.pt"
+            original = checkpoint.read_bytes()
+            checkpoint.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "checkpoint is missing or changed"):
+                runner.confirm_training_log(self.logs)
+            checkpoint.write_bytes(original)
+            runner.confirm_training_log(self.logs)
+            self.assertEqual(json.loads((self.logs / "run_manifest.json").read_text())["status"],
+                             "suite_complete_not_adoption")
+            resume_logs = self.root / "resume-logs"
+            resume_logs.mkdir()
+            runner.training_attempt(
+                self.path, self.suite, resume_logs, self.logs, "retry", resume=True, **options,
+            )
+            (resume_logs / "training.log").write_text("resume captured log")
+            runner.confirm_training_log(resume_logs)
+            self.assertEqual([call["resume"] for call in calls], [False, True])
+            self.assertNotEqual(calls[0]["attempt_id"], calls[1]["attempt_id"])
+            self.assertEqual(set_limit.call_count, 2)
+            self.assertEqual(start_service.call_args_list, [mock.call(self.suite, self.logs)] * 2)
+
+    def test_training_attempt_rejects_changed_budget_and_insufficient_space(self):
+        self.record["matching_config"] = {"run_id": "training", "final_epoch": 2, "batches_per_epoch": 3}
+        self.config_hash = content_hash(self.record)
+        self.path.write_text(json.dumps(self.record))
+        options = {
+            "config_sha256": self.config_hash, "epochs": 2, "batches_per_epoch": 3,
+            "mps_memory_fraction": 0.4, "min_suite_free_bytes": 100, "min_log_free_bytes": 200,
+        }
+        (self.suite / "resolved_suite_inputs.json").unlink()
+        self.suite.rmdir()
+        with mock.patch("scripts.streamed_overlap_epoch_runner.run_suite_from_record") as run:
+            with self.assertRaisesRegex(ValueError, "budget"):
+                runner.training_attempt(
+                    self.path, self.suite, self.logs, self.logs, "training", resume=False,
+                    **{**options, "epochs": 3},
+                )
+            self.assertFalse((self.logs / "run_manifest.json").exists())
+            with mock.patch("scripts.streamed_overlap_epoch_runner._filesystem_available_bytes",
+                            side_effect=[99, 200]):
+                with self.assertRaisesRegex(OSError, "Insufficient free space"):
+                    runner.training_attempt(
+                        self.path, self.suite, self.logs, self.logs, "training", resume=False, **options,
+                    )
+            run.assert_not_called()
+        self.assertEqual(json.loads((self.logs / "run_manifest.json").read_text())["status"], "failed")
+        self.assertFalse(self.suite.exists())
+
+    def test_training_service_failure_never_reports_completion(self):
+        self.record["matching_config"] = {"run_id": "training", "final_epoch": 2, "batches_per_epoch": 3}
+        self.config_hash = content_hash(self.record)
+        self.path.write_text(json.dumps(self.record))
+        (self.suite / "resolved_suite_inputs.json").unlink()
+        self.suite.rmdir()
+
+        def execute(record_path, suite_dir, **kwargs):
+            suite_dir.mkdir()
+            (suite_dir / "resolved_suite_inputs.json").write_text(json.dumps(self.record))
+            kwargs["on_suite_bound"]()
+            self.fail("Training must not start when TensorBoard fails.")
+
+        with mock.patch("scripts.streamed_overlap_epoch_runner.run_suite_from_record", side_effect=execute), \
+             mock.patch("torch.backends.mps.is_available", return_value=True), \
+             mock.patch("torch.mps.set_per_process_memory_fraction"), \
+             mock.patch.object(runner, "start_tensorboard", side_effect=RuntimeError("port occupied")), \
+             mock.patch.object(runner.platform, "platform", return_value="fixture-platform"), \
+             mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]), \
+             mock.patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+            with self.assertRaisesRegex(RuntimeError, "port occupied"):
+                runner.training_attempt(
+                    self.path, self.suite, self.logs, self.logs, "training", config_sha256=self.config_hash,
+                    resume=False, epochs=2, batches_per_epoch=3, mps_memory_fraction=0.4,
+                    min_suite_free_bytes=1, min_log_free_bytes=1,
+                )
+        self.assertEqual(json.loads((self.logs / "run_manifest.json").read_text())["status"], "failed")
+        self.assertFalse((self.logs / "evaluation_receipt.json").exists())
+        self.assertTrue((self.suite / "resolved_suite_inputs.json").is_file())
+        self.assertFalse((self.suite / "S1").exists())
+
+    def test_training_cli_requires_approval_and_routes_resume(self):
+        args = [
+            "runner", "--action", "resume-attempt", "--log-dir", str(self.logs), "--config", str(self.path),
+            "--run-dir", str(self.suite), "--run-id", "retry", "--config-sha256", self.config_hash,
+            "--mps-memory-fraction", "0.4", "--min-suite-free-bytes", "100", "--min-log-free-bytes", "200",
+            "--epochs", "2", "--batches-per-epoch", "3", "--tensorboard-log-dir", str(self.logs),
+        ]
+        with mock.patch.object(runner.signal, "signal"), \
+             mock.patch.object(runner, "training_attempt") as attempt:
+            with mock.patch.object(sys, "argv", args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    runner.main()
+                self.assertEqual(result.exception.code, 2)
+            attempt.assert_not_called()
+            with mock.patch.object(sys, "argv", args + [
+                "--acknowledge-training-approval", "--acknowledge-training-resources",
+            ]):
+                runner.main()
+            attempt.assert_called_once_with(
+                self.path, self.suite, self.logs, self.logs, "retry", config_sha256=self.config_hash,
+                resume=True, epochs=2, batches_per_epoch=3, mps_memory_fraction=0.4,
+                min_suite_free_bytes=100, min_log_free_bytes=200,
+            )
+
 
 class AuditAttemptTests(unittest.TestCase):
     def test_incomplete_execution_modes_remain_blocked_without_side_effects(self):

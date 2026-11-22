@@ -1,4 +1,4 @@
-"""Audit, preparation and owned TensorBoard services; not a streamed trainer."""
+"""Logged entry points and owned TensorBoard services for the streamed suite."""
 
 from __future__ import annotations
 
@@ -527,6 +527,158 @@ def confirm_evaluation_log(log_dir: Path) -> None:
     save_json(manifest_path, manifest, replace=True)
 
 
+def training_attempt(
+    record_path: Path, suite_dir: Path, log_dir: Path, tensorboard_log_dir: Path, run_id: str, *,
+    config_sha256: str, resume: bool, epochs: int, batches_per_epoch: int,
+    mps_memory_fraction: float, min_suite_free_bytes: int, min_log_free_bytes: int,
+) -> None:
+    """Run a pinned matched suite; the caller must separately approve training and capture logs."""
+    import torch
+    from scripts.streamed_overlap_audit import content_hash
+    from scripts.streamed_overlap_epoch_runner import (
+        _filesystem_available_bytes, _read_pinned_suite_record, run_suite_from_record,
+    )
+    from scripts.streamed_overlap_journal import _publish_exclusive
+
+    if (type(resume) is not bool or not isinstance(run_id, str) or not run_id
+            or any(c in run_id for c in "\r\n")
+            or any(type(value) is not int or value < 1 for value in (
+                epochs, batches_per_epoch, min_suite_free_bytes, min_log_free_bytes,
+            ))
+            or isinstance(mps_memory_fraction, bool)
+            or not isinstance(mps_memory_fraction, (int, float))
+            or not math.isfinite(mps_memory_fraction) or not 0 < mps_memory_fraction <= 0.5
+            or log_dir.is_symlink() or not log_dir.is_dir()):
+        raise ValueError("Training requires explicit positive budgets, storage floors and an existing log directory.")
+    record, _, _ = _read_pinned_suite_record(record_path, suite_dir, config_sha256)
+    matching = record["matching_config"]
+    if (matching["final_epoch"] != epochs or matching["batches_per_epoch"] != batches_per_epoch
+            or (not resume and matching["run_id"] != run_id)):
+        raise ValueError("Training budget and fresh run ID must match the pinned suite configuration.")
+    suite_root = suite_dir.resolve()
+    log_root = log_dir.resolve()
+    source_root = Path(record["source_root"]).resolve()
+    if any(log_root.is_relative_to(path) or path.is_relative_to(log_root) for path in (suite_root, source_root)):
+        raise ValueError("Training logs must be separate from the suite and source directories.")
+    if (resume and (suite_dir.is_symlink() or not suite_dir.is_dir())
+            or not resume and (suite_dir.exists() or suite_dir.is_symlink()
+                               or suite_dir.parent.is_symlink() or not suite_dir.parent.is_dir())):
+        raise ValueError("Fresh training requires a new suite; resume requires an existing suite.")
+    if resume:
+        if tensorboard_log_dir.is_symlink() or not tensorboard_log_dir.is_dir():
+            raise ValueError("Resume requires the original TensorBoard log directory.")
+        previous_path = tensorboard_log_dir / "run_manifest.json"
+        if previous_path.is_symlink() or not previous_path.is_file():
+            raise ValueError("Resume requires the original training attempt manifest.")
+        previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        if (not isinstance(previous, dict) or previous.get("mode") != "train"
+                or previous.get("output_path") != str(suite_root)
+                or previous.get("suite_config_sha256") != config_sha256):
+            raise ValueError("TensorBoard ownership must belong to this training suite.")
+    elif tensorboard_log_dir.resolve() != log_root:
+        raise ValueError("Fresh training must own its TensorBoard service in its attempt log directory.")
+    manifest_path = log_dir / "run_manifest.json"
+    receipt = log_dir / "evaluation_receipt.json"
+    if any(path.exists() or path.is_symlink() for path in (manifest_path, receipt)):
+        raise FileExistsError("Refusing an existing training attempt manifest or receipt.")
+    attempt_id = uuid.uuid4().hex
+    manifest = {
+        "schema_version": 1, "mode": "resume" if resume else "train", "run_id": run_id,
+        "attempt_id": attempt_id, "started_at_utc": utc_now(), "status": "preflight",
+        "record_path": str(record_path.resolve()), "output_path": str(suite_root),
+        "log_path": str((log_dir / "training.log").resolve()), "suite_config_sha256": config_sha256,
+        "mps_memory_fraction": mps_memory_fraction, "epochs": epochs, "batches_per_epoch": batches_per_epoch,
+        "tensorboard_log_dir": str(tensorboard_log_dir.resolve()), "training_device": "mps",
+        "record_file_sha256": file_hash(record_path), "python": sys.version, "platform": platform.platform(),
+        "runner_sha256": file_hash(Path(__file__)), "command": [sys.executable, *sys.argv],
+    }
+    save_json(manifest_path, manifest)
+    try:
+        suite_space_path = suite_dir if resume else suite_dir.parent
+        manifest["free_space_preflight"] = {
+            "suite": {"directory": str(suite_space_path.resolve()), "minimum_bytes": min_suite_free_bytes,
+                      "available_bytes": _filesystem_available_bytes(suite_space_path)},
+            "log": {"directory": str(log_root), "minimum_bytes": min_log_free_bytes,
+                    "available_bytes": _filesystem_available_bytes(log_dir)},
+        }
+        for name, measurement in manifest["free_space_preflight"].items():
+            if measurement["available_bytes"] < measurement["minimum_bytes"]:
+                raise OSError(f"Insufficient free space for training {name}.")
+        if not torch.backends.mps.is_available() or os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "0":
+            raise RuntimeError("Training requires MPS without CPU fallback.")
+        manifest["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        changes = subprocess.check_output(["git", "diff", "HEAD", "--binary"])
+        manifest["git_diff_sha256"] = hashlib.sha256(changes).hexdigest()
+        manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True).splitlines()
+        manifest["versions"] = {
+            package: importlib.metadata.version(package)
+            for package in ("numpy", "zarr", "torch", "tensorboard", "lpips")
+        }
+        torch.mps.set_per_process_memory_fraction(mps_memory_fraction)
+        manifest["status"] = "running"
+        save_json(manifest_path, manifest, replace=True)
+
+        def start_service() -> None:
+            with service_lock(tensorboard_log_dir):
+                start_tensorboard(suite_dir, tensorboard_log_dir)
+
+        results = run_suite_from_record(
+            record_path, suite_dir, expected_config_sha256=config_sha256, resume=resume,
+            attempt_id=attempt_id, on_suite_bound=start_service,
+        )
+        final = {arm: results[arm]["last_epoch"]["checkpoint"] for arm in ("S1", "S2", "S3")}
+        if any(identity.get("arm") != arm or identity.get("config_sha256") != config_sha256
+               or identity.get("epoch") != epochs or identity.get("step") != epochs * batches_per_epoch
+               for arm, identity in final.items()):
+            raise ValueError("Completed suite returned mismatched final checkpoints.")
+        report_hashes = {}
+        for key in ("mu_cosine_comparisons", "pair_head_metric_checks"):
+            report = results["S3"][key]
+            if report.get("sha256") != content_hash({k: v for k, v in report.items() if k != "sha256"}):
+                raise ValueError(f"Completed suite returned an invalid {key} report.")
+            report_hashes[key] = report["sha256"]
+        result = {
+            "schema": "streamed-evaluation-child-result-v1", "status": "REPORTS_COMPUTED_NOT_ADOPTION",
+            "suite_config_sha256": config_sha256, "suite_dir": str(suite_root), "attempt_id": attempt_id,
+            "mps_memory_fraction": mps_memory_fraction, "final_checkpoints": final, "report_sha256": report_hashes,
+        }
+        data = (json.dumps(result, sort_keys=True, allow_nan=False) + "\n").encode()
+        def write(stream) -> None:
+            stream.write(data)
+
+        _publish_exclusive(receipt, write)
+        manifest["receipt_sha256"] = _verify_evaluation_result(manifest, log_dir)
+        manifest["status"] = "suite_complete_log_unconfirmed"
+        print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+    except (KeyboardInterrupt, SystemExit):
+        manifest["status"] = "interrupted"
+        raise
+    finally:
+        if manifest["status"] in ("preflight", "running"):
+            manifest["status"] = "failed"
+        manifest["finished_at_utc"] = utc_now()
+        save_json(manifest_path, manifest, replace=True)
+
+
+def confirm_training_log(log_dir: Path) -> None:
+    manifest_path = log_dir / "run_manifest.json"
+    log_path = log_dir / "training.log"
+    if (log_dir.is_symlink() or not log_dir.is_dir()
+            or any(path.is_symlink() or not path.is_file() for path in (manifest_path, log_path))):
+        raise ValueError("Training requires a regular attempt manifest and completed log.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (not isinstance(manifest, dict) or manifest.get("mode") not in {"train", "resume"}
+            or manifest.get("status") != "suite_complete_log_unconfirmed"
+            or manifest.get("log_path") != str(log_path.resolve())):
+        raise ValueError("Training attempt is not awaiting log confirmation.")
+    if _verify_evaluation_result(manifest, log_dir) != manifest["receipt_sha256"]:
+        raise ValueError("Training receipt changed before log confirmation.")
+    with log_path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    manifest["status"] = "suite_complete_not_adoption"
+    save_json(manifest_path, manifest, replace=True)
+
+
 def process_identity(pid: int) -> dict | None:
     if pid <= 1:
         raise ValueError("Refusing an unsafe service PID.")
@@ -727,6 +879,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--action", required=True, choices=(
         "audit", "smoke", "prepare", "confirm-prepare-log", "evaluate-attempt", "confirm-evaluation-log",
+        "train-attempt", "resume-attempt", "confirm-training-log",
         "tensorboard", "tensorboard-status", "tensorboard-stop",
     ))
     parser.add_argument("--log-dir", type=Path, required=True)
@@ -739,12 +892,34 @@ def main() -> None:
     parser.add_argument("--config-sha256")
     parser.add_argument("--min-suite-free-bytes", type=int)
     parser.add_argument("--min-log-free-bytes", type=int)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batches-per-epoch", type=int)
+    parser.add_argument("--tensorboard-log-dir", type=Path)
+    parser.add_argument("--acknowledge-training-approval", action="store_true")
+    parser.add_argument("--acknowledge-training-resources", action="store_true")
     args = parser.parse_args()
     if args.action == "confirm-prepare-log":
         confirm_prepare_log(args.log_dir)
         return
     if args.action == "confirm-evaluation-log":
         confirm_evaluation_log(args.log_dir)
+        return
+    if args.action == "confirm-training-log":
+        confirm_training_log(args.log_dir)
+        return
+    if args.action in {"train-attempt", "resume-attempt"}:
+        if (args.config is None or args.run_dir is None or args.run_id is None or args.config_sha256 is None
+                or args.mps_memory_fraction is None or args.min_suite_free_bytes is None
+                or args.min_log_free_bytes is None or args.epochs is None or args.batches_per_epoch is None
+                or args.tensorboard_log_dir is None or not args.acknowledge_training_approval
+                or not args.acknowledge_training_resources):
+            parser.error("Training requires pinned inputs, explicit budgets, resources and approval acknowledgements.")
+        training_attempt(
+            args.config, args.run_dir, args.log_dir, args.tensorboard_log_dir, args.run_id,
+            config_sha256=args.config_sha256, resume=args.action == "resume-attempt", epochs=args.epochs,
+            batches_per_epoch=args.batches_per_epoch, mps_memory_fraction=args.mps_memory_fraction,
+            min_suite_free_bytes=args.min_suite_free_bytes, min_log_free_bytes=args.min_log_free_bytes,
+        )
         return
     if args.action == "evaluate-attempt":
         if (args.config is None or args.run_dir is None or args.run_id is None

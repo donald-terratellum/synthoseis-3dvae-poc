@@ -464,6 +464,32 @@ class ArmInitializationTests(unittest.TestCase):
         self.assertEqual(evidence["initialization"]["device"], "mps")
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_failed_service_after_suite_binding_can_resume_bootstrap(self):
+        suite = self.source.parent / "service-interrupted"
+        inputs = self.suite_inputs()
+        self.hashes["config"] = content_hash(suite_input_record(suite, **inputs))
+        arguments = {
+            **inputs, "monitor_batches": {}, "lpips_loss_fn": object(),
+        }
+        with patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler", return_value=self.sampler), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs", return_value={"status": "fixture"}), \
+             patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            with self.assertRaisesRegex(RuntimeError, "service unavailable"):
+                run_suite(
+                    suite, resume=False, attempt_id="first", on_suite_bound=Mock(
+                        side_effect=RuntimeError("service unavailable")),
+                    **arguments,
+                )
+            self.assertTrue((suite / "resolved_suite_inputs.json").is_file())
+            self.assertFalse((suite / "S1").exists())
+            callback = Mock()
+            result = run_suite(suite, resume=True, attempt_id="retry", on_suite_bound=callback, **arguments)
+            self.assertEqual(result, {"status": "fixture"})
+            callback.assert_called_once_with()
+            self.assertTrue((suite / "suite_metadata.json").is_file())
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_suite_workflow_prepares_and_reopens_three_matched_arms(self):
         suite = self.source.parent / "workflow"
         inputs = self.suite_inputs()
@@ -475,6 +501,12 @@ class ArmInitializationTests(unittest.TestCase):
             **inputs, "attempt_id": "first-run", "monitor_batches": {}, "lpips_loss_fn": object(),
         }
         captures = []
+        bound = []
+
+        def suite_bound():
+            saved = json.loads((suite / "resolved_suite_inputs.json").read_text())
+            self.assertEqual(content_hash(saved), self.hashes["config"])
+            bound.append((suite / "S1").exists())
 
         def coordinate(journals, **kwargs):
             self.assertEqual(set(journals), {"S1", "S2", "S3"})
@@ -495,7 +527,7 @@ class ArmInitializationTests(unittest.TestCase):
                        return_value=({}, inputs["validate_epoch"], arguments["lpips_loss_fn"], {})):
                 result = run_suite_from_record(
                     record_path, suite, expected_config_sha256=self.hashes["config"],
-                    resume=False, attempt_id="first-run",
+                    resume=False, attempt_id="first-run", on_suite_bound=suite_bound,
                 )
             self.assertEqual(result, {"S1": {"status": "fixture"}})
             self.assertEqual(content_hash(json.loads((suite / "resolved_suite_inputs.json").read_text())),
@@ -518,8 +550,9 @@ class ArmInitializationTests(unittest.TestCase):
                        return_value=({}, inputs["validate_epoch"], arguments["lpips_loss_fn"], {})):
                 run_suite_from_record(
                     record_path, suite, expected_config_sha256=self.hashes["config"],
-                    resume=True, attempt_id="resume",
+                    resume=True, attempt_id="resume", on_suite_bound=suite_bound,
                 )
+            self.assertEqual(bound, [False, True])
             second_journals, resumed = captures[-1]
             self.assertEqual(resumed, first_initialization)
             self.assertTrue(all(journal.lock_fd == -1 for journal in second_journals.values()))

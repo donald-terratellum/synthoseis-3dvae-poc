@@ -1433,6 +1433,7 @@ def run_suite(
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
     historical: HistoricalReconstruction, matching_config: dict, hashes: dict, evaluate_only: bool = False,
+    on_suite_bound: Callable[[], None] | None = None,
 ) -> dict[str, dict]:
     """Prepare or reopen a suite, then run or evaluate its arms in order.
 
@@ -1440,6 +1441,7 @@ def run_suite(
     launch approval where applicable, resource limits and log capture.
     """
     if (not isinstance(resume, bool) or not isinstance(evaluate_only, bool) or (evaluate_only and not resume)
+            or (on_suite_bound is not None and not callable(on_suite_bound))
             or not isinstance(attempt_id, str) or not attempt_id
             or any(character in attempt_id for character in "\r\n")):
         raise ValueError("An explicit fresh/resume mode and single-line attempt ID are required.")
@@ -1489,6 +1491,8 @@ def run_suite(
         suite_dir.mkdir()
         _sync_directory(suite_dir.parent)
     _bind_suite_inputs(suite_dir, record, resume=resume)
+    if on_suite_bound is not None:
+        on_suite_bound()
 
     with ExitStack() as stack:
         journals = {}
@@ -1649,7 +1653,7 @@ def suite_storage_preflight_from_record(
 
 def run_suite_from_record(
     record_path: Path, suite_dir: Path, *, expected_config_sha256: str, resume: bool, attempt_id: str,
-    evaluate_only: bool = False,
+    evaluate_only: bool = False, on_suite_bound: Callable[[], None] | None = None,
 ) -> dict[str, dict]:
     """Run or evaluate a pinned record; approval, resource limits and logging remain external."""
     record, reference, hashes = _read_pinned_suite_record(record_path, suite_dir, expected_config_sha256)
@@ -1660,4 +1664,5 @@ def run_suite_from_record(
         formal_config=record["formal_config"], guardrail_manifest=record["guardrail_manifest"],
         guardrail_config=record["guardrail_config"], historical=reference,
         matching_config=record["matching_config"], hashes=hashes, evaluate_only=evaluate_only,
+        on_suite_bound=on_suite_bound,
     )

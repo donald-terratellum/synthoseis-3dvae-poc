@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The record-bound runner now has internal fresh-training and resume attempts.
+Both require the explicit epoch and batch counts to match the pinned suite
+record, check caller-supplied disk floors, set the MPS per-process fraction,
+and record a distinct attempt. Once the suite directory and its input record
+are bound, the runner starts or reuses the suite-owned TensorBoard service
+before entering the existing sequential S1/S2/S3 coordinator. Resume uses the
+original training attempt's TensorBoard ownership record. If the suite returns,
+the runner verifies the final checkpoints and separate encoder and pair-head
+reports; completion remains unconfirmed until the combined log is checked.
+
+These are internal components, not approved launch commands. The CLI
+acknowledgements do not establish that approval or a resource review occurred.
+Disk floors are caller estimates, and the MPS fraction does not bound aggregate
+memory across tokenizer subprocesses. Tests used mocked suite execution and
+TensorBoard; a separate MPS fixture exercised binding, interrupted service
+startup and bootstrap without an optimizer step. Full integrated train/resume
+execution and resource headroom remain unverified. The public train/resume shell
+modes remain blocked; no production training was authorized or performed.
+
 The shell now connects evaluation of an **already completed** matched suite to
 the evaluation-only runner, combined log capture and log confirmation:
 
