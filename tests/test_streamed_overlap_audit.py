@@ -48,6 +48,17 @@ def make_source(root, name="seismic__fixture", complete=True):
             if key == FLUID_KEYS[0]:
                 mask[:, :, 60:65] = 1
             group.create_array(key, data=mask, chunks=(16, 16, 151))
+    ng_shape = (40, 40, 151)
+    group.create_array(
+        "faulted_net_to_gross",
+        data=np.full(ng_shape, 0.4, dtype="f4"),
+        chunks=(16, 16, 151),
+    )
+    group.create_array(
+        "faults/faulted_channel_ng",
+        data=np.zeros(ng_shape, dtype="f4"),
+        chunks=(16, 16, 151),
+    )
     (directory / "model_parameters_fixture.txt").write_text(
         "bandpass_bandlimits: 4.0, 35.0\nSHA: fixture-only\n"
     )
@@ -143,6 +154,9 @@ class StreamedAuditTests(unittest.TestCase):
         info = parameter_metadata(directory)
         self.assertEqual(info["bandlimits_hz"], [4, 35])
         self.assertEqual(info["sample_spacing_ms_from_digi"], 4)
+        self.assertGreater(info["parameters_mtime_ns"], 0)
+        self.assertGreater(info["config_mtime_ns"], 0)
+        self.assertIn("dirty-tree diff", info["generator_provenance_status"])
         parameter = directory / "model_parameters_fixture.txt"
         for text in (
             "SHA: fixture-only\n",
@@ -163,6 +177,12 @@ class StreamedAuditTests(unittest.TestCase):
         path = make_source(self.root, complete=False)
         info = inspect_source(Source(path, "validation"), DEFAULT_SEISMIC_KEY)
         self.assertFalse(info["semantic_arrays_complete"])
+        self.assertIn("faulted_net_to_gross", info["all_arrays"])
+        self.assertIn("faults/faulted_channel_ng", info["all_arrays"])
+        self.assertEqual(info["all_arrays"]["faults/faulted_channel_ng"]["shape"], [40, 40, 151])
+        self.assertEqual(info["all_arrays"]["faults/faulted_channel_ng"]["dtype"], "float32")
+        self.assertGreater(info["store_directory_mtime_ns"], 0)
+        self.assertGreater(info["source_directory_mtime_ns"], 0)
         for key in LABEL_KEYS:
             self.assertIn(f"Missing array: {key}", info["issues"])
         group = zarr.open_group(str(path), mode="r")
@@ -216,6 +236,14 @@ class StreamedAuditTests(unittest.TestCase):
         self.assertEqual(content_hash(manifest), result["manifest_sha256"])
         contract = json.loads((output / "target_contract.json").read_text())
         self.assertFalse(contract["approved"])
+        self.assertEqual(contract["schema_version"], 4)
+        self.assertNotIn("approved_direction", contract)
+        event_target = contract["owner_decisions"]["directional_event_coverage"]
+        self.assertEqual(event_target["reference"], "A")
+        self.assertTrue(event_target["computed_before_augmentation"])
+        self.assertIn("different source volumes", " ".join(event_target["zero_target_pairs"]))
+        self.assertIn("abs(oil_A-oil_B)", event_target["fluid_adjustment"])
+        self.assertIn("Peak/trough detector", contract["unresolved"][0])
         self.assertTrue((output / "audit_examples.html").is_file())
         with self.assertRaisesRegex(ValueError, "read-only source tree"):
             run_audit(config, self.root / "sources" / "forbidden-output")

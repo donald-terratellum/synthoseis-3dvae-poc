@@ -169,17 +169,49 @@ def parameter_metadata(directory: Path) -> dict:
     return {
         "parameters_path": str(path),
         "parameters_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "parameters_mtime_ns": path.stat().st_mtime_ns,
         "config_path": str(config_path),
         "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "config_mtime_ns": config_path.stat().st_mtime_ns,
         "generator_sha": sha[0],
+        "generator_provenance_status": (
+            "Recorded commit SHA only; generation-time dirty-tree diff and command are not stored."
+        ),
         "generator_seeds": config.get("seeds"),
         "bandlimits_hz": [low, high],
         "sample_spacing_ms_from_digi": spacing,
         "nyquist_hz_if_ms": 500.0 / spacing,
         "filter_order": order,
         "configured_cube_shape": config.get("cube_shape"),
+        "pad_samples": config.get("pad_samples"),
+        "infill_factor": config.get("infill_factor"),
+        "include_channels": config.get("include_channels"),
+        "channel_ntg_threshold": config.get("channel_ntg_threshold"),
         "interpretation_status": "Requires generator/key/units verification before augmentation.",
     }
+
+
+def array_metadata(array: zarr.Array) -> dict:
+    return {
+        "shape": list(array.shape),
+        "chunks": list(array.chunks),
+        "dtype": str(array.dtype),
+        "chunk_uncompressed_bytes": math.prod(array.chunks) * array.dtype.itemsize,
+    }
+
+
+def inventory_arrays(group: zarr.Group, prefix: str = "") -> dict[str, dict]:
+    inventory = {}
+    for name in sorted(group.keys()):
+        key = f"{prefix}{name}"
+        value = group[name]
+        if isinstance(value, zarr.Array):
+            inventory[key] = array_metadata(value)
+        elif isinstance(value, zarr.Group):
+            inventory.update(inventory_arrays(value, f"{key}/"))
+        else:
+            raise ValueError(f"Unsupported Zarr member at {key}")
+    return inventory
 
 
 def require_array(group: zarr.Group, key: str) -> zarr.Array:
@@ -191,6 +223,7 @@ def require_array(group: zarr.Group, key: str) -> zarr.Array:
 
 def inspect_source(source: Source, seismic_key: str) -> dict:
     group = zarr.open_group(str(source.path), mode="r")
+    all_arrays = inventory_arrays(group)
     arrays = {}
     issues = []
     for key in (seismic_key, *LABEL_KEYS, *CONTEXT_KEYS):
@@ -200,13 +233,7 @@ def inspect_source(source: Source, seismic_key: str) -> dict:
         array = require_array(group, key)
         if len(array.shape) != 3:
             raise ValueError(f"Expected 3D source array: {source.path}/{key}")
-        arrays[key] = {
-            "shape": list(array.shape),
-            "chunks": list(array.chunks),
-            "dtype": str(array.dtype),
-            "chunk_uncompressed_bytes": math.prod(array.chunks) * array.dtype.itemsize,
-            "attributes": dict(array.attrs),
-        }
+        arrays[key] = {**array_metadata(array), "attributes": dict(array.attrs)}
     if seismic_key not in arrays:
         raise ValueError(f"Missing seismic array {seismic_key}: {source.path}")
     try:
@@ -218,6 +245,9 @@ def inspect_source(source: Source, seismic_key: str) -> dict:
         "source_id": source.identifier,
         "path": str(source.path),
         "split": source.split,
+        "store_directory_mtime_ns": source.path.stat().st_mtime_ns,
+        "source_directory_mtime_ns": source.path.parent.stat().st_mtime_ns,
+        "all_arrays": all_arrays,
         "arrays": arrays,
         "parameters": parameters,
         "semantic_arrays_complete": all(key in arrays for key in LABEL_KEYS),
@@ -601,7 +631,7 @@ def run_audit(config: dict, output: Path) -> dict:
         "status": PENDING,
     }
     summary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": PENDING,
         "production_training_allowed": False,
@@ -614,11 +644,44 @@ def run_audit(config: dict, output: Path) -> dict:
             "absence_of_closure_invalidates_lithology": False,
             "closure_values_are_final_seismic_fluid": False,
             "fluid_policy": "Oil/gas closure labels modify fluid within corrected sand, including channels; channel identity is retained.",
-            "generator_consistency": "All three recorded historical commits apply late brine mixing to channels after oil/gas; reconcile with intended clean-fill targets before training.",
-            "provisional_fluid_policy": "Verified-version background brine; preserve intended channel oil/gas but flag historical channel mixing as fluid-invalid. No layer removal.",
+            "generator_consistency": "Recorded historical fingerprints indicate late brine mixing into channels after oil/gas; a recorded generator SHA does not establish the per-source generation worktree or command. Verify current source provenance and synthesis before treating closure masks as final seismic fluid.",
+            "provisional_fluid_policy": "Treat corrected sand outside oil/gas closures as brine only after confirming the applicable generator policy. The event-target remainder is mathematical, not an exhaustive brine label.",
             "historical_seismic_file_sha256": VERIFIED_SEISMIC_FILES,
-            "owner_approved_provisional_fluid_policy": False,
-            "channel_layer_identity": "Unresolved; host geologic age is not automatically channel depositional identity.",
+            "owner_approved_provisional_fluid_policy": True,
+        },
+        "owner_decisions": {
+            "physical_overlap": "Canonical 3D window intersection divided by one window's volume.",
+            "directional_event_coverage": {
+                "reference": "A",
+                "events": "Peaks and troughs detected on each full original A trace before augmentation.",
+                "numerator": "Events in A's shared XYZ support.",
+                "denominator": "Events across full A depth on traces in the shared XY footprint.",
+                "fluid_adjustment": (
+                    "1 - 0.5 * (abs(oil_A-oil_B) + abs(gas_A-gas_B) "
+                    "+ abs(other_A-other_B))"
+                ),
+                "fluid_fractions": (
+                    "Fractions use all selected age-range voxels in each full window; "
+                    "oil/gas-positive voxels are counted by their masks, with an "
+                    "equal split if both masks are positive. other = 1 - oil - gas."
+                ),
+                "age_range": (
+                    "Average geologic_age_faulted at shallowest and deepest Z indices "
+                    "in the shared region; select that range in each full window."
+                ),
+                "zero_target_pairs": [
+                    "Same-source windows with no 3D intersection.",
+                    "Windows from different source volumes.",
+                ],
+                "unavailable_cases": [
+                    "Overlapping pair with zero events in A's denominator.",
+                    "Unverified alignment, missing/non-finite required labels, or empty age support.",
+                ],
+                "computed_before_augmentation": True,
+            },
+            "cross_volume_age_equivalence": False,
+            "primary_retrieval_selection": "Directional pair-head ranking; report mu-cosine separately.",
+            "rotation_and_scaling": "Applied to every view; parameters remain independently sampled.",
         },
         "manifest_sha256": content_hash(manifest),
         "config_sha256": content_hash(config),
@@ -654,7 +717,7 @@ def run_audit(config: dict, output: Path) -> dict:
             "Bounded, intentionally fluid-seeking examples are not prevalence estimates.",
             "XYZ axes and configured label offset remain inspection hypotheses.",
             "Current neighboring generator code does not prove every historical generator SHA.",
-            "No semantic label or success/adoption threshold has been implemented or approved.",
+            "The event target is not implemented; detector settings, source validity and success/adoption thresholds remain unapproved.",
             "No model forward/backward pass, production training or final-test prediction was run.",
             "Decoded bytes are conservative chunk estimates, not measured physical I/O.",
         ],
@@ -664,24 +727,18 @@ def run_audit(config: dict, output: Path) -> dict:
     write_json(output / "audit_report.json", summary)
     write_visual_report(output / "audit_examples.html", summary, config["seismic_key"])
     write_json(output / "target_contract.json", {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": PENDING,
         "approved": False,
         "manifest_sha256": summary["manifest_sha256"],
         "label_policy": summary["label_policy"],
-        "approved_direction": {
-            "directional": True,
-            "equal_weight_per_distinct_A_layer": True,
-            "thickness_penalty": False,
-            "net_to_gross_penalty": False,
-            "fluid_mismatch_credit": 0,
-        },
+        "owner_decisions": summary["owner_decisions"],
         "unresolved": [
-            "Distinct layer/denominator and partial boundary-layer rules.",
-            "3D support, fractional fluid credit, unknown/conflicting masks.",
-            "Cross-volume analog correspondence and ordering tolerances.",
-            "Verified per-source axis/depth mapping and exact noise filter support.",
-            "Eligible relevance, cosine versus pair-head primary ranking and adoption thresholds.",
+            "Peak/trough detector, prominence/noise thresholds and edge handling.",
+            "Verified per-source XYZ/depth mapping and age-range boundary/empty-support handling.",
+            "Current generator worktree/command provenance and consistency of oil/gas/brine channel fill.",
+            "Exact source-specific noise filter, transient context and negligible-energy handling.",
+            "Target-yield reporting, relevance eligibility, evaluation cohort thresholds and adoption criteria.",
         ],
     })
     write_json(output / "resolved_audit_config.json", config)

@@ -251,7 +251,8 @@ The default evidence parent is
 The config explicitly labels `+1` as an alignment **hypothesis**, not verified truth.
 The interpreter defaults to `.venv/bin/python`; `PYTHON` can select another executable.
 
-Current local run: `streamed-overlap-target-audit-20261111-04` (report schema 2).
+Historical local run (superseded by section 7):
+`streamed-overlap-target-audit-20261111-04` (report schema 2).
 It includes the owner's clarified hierarchy and a runner attempt manifest. Earlier
 run `-03` is preserved; its embedded fluid-policy text predates that hierarchy and
 is superseded by this document and the updated audit writer.
@@ -470,4 +471,44 @@ Pylance syntax checks and shell syntax checks. The integrated browser disconnect
 opening the offline report; interactive rendering was not certified by that attempt.
 
 **Stop here: target-contract review is the next scientific decision. No production
-training, baseline extension, replication, push or PR has been launched.**
+training, baseline extension, or replication has been launched. Audit-only code and
+plan updates may be committed and pushed; private audit outputs remain local.**
+
+## 7. Refreshed source inventory (2026-11-22)
+
+Read-only run `streamed-overlap-target-audit-20261121-03` used the existing local
+train/validation source root and configuration. It inspected metadata for 205 sources:
+180 training and 25 validation. All 205 have complete required semantic arrays and no
+inventory issues. No final-test crops were read. The run remains
+`LOCAL_TARGET_VALIDATION_PENDING`; its target contract is unapproved and production
+training is explicitly disallowed. The local manifest SHA256 is
+`695a39954b527f58a04d02590cd368a6b5817f04396ecb05a4e18ba770484da7`.
+
+The expanded manifest inventories 20 recursive array keys per source. Across all
+sources, the four seismic variants have shape `(300, 300, 1499)`, chunks
+`(50, 50, 1499)`, and `float32` dtype. Semantic/geometry arrays have shape
+`(300, 300, 1510)` and chunks `(50, 50, 1510)`. `geologic_age_faulted` and
+`faulted_lithology` are `float32`; oil, gas, and brine closures and channel labels are
+`uint8`. `faulted_net_to_gross` is present in all 205 stores, as are
+`faults/faulted_channel_labels`; `faults/faulted_channel_ng` is absent from all 205.
+`closure_segments_id` is `uint16` in 204 stores and `uint8` in one. See the local
+`source_manifest.json` for the full per-array inventory.
+
+All stores record generator SHA
+`bd51313ebfb620800bb2973c2cea28f4b9325a15`; parameter/config file modification times
+range from November 16 through November 20 UTC. The recorded commit is available and
+an ancestor of the neighboring checkout's current `6ae391fe9f18a3af0293e60b781f32aeb81a430b`
+HEAD. The current checkout has an uncommitted 9,513-byte diff in `Faults.py` and
+`Seismic.py`; those files' modification times precede the observed source metadata
+times. This makes the dirty code a plausible generation-time context, not proof: per-run
+generation commands and dirty-worktree fingerprints were not stored. A local,
+observation-only fingerprint is preserved as
+`generator_checkout_observation.json` beside the audit output; it is not source-level
+provenance and must not be used to claim that any specific store came from that worktree.
+
+The refreshed source inventory resolves availability and uniformity questions, not the
+target contract. Exact event detector/prominence/edge rules, verified XYZ/depth and
+age-range support, applicable generator/fluid provenance, source-noise filtering and
+transient handling, valid-target yield, and evaluation eligibility/thresholds remain
+unresolved as listed in the machine-readable contract. Do not generate semantic labels
+or launch training until those decisions are reviewed and approved.

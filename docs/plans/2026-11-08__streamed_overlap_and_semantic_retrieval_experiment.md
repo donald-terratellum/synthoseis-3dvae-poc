@@ -1,6 +1,6 @@
 # Streamed overlap and fluid-aware semantic retrieval: execution plan
 
-Updated: 2026-11-21, with the owner's revised observable-event target.
+Updated: 2026-11-22, with the refreshed source inventory and the owner's revised observable-event target.
 
 ## 1. Authority, scope, and approval gates
 
@@ -35,6 +35,14 @@ start/status/stop; later training/CSV/resume and automatic trainer/service integ
 in this plan are requirements, not claims
 that those features already exist. See the proposal for the exact reproduction command,
 measurements, missing validation labels and revised lithology/closure interpretation.
+
+**2026-11-22 refreshed local audit:** Run
+`streamed-overlap-target-audit-20261121-03` inventories all recursive Zarr array
+keys/shapes/chunks/dtypes and source/config metadata times for 180 training and 25
+validation sources. All 205 have the required semantic arrays and no inventory issues;
+all retain `faulted_net_to_gross` and `faults/faulted_channel_labels`, but none retain
+`faults/faulted_channel_ng`. Full results and provenance caveats are in the proposal.
+No final-test crops were read, and Gate 1 and the training-launch gate remain closed.
 
 Proceed autonomously on the approved decisions below. Do not repeatedly ask about
 settled choices. Only stop for an unresolved scientific contract, failed safety or
