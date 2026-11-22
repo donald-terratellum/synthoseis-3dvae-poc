@@ -488,6 +488,17 @@ class ArmInitializationTests(unittest.TestCase):
             train.assert_not_called()
 
     def test_suite_runs_arms_sequentially_and_stops_on_failure(self):
+        formal = {"final_epoch": self.config["final_epoch"], "diagnostic_max_wall_seconds": 30}
+        historical = HistoricalReconstruction(
+            self.suite_dir / "report", "a" * 64, self.suite_dir / "checkpoint", "b" * 64, "fixture",
+        )
+        self.hashes.update(
+            formal_evaluation=content_hash(formal), reconstruction_guardrail=content_hash({}),
+            reconstruction_reference=content_hash({
+                "report_sha256": historical.report_sha256, "checkpoint_sha256": historical.checkpoint_sha256,
+                "checkpoint_label": historical.checkpoint_label,
+            }),
+        )
         arms = self.prepare_suite()
         evidence = save_suite_initialization(
             self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
@@ -540,8 +551,8 @@ class ArmInitializationTests(unittest.TestCase):
             "attempt_id": "attempt", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
             "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
             "search_manifest": search, "diagnostic_manifest": {},
-            "formal_config": {"diagnostic_max_wall_seconds": 30}, "guardrail_manifest": {},
-            "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
+            "formal_config": formal, "guardrail_manifest": {},
+            "guardrail_config": {}, "historical": historical, "matching_config": self.config, "hashes": self.hashes,
             "suite_initialization": suite,
         }
         journals = {arm: item.journal for arm, item in arms.items()}
@@ -564,6 +575,29 @@ class ArmInitializationTests(unittest.TestCase):
             run_arm.assert_not_called()
             self.assertEqual(calls, [])
             metadata["path"].write_bytes(original)
+            for key, changed in (
+                ("formal_config", {**formal, "diagnostic_max_wall_seconds": 31}),
+                ("guardrail_config", {"changed": True}),
+                ("historical", replace(historical, checkpoint_label="other")),
+            ):
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, "frozen"):
+                    run_suite_epochs(journals, runtime_factory, **{**arguments, key: changed})
+                validation_preflight.assert_not_called()
+                run_arm.assert_not_called()
+                self.assertEqual(calls, [])
+            changed_formal = {**formal, "final_epoch": self.config["final_epoch"] + 1}
+            changed_hashes = {**self.hashes, "formal_evaluation": content_hash(changed_formal)}
+            with patch("scripts.streamed_overlap_epoch_runner.verify_suite_run_metadata",
+                       return_value={"initialization_sha256": evidence["evidence_sha256"]}):
+                for overrides in (
+                    {"formal_config": changed_formal, "hashes": changed_hashes},
+                    {"hashes": {**self.hashes, "matching": "f" * 64}},
+                ):
+                    with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "suite budget"):
+                        run_suite_epochs(journals, runtime_factory, **{**arguments, **overrides})
+            validation_preflight.assert_not_called()
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
             epoch_gate.side_effect = ValueError("invalid epoch inputs")
             with self.assertRaisesRegex(ValueError, "invalid epoch inputs"):
                 run_suite_epochs(journals, runtime_factory, **arguments)
@@ -625,6 +659,13 @@ class ArmInitializationTests(unittest.TestCase):
                                      for action in ("open", "run", "close")])
 
     def test_suite_rejects_unlocked_journal_before_opening_runtime(self):
+        formal = {"final_epoch": self.config["final_epoch"]}
+        self.hashes.update(
+            formal_evaluation=content_hash(formal), reconstruction_guardrail=content_hash({}),
+            reconstruction_reference=content_hash({
+                "report_sha256": "a" * 64, "checkpoint_sha256": "b" * 64, "checkpoint_label": "fixture",
+            }),
+        )
         arms = self.prepare_suite()
         evidence = save_suite_initialization(
             self.suite_dir, arms, matching_config=self.config, expected_hashes=self.hashes, source_root=self.source,
@@ -648,7 +689,7 @@ class ArmInitializationTests(unittest.TestCase):
                     {arm: item.journal for arm, item in arms.items()}, factory,
                     attempt_id="attempt", monitor_batches={}, validate_epoch=object(), lpips_loss_fn=object(),
                     manifest_path=self.suite_dir / "manifest", source_root=self.source,
-                    search_manifest={}, diagnostic_manifest={}, formal_config={}, guardrail_manifest={},
+                    search_manifest={}, diagnostic_manifest={}, formal_config=formal, guardrail_manifest={},
                     guardrail_config={}, historical=HistoricalReconstruction(
                         self.suite_dir / "report", "a" * 64, self.suite_dir / "checkpoint", "b" * 64, "fixture",
                     ), matching_config=self.config, hashes=self.hashes,

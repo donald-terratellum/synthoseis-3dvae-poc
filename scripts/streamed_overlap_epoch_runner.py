@@ -552,6 +552,16 @@ def _reference_hash(historical: HistoricalReconstruction) -> str:
     })
 
 
+def _validate_evaluation_bindings(
+    hashes: dict, formal_config: dict, guardrail_config: dict, historical: HistoricalReconstruction,
+) -> None:
+    if hashes.get("formal_evaluation") != content_hash(formal_config):
+        raise ValueError("The arm must use its frozen formal evaluation configuration.")
+    if (hashes.get("reconstruction_guardrail") != content_hash(guardrail_config)
+            or hashes.get("reconstruction_reference") != _reference_hash(historical)):
+        raise ValueError("The arm must bind the frozen reconstruction configuration and reference.")
+
+
 def complete_reconstruction_comparison(
     candidate: SelectedReconstruction, historical: HistoricalReconstruction, *,
     s1: SelectedReconstruction | None, guardrail_manifest: dict, guardrail_config: dict, lpips_loss_fn,
@@ -744,8 +754,7 @@ def run_arm_epochs(
     initial_checkpoint: Path, suite_initialization: SuiteInitialization,
 ) -> dict:
     """Resume one arm from its full epoch state and finish evaluation before advancing."""
-    if hashes.get("formal_evaluation") != content_hash(formal_config):
-        raise ValueError("The arm must use its frozen formal evaluation configuration.")
+    _validate_evaluation_bindings(hashes, formal_config, guardrail_config, historical)
     if (isinstance(formal_config.get("final_epoch"), bool)
             or not isinstance(formal_config.get("final_epoch"), int)
             or formal_config["final_epoch"] < 1):
@@ -768,9 +777,6 @@ def run_arm_epochs(
         monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
         manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
     )
-    if (hashes.get("reconstruction_guardrail") != content_hash(guardrail_config)
-            or hashes.get("reconstruction_reference") != _reference_hash(historical)):
-        raise ValueError("The arm must bind the frozen reconstruction configuration and reference.")
     if (model.arm not in {"S1", "S2", "S3"}
             or (model.arm == "S1" and s1 is not None)
             or (model.arm in {"S2", "S3"} and (
@@ -895,6 +901,7 @@ def run_suite_epochs(
     )
     if metadata["initialization_sha256"] != suite_initialization.evidence_sha256:
         raise ValueError("The suite must use the initialization pin recorded in suite metadata.")
+    _validate_evaluation_bindings(hashes, formal_config, guardrail_config, historical)
     _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
     _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
     _validate_epoch_inputs(
@@ -902,6 +909,9 @@ def run_suite_epochs(
         manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
     )
     workload = suite_workload(matching_config, search_manifest)
+    if (hashes.get("matching") != matching_config_hash(matching_config)
+            or formal_config["final_epoch"] != matching_config["final_epoch"]):
+        raise ValueError("Evaluation and suite budget must match the frozen matching configuration.")
     for arm in ("S1", "S2", "S3"):
         journal = journals[arm]
         initial = suite_initialization.initial_checkpoints[arm]

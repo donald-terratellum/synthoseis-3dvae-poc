@@ -4,6 +4,21 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The prepared-suite coordinator now checks the formal-evaluation,
+reconstruction-guardrail and historical-reference hashes against the
+checkpoint-bound suite hashes before opening an arm runtime or reading
+validation inputs. It also requires the formal final epoch to match the
+matching configuration and verifies that configuration's hash. The same
+evaluation-binding checks remain in the per-arm path. The historical
+reference files and real guardrail stores are not read by this check; their
+post-selection verification remains separate. These checks do not bind the
+complete resolved launch configuration or authorize training.
+
+The portable streamed suite passed 231 tests, with one skipped and 59 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`; it took 37.26
+seconds wall time and 711,049,216 bytes peak RSS. These are fixture-test
+measurements, not training estimates. Train, resume and evaluate remain blocked.
+
 Before opening any arm runtime, the prepared-suite coordinator now also
 revalidates each frozen bounded-search region and the diagnostic label
 fingerprints using the same verifiers used during evaluation. It checks the
