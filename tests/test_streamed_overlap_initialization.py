@@ -1,5 +1,7 @@
 import copy
 import hashlib
+import os
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,10 +10,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_initialization import _publish_copy, prepare_arm_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
-from scripts.streamed_overlap_matching import verify_arm_initial_checkpoint
+from scripts.streamed_overlap_matching import _rngs_equal, verify_arm_initial_checkpoint
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.train import EarlyStoppingState
 
@@ -31,6 +34,11 @@ class FixtureSampler:
 
 class ArmInitializationTests(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(random.setstate, random.getstate())
+        self.addCleanup(np.random.set_state, np.random.get_state())
+        self.addCleanup(torch.set_rng_state, torch.get_rng_state())
+        if torch.backends.mps.is_available():
+            self.addCleanup(torch.mps.set_rng_state, torch.mps.get_rng_state())
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -96,6 +104,78 @@ class ArmInitializationTests(unittest.TestCase):
         self.assertEqual(initial.read_bytes(), original)
         self.assertEqual(result["checkpoint_path"].read_bytes(), original)
 
+    def check_matched_initial_rng(self, device):
+        self.model = self.model.to(device)
+        self.optimizer = build_optimizer(self.model)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, factor=0.5, patience=6, min_lr=1e-5,
+        )
+        self.model.train()
+        random.seed(100)
+        np.random.seed(101)
+        torch.default_generator.manual_seed(102)
+        if device == "mps":
+            torch.mps.manual_seed(103)
+        before = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        initial = self.prepare()["initial_checkpoint"]
+        after = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        self.assertTrue(_rngs_equal(before, after, device))
+        self.assertTrue(self.model.training)
+
+        control_dir = self.run_dir.parent / "control"
+        control_dir.mkdir()
+        journal = BatchJournal(control_dir / "batch_metrics.csv", STEP_FIELDS, create=True)
+        self.addCleanup(journal.close)
+        journal.reconcile(watermark=None, attempt_id="control", expected_step=0, expected_exposure=0)
+        model = fresh_e1_model("S1", model_seed=2, head_seed=3).to(device)
+        optimizer = build_optimizer(model)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.5, patience=6, min_lr=1e-5,
+        )
+        random.seed(200)
+        np.random.seed(201)
+        torch.default_generator.manual_seed(202)
+        if device == "mps":
+            torch.mps.manual_seed(203)
+        before_control = capture_training_state(optimizer, scheduler, None, self.stopping)
+        control = self.prepare(
+            model=model, optimizer=optimizer, scheduler=scheduler, journal=journal,
+        )["initial_checkpoint"]
+        after_control = capture_training_state(optimizer, scheduler, None, self.stopping)
+        self.assertTrue(_rngs_equal(before_control, after_control, device))
+        left = torch.load(initial, map_location="cpu", weights_only=True)
+        right = torch.load(control, map_location="cpu", weights_only=True)
+        self.assertTrue(_rngs_equal(left["training"], right["training"], device))
+
+    def test_initial_rng_is_matched_and_caller_rng_is_preserved(self):
+        self.check_matched_initial_rng("cpu")
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_initial_mps_rng_is_matched_and_caller_rng_is_preserved(self):
+        self.check_matched_initial_rng("mps")
+
+    def test_rng_is_restored_when_checkpoint_save_fails(self):
+        before = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        with patch("scripts.streamed_overlap_initialization.save_epoch_state", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                self.prepare()
+        after = capture_training_state(self.optimizer, self.scheduler, None, self.stopping)
+        self.assertTrue(_rngs_equal(before, after, "cpu"))
+        self.assertTrue(self.model.training)
+
+    def test_retained_initial_with_wrong_rng_is_rejected(self):
+        result = self.prepare()
+        initial, last = result["initial_checkpoint"], result["checkpoint_path"]
+        state = torch.load(initial, weights_only=True)
+        state["training"]["torch_rng"][0] ^= 1
+        torch.save(state, initial)
+        last.write_bytes(initial.read_bytes())
+        before = initial.read_bytes()
+        with self.assertRaisesRegex(ValueError, "RNG state does not match"):
+            self.prepare()
+        self.assertEqual(initial.read_bytes(), before)
+        self.assertEqual(last.read_bytes(), before)
+
     def test_failed_copy_removes_only_the_new_partial_file(self):
         source = self.run_dir / "fixture-source"
         source.write_bytes(b"source")
@@ -105,6 +185,25 @@ class ArmInitializationTests(unittest.TestCase):
                 _publish_copy(source, destination, "1" * 64)
         self.assertFalse(destination.exists())
         self.assertEqual(source.read_bytes(), b"source")
+
+    def test_failed_copy_handles_identity_changing_after_write(self):
+        source = self.run_dir / "fixture-source"
+        destination = self.run_dir / "fixture-destination"
+        source.write_bytes(b"source")
+        real_fstat = os.fstat
+
+        def changing_identity(fd):
+            stat = real_fstat(fd)
+            if os.lseek(fd, 0, os.SEEK_CUR) == 0:
+                values = list(stat)
+                values[1] = stat.st_ino ^ 1
+                return os.stat_result(values)
+            return stat
+
+        with patch("scripts.streamed_overlap_initialization.os.fstat", side_effect=changing_identity):
+            with self.assertRaisesRegex(ValueError, "changed during publication"):
+                _publish_copy(source, destination, "1" * 64)
+        self.assertFalse(destination.exists())
 
     def test_failed_copy_does_not_remove_replaced_destination(self):
         source = self.run_dir / "fixture-source"

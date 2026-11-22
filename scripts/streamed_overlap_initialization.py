@@ -7,40 +7,41 @@ import uuid
 
 import torch
 
+from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_checkpoint import (
     _model_device, _validate_hashes, _validate_scheduler, save_epoch_state,
 )
 from scripts.streamed_overlap_evaluation import _checkpoint_state
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _sync_directory
 from scripts.streamed_overlap_matching import (
-    _digest, _initial_state, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
+    _digest, _initial_state, _permitted_file, _rngs_equal, matching_config_hash, verify_arm_initial_checkpoint,
 )
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
+from scripts.train import streamed_inference_context
 
 
 def _publish_copy(source: Path, destination: Path, expected: str) -> None:
-    created = None
-    complete = False
-    try:
-        digest = hashlib.sha256()
-        with source.open("rb") as reader, destination.open("xb") as writer:
-            created = os.fstat(writer.fileno())
+    digest = hashlib.sha256()
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        complete = False
+        try:
             while chunk := reader.read(1024 * 1024):
                 writer.write(chunk)
                 digest.update(chunk)
             writer.flush()
             os.fsync(writer.fileno())
-        if (digest.hexdigest() != expected or _digest(source) != expected
-                or _digest(destination) != expected):
-            raise ValueError("Initial checkpoint changed during publication.")
-        _sync_directory(destination.parent)
-        complete = True
-    finally:
-        if created is not None and not complete and destination.exists() and not destination.is_symlink():
-            current = destination.stat()
-            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
-                destination.unlink()
-                _sync_directory(destination.parent)
+            if (digest.hexdigest() != expected or _digest(source) != expected
+                    or _digest(destination) != expected):
+                raise ValueError("Initial checkpoint changed during publication.")
+            _sync_directory(destination.parent)
+            complete = True
+        finally:
+            if not complete and destination.exists() and not destination.is_symlink():
+                created = os.fstat(writer.fileno())
+                current = destination.stat()
+                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                    destination.unlink()
+                    _sync_directory(destination.parent)
 
 
 def prepare_arm_initial_checkpoints(
@@ -108,31 +109,37 @@ def prepare_arm_initial_checkpoints(
     last_exists = last.exists() or last.is_symlink()
     if last_exists and not initial_exists:
         raise FileExistsError("Refusing an existing last checkpoint without its initial snapshot.")
-    if not initial_exists:
-        temporary = root / f".initial-{uuid.uuid4().hex}.pt"
-        try:
-            save_epoch_state(
-                temporary, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
-                early_stopping=early_stopping, journal=journal, hashes=hashes, completed_epoch=0,
-                batches_per_epoch=matching_config["batches_per_epoch"], selection_state={},
-            )
-            state, digest = _checkpoint_state(temporary)
+    with streamed_inference_context(model, device, matching_config["experiment_seed"]):
+        expected_rng = capture_training_state(optimizer, scheduler, None, early_stopping)
+        if not initial_exists:
+            temporary = root / f".initial-{uuid.uuid4().hex}.pt"
+            try:
+                save_epoch_state(
+                    temporary, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+                    early_stopping=early_stopping, journal=journal, hashes=hashes, completed_epoch=0,
+                    batches_per_epoch=matching_config["batches_per_epoch"], selection_state={},
+                )
+                state, digest = _checkpoint_state(temporary)
+                _initial_state(
+                    state, model.arm, draft, matching_config["model_seed"], matching_config["head_seed"],
+                    matching_config["sampler_seed"],
+                )
+                if not _rngs_equal(state["training"], expected_rng, device):
+                    raise ValueError("Initial checkpoint RNG state does not match the experiment seed.")
+                _publish_copy(temporary, initial, digest)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+                    _sync_directory(root)
+        else:
+            _permitted_file(initial)
+            state, digest = _checkpoint_state(initial)
             _initial_state(
                 state, model.arm, draft, matching_config["model_seed"], matching_config["head_seed"],
                 matching_config["sampler_seed"],
             )
-            _publish_copy(temporary, initial, digest)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-                _sync_directory(root)
-    else:
-        _permitted_file(initial)
-        state, digest = _checkpoint_state(initial)
-        _initial_state(
-            state, model.arm, draft, matching_config["model_seed"], matching_config["head_seed"],
-            matching_config["sampler_seed"],
-        )
+            if not _rngs_equal(state["training"], expected_rng, device):
+                raise ValueError("Initial checkpoint RNG state does not match the experiment seed.")
     if (state["training"]["optimizer"] != optimizer.state_dict()
             or state["training"]["scheduler"] != scheduler.state_dict()
             or state["training"]["early_stopping"] != vars(early_stopping)):

@@ -4,6 +4,27 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The no-training bootstrap now seeds the initial Python, NumPy, CPU and, for an
+MPS arm, MPS training RNGs from the bound `experiment_seed`. It isolates this
+operation from the caller's RNG states and restores the model's training modes,
+including on failure. Different ambient RNG states therefore do not change
+the initial VAE-sampling state of freshly prepared matched arms. Existing initial
+snapshots must have the expected seeded state or initialization fails without
+replacing them; a snapshot made by the earlier ambient-RNG bootstrap may require
+investigation rather than automatic reuse. The sampler, model/head and evaluation
+seeds remain separately configured. Synthetic CPU and local MPS checks compare
+S1 and S3 without an optimizer step. The suite runner must still bootstrap and
+verify every arm, persist the full configuration and check recorded matched
+streams; this is not training approval or evidence of matched final trajectories.
+On the actual ExFAT volume, a new file's reported inode changed after its first
+write. Publication cleanup now compares the destination against the still-open
+file handle after writing, rather than a pre-write inode. The focused synthetic
+CPU/MPS initialization tests passed on ExFAT in 3.49 seconds, with 479,559,680
+bytes peak RSS and 42,418,176 bytes MPS driver allocation sampled afterward.
+Temporary files were removed. These measurements are not training estimates.
+The portable streamed suite passed 200 tests, with one skipped and 42 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 An opt-in `prepare_arm_initial_checkpoints` helper now prepares a fresh arm
 without an optimizer step. It requires a locked, reconciled, empty step journal,
 the hash-bound matching configuration, fresh seeded E1 model and sampler, and
