@@ -1,40 +1,29 @@
 # Copilot handoff: streamed overlap and directional semantic retrieval
 
-Updated: 2026-11-21.
+Updated: 2026-11-22.
 
 ## Local implementation status
 
-The owner reports all SynthoSeis datasets have now been updated. Reinventory and
-audit the current training and validation sources; completion is reported, not yet
-independently verified. The November 15 audit identified updated training runs
-1041-1214, superseding the earlier 48-hour-only cohort rule for that snapshot. Apply the
-[regeneration-check instructions](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-regeneration-check-and-copilot-instructions)
-and read the [channel/closure follow-up](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-channelclosure-follow-up)
-before making claims about updated data. As of that historical snapshot, updated training
-data has unresolved alignment and synthesis/label questions, and no validation
-sources met that recency criterion. Older validation observations are not proof about
-updated validation. Do not treat those historical findings as a current inventory.
-The owner's November 21 decisions replace the old layer/analog target with directional
-fluid-adjusted observable-event coverage; the remaining target details and the launch
-approval remain separate gates.
+The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
+180 training and 25 validation sources. All 205 have the required semantic arrays;
+`faulted_net_to_gross`, channel labels and closure arrays are present, while the
+separate `faults/faulted_channel_ng` array is absent. The current neighboring generator
+inserts channel N/G into `faulted_net_to_gross` before closure/property construction;
+13 synthetic end-to-end tests passed. This verifies current code behavior, not the
+unknown generation-time worktree/command of every saved source.
 
-Local implementation is on `experiment/streamed-overlap-retrieval`, based on planning
-commit `1e7e642`. The owner authorized audit tooling and local training/validation
-inspection only, ending with the [unapproved target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md).
-The portable audit fixtures and actual bounded local audit passed. Gate 1 remains
-closed: this is **not** approval to implement guessed semantic labels or run training.
-The shell runner now supports audit plus owned TensorBoard start/status/stop.
-M2 targets, M3 trainer/recovery and M4 evaluation/completed-step CSV and automatic
-training/TensorBoard integration remain subsequent work. Train/resume/smoke/evaluate
-remain blocked; monitoring support is not production-training readiness.
+The owner approved strict adjacent-sample Z-axis extrema, same-index non-padded label
+support, closure fractions as a coarse operational fluid proxy despite provenance
+uncertainty, source-specific filter metadata, and the proposed evaluation success
+criteria. The executable target, target-yield preflight and frozen evaluation manifest
+remain to be implemented and checked. Gate 1 remains closed until those checks pass;
+the separate training-launch approval gate remains closed as well.
 
-The owner clarified that channel labels `> 0.5` override background lithology as sand;
-closure masks indicate trap/fill geometry, not exhaustive lithology. The revised
-proposal and schema-2 audit separate corrected facies, closure context and final-fluid
-consistency. Channels retain identity; oil/gas closures modify fill within sand,
-including channels. Do not invalidate non-trapping sand because closure masks are
-absent or adopt the neighboring generator's late brine-channel override as the target
-rule. Verify historical synthesis agrees with the owner's hierarchy before training.
+Local implementation is on `experiment/streamed-overlap-copilot-implementation`.
+The audit tooling and local source inventory exist; pair-target generation, training,
+resume, evaluation, completed-step CSV and automatic trainer/TensorBoard integration
+remain subsequent work. Do not treat this handoff or the current tests as permission
+to launch training.
 
 The cloud prompt below is a future handoff, not a claim that this branch or private
 audit artifacts have been published. Continue from the published implementation branch
@@ -107,8 +96,13 @@ verification prevents claiming or stopping an unrelated listener. Successful sta
 separates the service lifetime from the invoking shell; failed startup cleans up only
 its own newly spawned child. `--print-commands` creates nothing and starts nothing.
 
-Local validation used the uv environment: **35 audit/runner/legacy sampler tests
-passed**, and the mounted-source audit produced the new attempt manifest.
+As of 2026-11-22, the repository `.venv` passed **21 audit/target tests and four
+subtests**; shell syntax and `git diff --check` passed. The neighboring generator's
+own `.venv` passed **13 channel end-to-end tests**. The refreshed read-only audit
+`streamed-overlap-target-audit-20261122-03` inventoried 180 training and 25 validation
+sources and recorded 44 source-SNR metadata warnings. No training or final-test crops
+were read.
+
 Port 6006 was already occupied and was left untouched. A real TensorBoard lifecycle
 was separately verified on an explicitly selected temporary test port: readiness,
 survival after starter exit, Bash status and owned shutdown. That test server was
@@ -138,19 +132,19 @@ Use fresh E1 mu128 and three matched arms: reconstruction-only, overlap-only and
 overlap+semantic. Stream original sources; never create a training-patch corpus.
 Preserve production tokenizer defaults and historical benchmarks.
 
-Do not ask again about settled decisions. Do not guess unresolved geology semantics,
-target thresholds or launch budgets. Exact semantic-target rules require a local audit
-and owner approval. If no approved target contract is available, implement the audit
-and infrastructure first, fail closed for semantic training, and report
-LOCAL_TARGET_VALIDATION_PENDING. Do not claim the experiment is training-ready.
+Do not ask again about settled decisions. Implement the exact owner-approved rules in
+the current execution plan and target-contract proposal: strict local extrema, native
+same-index label support, the closure-mask fraction proxy, source-specific filter
+metadata, and the approved evaluation criteria. Unknown generation-time dirty-worktree
+provenance is a documented limitation, not a reason to block the proxy. The streamed
+target, validity/yield preflight and frozen evaluation manifest still need implementation.
+Do not claim the experiment is training-ready or infer a launch budget.
 
-The owner reports dataset replacement is complete. Reinventory the current cohorts;
-use the dated regeneration-check instructions in the target-contract proposal as
-historical context, separately inventory current source and validation cohorts,
-and verify actual generator provenance, alignment and fluid synthesis for the relevant
-cohorts. Do not treat older validation results, timestamps, or a recorded SHA alone as
-proof that replacement is complete or that stored waveforms match a target. Do not
-modify, delete, regenerate or overwrite source data without separate owner approval.
+The 2026-11-22 local audit inventories the current training/validation cohort. Use the
+dated regeneration-check instructions only as historical context. Do not treat the
+recorded SHA or current generator tests as proof of the worktree that produced each
+saved volume. Do not modify, delete, regenerate or overwrite source data without
+separate owner approval.
 
 Cloud checks use tiny fabricated fixtures only. Do not upload or request private Zarr
 cubes/checkpoints, assume /Volumes is mounted, run long training, use final-test data
@@ -209,10 +203,12 @@ Important approved decisions:
 - Two distinct outputs: physical canonical overlap fraction and directional,
   fluid-adjusted observable-event coverage, with A as the reference. This replaces
   equal-weight layer coverage; the event ratio is not an exact layer count.
-- Count peaks and troughs in the shared region relative to the full A depth over
-  shared XY, before augmentation; apply the execution plan's window-level
-  oil/gas/other correction. Disjoint or different-source pairs have zero coverage.
-  Do not compare numeric age IDs across independent sources.
+- Count strict adjacent-sample Z-axis peaks/troughs in the shared region relative to
+  the full A depth over shared XY, before augmentation; no prominence threshold.
+  Use same-index label support and exclude padded indices 1500:1510. Apply the
+  execution plan's window-level oil/gas/other closure-fraction correction as a coarse
+  proxy, not physical-fluid truth. Disjoint or different-source pairs have zero
+  coverage. Do not compare numeric age IDs across independent sources.
 - Calibrated cosine overlap on mu; an ordered learned semantic head on mu_A/mu_B.
   Select by directional pair-head ranking and measure mu-cosine retrieval independently.
   A later spatial-alignment model is deferred.
@@ -226,6 +222,12 @@ Important approved decisions:
 - Three sequential matched arms; epochs/batches are specified at launch, not guessed.
 - Durable batch CSV plus existing epoch CSV/TensorBoard; epoch-state resume with explicit
   replay history; logs under repository `logs/`, checkpoints on CrucialX9.
+- At every 100 completed steps and epoch boundary, run fixed deterministic no-gradient
+  train/validation monitor batches and report component losses to stdout and TensorBoard.
+- Evaluation criteria: at least 200 eligible positive queries overall and 20 queries
+  from five volumes per predeclared cohort; +0.01 pair-head NDCG@10 over repeated
+  random ranking, positive lower 95% source-cluster bootstrap bound, no cohort loss
+  worse than 0.02, and independent-seed replication.
 
 The [mu512 assessment](../sessions/2026-11-10-p9-mu512-screening-outcome-and-next-steps.md)
 explains why numerical extension wins do not authorize a wider starting model or another
@@ -290,23 +292,21 @@ Implement `scripts/streamed_overlap_experiment.sh --mode audit` and a structured
 audit report. The output must identify unapproved semantics instead of claiming fabricated
 fixtures validate real source labels. Print the exact local command for the owner.
 
-### M2: obtain local target-contract approval
+### M2: implement the approved target contract
 
-The local assistant/user runs the read-only audit against the updated mounted sources.
-Audit training/validation examples, not final-test model performance. Present one
-approval form covering the unresolved contract listed in execution-plan sections 3
-and 7: event-detection and boundary settings, age-range validity and alignment,
-source fluid provenance, noise filter and metric/adoption thresholds. Preserve the
-owner's settled event ratio and simple window-level fluid formula.
+Use the local audit and reviewed code evidence to implement a versioned target contract
+with explicit source validity and invalid reasons. Generate targets before augmentation,
+use canonical A-reference supports, and stream full-depth seismic events from Zarr in
+XY chunks. Add focused fixtures for extrema, age support, fluid-fraction edge cases,
+pair order, zero-target categories and unavailable denominators/empty support. Run a
+read-only target-yield preflight on training/validation sources only; do not read final
+test crops or train. Freeze evaluation cohorts/manifests only after the yield is known.
 
-The owner supplies a versioned approved contract to the implementation branch. Share
-only approved non-sensitive rules and fabricated fixture cases with the cloud agent;
-do not upload private datasets or raw source crops. If the audit discovers a need to
-change an approved scientific choice, ask rather than conceal that scope change.
-
-This milestone is a hard gate. Cloud infrastructure can proceed in parallel where
-independent, but semantic target implementation cannot guess the missing formulas.
-After approval, implement exact deterministic target rules and their regression cases.
+The owner-approved fluid proxy must remain a proxy: unknown generation provenance is
+recorded, not silently elevated to physical truth or used to invalidate every source.
+Share only non-sensitive rules and manufactured fixtures with any future cloud agent;
+never upload private datasets or raw source crops. If implementation evidence requires
+changing an approved scientific choice, stop and ask before changing it.
 
 ### M3: model/trainer integration and durable recovery
 
@@ -375,5 +375,6 @@ batch/epoch journals and checkpoints are persistent; failures and selection deci
 are explicit; TensorBoard remains available with a verified run-owned PID and shutdown
 instructions. Training completion does not mean model adoption.
 
-No threshold, source-schema rule, frequency sampling interval, scientific target or
-training budget should be invented to avoid the two planned approval gates.
+Do not replace the approved thresholds or source/filter rules, invent additional
+scientific targets, or guess a training budget to bypass the implementation and
+training-launch gates.

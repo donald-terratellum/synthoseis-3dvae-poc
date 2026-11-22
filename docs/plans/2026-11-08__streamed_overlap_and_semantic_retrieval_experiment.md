@@ -12,52 +12,44 @@ the paste-ready prompt, cloud/local division, and ordered implementation tasks.
 
 ### Current bounded local milestone
 
-**2026-11-21 source update:** The owner reports that all SynthoSeis datasets have
-been updated. This has not yet been verified by a fresh source audit. The
-November 15 recent-store check and concrete next-agent instructions are in the
-[target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-regeneration-check-and-copilot-instructions).
-At that time the owner identified updated training runs 1041-1214; see the proposal's
-[channel/closure follow-up](2026-11-11__streamed_overlap_target_contract_proposal.md#2026-11-15-channelclosure-follow-up)
-for three full-label scans and the corrected generator working-tree evidence.
-The recent training cohort has not passed seismic/label alignment verification or
-channel-fluid synthesis consistency review; no recently updated validation store
-was available under the user's 48-hour criterion at that snapshot. These are historical
-observations, not findings about the newly updated datasets. Reinventory training and
-validation and re-run the required checks against a stable, explicitly identified cohort.
-Gate 1 remains closed, as does the separate training-launch approval gate.
-
-The owner subsequently authorized local implementation/audit only, ending at a
-target-contract proposal, with **no production training**. The audit runner and fixture
-tests are implemented; the local training/validation inventory and bounded examples
-are documented in the [unapproved target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md).
-Gate 1 remains closed. The runner implements audit and explicit owned TensorBoard
-start/status/stop; later training/CSV/resume and automatic trainer/service integration
-in this plan are requirements, not claims
-that those features already exist. See the proposal for the exact reproduction command,
-measurements, missing validation labels and revised lithology/closure interpretation.
+The owner authorized local implementation using the Mac's `/Volumes` data and this
+repository's `.venv`; commits and a push are required on the existing task branch.
+Datasets, private audit outputs, secrets and unrelated work must remain uncommitted.
+Production training is still separately gated; the target and preflight work below
+must not be mistaken for permission to launch the training suite.
 
 **2026-11-22 refreshed local audit:** Run
-`streamed-overlap-target-audit-20261121-03` inventories all recursive Zarr array
+`streamed-overlap-target-audit-20261122-03` inventories all recursive Zarr array
 keys/shapes/chunks/dtypes and source/config metadata times for 180 training and 25
 validation sources. All 205 have the required semantic arrays and no inventory issues;
 all retain `faulted_net_to_gross` and `faults/faulted_channel_labels`, but none retain
-`faults/faulted_channel_ng`. Full results and provenance caveats are in the proposal.
-No final-test crops were read, and Gate 1 and the training-launch gate remain closed.
+`faults/faulted_channel_ng`. Inspection of the current neighboring generator and 13
+passing synthetic channel/closure tests confirms its current code inserts channel N/G
+into `faulted_net_to_gross` before closure and elastic-property construction. The saved
+stores do not retain the per-channel N/G array, and their exact generation-time dirty
+worktree/command is unknown; therefore this verifies the implementation path, not every
+historical source's provenance. The owner accepted oil/gas closure fractions as a coarse
+operational proxy, with that provenance limitation recorded. Full results are in the
+[target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md).
+No final-test crops were read.
 
-A bounded detector/filter-context diagnostic is also complete: 450 full-depth traces
-from 12 training and 6 validation sources were sampled. The proposal records its
-sensitivity results and unapproved recommendations. The source generator establishes
-a native property/label index relationship, but the old correlation-based offset probe
-does not verify a universal event-to-age offset. Gate 1 still requires owner review.
+The owner has also approved the strict adjacent-sample Z-axis peak/trough detector,
+same-index non-padded label support, per-source filter metadata rules, closure-proxy
+policy, and the proposed evaluation success criteria. A bounded diagnostic of 45,000
+full-depth traces from 12 training and 6 validation sources found no zero-event trace;
+the exact distribution and limits are in the proposal. These decisions are documented,
+but the streamed pair-target implementation, target-yield preflight and frozen
+evaluation manifest still need to be implemented and checked. Gate 1 remains closed
+until those steps pass; the separate training-launch gate also remains closed.
 
 Proceed autonomously on the approved decisions below. Do not repeatedly ask about
 settled choices. Only stop for an unresolved scientific contract, failed safety or
 resource prerequisite, conflicting user changes, or an explicit approval gate:
 
-1. **Local target-contract approval:** audit source schemas and label examples locally,
-   propose remaining event-detection rules and evaluation thresholds, then obtain
-   the user's approval. Array names are not sufficient evidence. Do not invent the
-   remaining rules, replace missing labels, or enable semantic training before approval.
+1. **Local target-contract completion:** implement the approved labels and detector,
+   report source/target validity and yield, and freeze the approved evaluation manifest
+   and cohorts. Array names are not sufficient evidence. Do not replace missing labels
+   or enable semantic training until the implementation and preflight checks pass.
 2. **Local training-launch approval:** after implementation, tests, and local smoke pass,
    present the actual commands, epochs, batches per epoch, resource measurements, and
    resolved configuration once. Obtain approval before the sequential training suite.
@@ -135,15 +127,21 @@ Use the original, unaugmented dense seismic and canonical source coordinates:
 - For the same source, intersect A and B in XYZ. If there is no 3D intersection,
   the directional target is zero. Different-source pairs also have target zero;
   numeric age values across independent volumes do not identify common horizons.
-- In the shared XY footprint, detect peaks and troughs along each full A trace first.
-  Sum events in A's shared XYZ region for the numerator, and sum events over the
-  full A depth for those same traces for the denominator. The ratio is directional.
-  A zero denominator for an overlapping pair is unavailable, with an explicit reason.
-  The overlap-boundary must not create artificial extrema.
+- In the shared XY footprint, stream full-depth original A traces in XY chunks and
+  detect strict local maxima and minima along Z. A peak must be greater than both
+  adjacent samples; a trough must be less than both. Compare `volume[:,:,1:-1]`
+  with `volume[:,:,:-2]` and `volume[:,:,2:]`, then add one to each returned Z index.
+  Use no prominence threshold; the first and last Z samples are excluded naturally.
+  Sum events in A's shared XYZ region for the numerator, and sum events over the full
+  A depth for those same traces for the denominator. A zero denominator for an
+  overlapping pair is unavailable, with an explicit reason. The overlap boundary
+  must not create artificial extrema.
 - In the shared XYZ region, average `geologic_age_faulted` at its shallowest and
   deepest Z indices, across the shared XY footprint. Use these two values as the
-  age-range bounds. For each *full* A and B window, select voxels within this
-  range using the verified seismic-to-label alignment.
+  age-range bounds. For each *full* A and B window, select voxels within this range
+  using native same-index support. The seismic's 1,499 samples correspond to the
+  first 1,499 native property/label indices; exclude padded label indices 1500:1510.
+  Do not apply a global correlation-derived +1/+2 Z shift.
 - For each window, compute oil and gas fractions from `oil_closures > 0.5` and
   `gas_closures > 0.5`, divided by **all** selected voxels, not just sand. At voxels
   where both masks are positive, count one half toward each. Let `other = 1 - oil - gas`.
@@ -155,23 +153,27 @@ Use the original, unaugmented dense seismic and canonical source coordinates:
   has factor 0.9. This is a deliberately coarse, window-level proxy: it can miss
   differences when fluid distributions swap between layers, and is not per-layer
   correspondence or a measured amplitude difference.
-- Treat reservoir sand outside oil/gas closures as brine **only if the updated
-  generator's synthesis policy is verified**. Do not infer this from masks alone.
-  Missing, unaligned, non-finite or otherwise unusable labels, or an empty selected
-  age-range support, must yield an explicit unavailable reason, not a zero target.
+- The closure fractions are an owner-approved, coarse operational proxy, not verified
+  per-voxel physical-fluid labels. Do not infer brine from absence of an oil/gas
+  closure; `other` remains only the formula's mathematical remainder. Record the
+  unknown per-source generation-time worktree/command as a limitation, not as a reason
+  to block this proxy. Missing, non-finite or otherwise unusable labels, or an empty
+  selected age-range support, must yield an explicit unavailable reason, not a zero
+  target.
 
 Detect events and calculate both labels before rotation, flips, scaling or added
 noise; augment A and B independently afterward. Audit how canonical support and
 transformed views relate, including sufficient real context. Do not leak source IDs,
 coordinates or labels to the predictors.
 
-Still to be established at gate 1: the exact event detector, prominence/noise and
-boundary rules, valid age/support handling, seismic-to-label alignment and synthesis
-provenance, noise filter contract, and evaluation eligibility and thresholds. Propose
-these from the refreshed training/validation audit, using reviewed examples and
-explicitly reporting target yield. Do not reinterpret older observations as new-source
-validation. Version the complete target with fixed rules and synthetic examples; the
-owner's decisions above are not approval of unspecified settings.
+Owner decisions now fix the event detector, native label support, closure-mask proxy,
+noise metadata sources and evaluation success criteria. Gate 1 remains closed only
+until these rules are implemented and tested, source/target validity and yield are
+measured, and the deterministic evaluation manifest/cohorts are frozen. The dirty
+generation-time provenance remains a documented limitation, not a proxy veto. Do not
+reinterpret earlier sampled sources as validation of every stored source. Version the
+complete target contract and cover its rules with synthetic cases before authorizing
+training.
 
 ## 4. Model and objectives
 
@@ -304,25 +306,29 @@ This is not denoising to a clean target. Log retained-extrema fraction and noise
 Use [the shared tokenizer preprocessor](../../src/tokenizer/core/preprocess.py); do not
 introduce a competing normalization path.
 
-For each source, read `bandpass_bandlimits` from its `model_parameters_*.txt`.
-The user supplied a metadata example:
-`test_synthoseis/seismic__2026.85540230__synthoseis_run_0018/model_parameters_2026.85540230.txt`
-contains `bandpass_bandlimits: 3.39, 36.24`. This metadata example is not permission
-to use final-test samples for training, calibration or model selection.
+For each training/validation source, use `bandpass_bandlimits` in its associated
+`model_parameters_*.txt` as the actual sampled low/high cutoffs. The matched
+`model_config_*.json` `bandwidth_low` and `bandwidth_high` are allowed ranges, not
+the sampled cutoffs; `bandwidth_ord` supplies the order. The inspected 205 sources
+use 4 ms sampling and order 4; all actual text cutoffs fell inside their JSON ranges
+(low 3.03-6.00 Hz, high 22.69-44.92 Hz). Reproduce the neighboring generator's
+depth-axis Butterworth/Gustafsson filtering and pole-decay context from its code,
+but do not make the cloud trainer depend on importing that checkout. Persist exact
+per-source settings and reject missing, contradictory or Nyquist-invalid metadata;
+never substitute a global band or silently disable noise.
 
-Audit sample spacing, frequency units and synthesis filter configuration locally;
-current synthesis code uses depth-axis filtering with digitisation converted to seconds.
-The cloud implementation must not depend on importing a neighboring synthesis checkout.
-Persist verified values in the source manifest. Require finite ordered frequencies below
-Nyquist and unambiguous per-source parameter association. Missing/contradictory parameters
-block noise-enabled runs; do not silently substitute one global band or disable noise.
-At gate 1, approve filter order, transient/support handling, and negligible-energy policy.
+The same `.txt` files' `sn_db` is the generator's source-noise SNR, not a filter
+parameter and not the extra-noise augmentation SNR. It falls outside its JSON
+`signal_to_noise_ratio_db` range in 44/205 inspected sources. Record that mismatch
+as provenance metadata/warning; do not reuse `sn_db` for augmentation or reject
+otherwise valid filter cutoffs solely for that warning. Do not read final-test seismic
+for training or selection.
 
 Added-noise RMS relative to pre-noise signal RMS is `10 ** (-SNR_dB/20)`:
 approximately 0.251 at 12 dB and 0.0316 at 30 dB. The old plan's 0.063 lower bound
-was incorrect. Normalize filtered noise to the requested RMS. Do not reuse the existing
-source `sn_db` as an extra-noise setting; the stored seismic already contains noise.
-Measure actual spectral/RMS behavior after resampling and filtering.
+was incorrect. Normalize filtered noise to the requested RMS. A non-finite or zero
+pre-noise RMS has undefined SNR and must produce an explicit invalid reason rather
+than a silent fallback. Measure actual spectral/RMS behavior after filtering.
 
 ## 7. Source audit and semantic-contract review
 
@@ -417,10 +423,21 @@ Do not evaluate an untrained projection head as a learned retrieval representati
 
 Primary selection: directional pair-head NDCG@10, using the approved fluid-adjusted
 event target as relevance; report mu-cosine ranking separately. Different-volume
-pairs are zero-target negatives, not a cross-volume analog task. Gate 1 must approve
-relevance/gain definitions, eligibility, tie-breaking, effect size, uncertainty
-and cohort regression thresholds. Without that contract, report metrics but do not
-declare a winner or infer adoption.
+pairs are zero-target negatives, not a cross-volume analog task. Use the fixed
+eligibility, tie-breaking and success rules below; freeze their manifests and
+cohorts before model results are examined.
+
+The owner approved linear DCG gain, only known-label queries with at least one valid
+positive, and a frozen candidate manifest with eligibility independent of the model.
+Require at least 200 eligible positive queries overall and at least 20 queries from
+five source volumes in each predeclared positive-query cohort. The primary pair-head
+must improve NDCG@10 by at least 0.01 absolute over a repeated uniform-random ranking
+baseline, with a positive lower bound of the paired source-cluster bootstrap 95%
+interval. No mandatory cohort may regress by more than 0.02 absolute NDCG@10, and
+the direction of gain must repeat with an independent seed. If the eligibility floor
+is not met, stop and report it; do not lower the threshold after seeing results.
+Compare mu-cosine separately against the matched S1 reconstruction-only mu baseline.
+Never score an untrained pair head.
 
 Report physical-overlap MAE/RMSE/bias by overlap bin and pair category; compare constant
 and waveform baselines. Report event-coverage error, NTG differences, fluid mismatch,
@@ -523,6 +540,14 @@ must stop with a traceback/nonzero status; do not call failed/skipped steps comp
 Epoch CSV and TensorBoard remain; add batch-step component tags and epoch retrieval,
 reconstruction, pair-error, coverage, noise and throughput tags. CSV is the durable
 journal; TensorBoard is visualization, not the only record.
+
+At every 100 completed optimizer steps and at each epoch boundary (if not already
+logged), run no-gradient inference with the latest weights on fixed deterministic
+training and validation monitor batches. Emit the reconstruction, overlap and
+semantic loss components to stdout and TensorBoard. Use inference mode, restore the
+prior model mode and RNG states, and record monitor time as overhead. These fixed
+monitor batches are for progress visibility, not checkpoint selection; formal
+validation and retrieval evaluation retain the cadence above.
 
 Atomically save full epoch-boundary training state: model/head and optimizer/scheduler,
 all RNGs and deterministic loader stream positions, sampling/config/manifest hashes,

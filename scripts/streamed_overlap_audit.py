@@ -159,10 +159,47 @@ def parameter_metadata(directory: Path) -> dict:
     order = config["bandwidth_ord"]
     if isinstance(order, bool) or not isinstance(order, int) or order < 1:
         raise ValueError(f"Invalid bandwidth_ord in {config_path}")
-    if not all(math.isfinite(value) for value in (low, high, spacing)):
+    low_range = config["bandwidth_low"]
+    high_range = config["bandwidth_high"]
+    source_snr_range = config["signal_to_noise_ratio_db"]
+    if not all(isinstance(values, list) and len(values) == 2 for values in (low_range, high_range)):
+        raise ValueError(f"Invalid bandwidth range in {config_path}")
+    if not isinstance(source_snr_range, list) or len(source_snr_range) != 3:
+        raise ValueError(f"Invalid signal_to_noise_ratio_db in {config_path}")
+    low_range = [float(value) for value in low_range]
+    high_range = [float(value) for value in high_range]
+    source_snr_range = [float(value) for value in source_snr_range]
+    sn_entries = re.findall(r"^sn_db:\s*(.+)$", text, flags=re.MULTILINE)
+    if len(sn_entries) != 1:
+        raise ValueError(f"Expected one sn_db entry in {path}")
+    source_snr = float(sn_entries[0])
+    all_numeric_values = (
+        low,
+        high,
+        spacing,
+        source_snr,
+        *low_range,
+        *high_range,
+        *source_snr_range,
+    )
+    if not all(math.isfinite(value) for value in all_numeric_values):
         raise ValueError(f"Nonfinite band/sample spacing in {path}")
     if spacing <= 0 or not 0 < low < high < 500.0 / spacing:
         raise ValueError(f"Band limits/sample spacing violate Nyquist in {path}")
+    nyquist = 500.0 / spacing
+    if (
+        not 0 < low_range[0] <= low_range[1] < nyquist
+        or not 0 < high_range[0] <= high_range[1] < nyquist
+    ):
+        raise ValueError(f"Invalid bandwidth range in {config_path}")
+    if not source_snr_range[0] <= source_snr_range[1] <= source_snr_range[2]:
+        raise ValueError(f"Invalid signal_to_noise_ratio_db in {config_path}")
+    rounding_tolerance = 0.0051
+    if not (
+        low_range[0] - rounding_tolerance <= low <= low_range[1] + rounding_tolerance
+        and high_range[0] - rounding_tolerance <= high <= high_range[1] + rounding_tolerance
+    ):
+        raise ValueError(f"Recorded band limits fall outside configured ranges in {path}")
     sha = re.findall(r"^SHA:\s*(\S+)", text, flags=re.MULTILINE)
     if len(sha) != 1:
         raise ValueError(f"Expected one generator SHA in {path}")
@@ -182,12 +219,22 @@ def parameter_metadata(directory: Path) -> dict:
         "sample_spacing_ms_from_digi": spacing,
         "nyquist_hz_if_ms": 500.0 / spacing,
         "filter_order": order,
+        "configured_bandwidth_low_range_hz": low_range,
+        "configured_bandwidth_high_range_hz": high_range,
+        "source_noise_sn_db": source_snr,
+        "configured_source_noise_snr_db": source_snr_range,
+        "source_noise_snr_within_configured_range": (
+            source_snr_range[0] <= source_snr <= source_snr_range[2]
+        ),
         "configured_cube_shape": config.get("cube_shape"),
         "pad_samples": config.get("pad_samples"),
         "infill_factor": config.get("infill_factor"),
         "include_channels": config.get("include_channels"),
         "channel_ntg_threshold": config.get("channel_ntg_threshold"),
-        "interpretation_status": "Requires generator/key/units verification before augmentation.",
+        "interpretation_status": (
+            "Actual cutoffs, JSON ranges, order and sample spacing are recorded; "
+            "per-source generation worktree/command provenance is not attested."
+        ),
     }
 
 
@@ -241,6 +288,11 @@ def inspect_source(source: Source, seismic_key: str) -> dict:
     except (ValueError, KeyError, FileNotFoundError) as error:
         parameters = None
         issues.append(f"Parameter metadata invalid: {error}")
+    warnings = []
+    if parameters and not parameters["source_noise_snr_within_configured_range"]:
+        warnings.append(
+            "Recorded source sn_db falls outside the JSON signal_to_noise_ratio_db range."
+        )
     return {
         "source_id": source.identifier,
         "path": str(source.path),
@@ -251,8 +303,12 @@ def inspect_source(source: Source, seismic_key: str) -> dict:
         "arrays": arrays,
         "parameters": parameters,
         "semantic_arrays_complete": all(key in arrays for key in LABEL_KEYS),
+        "warnings": warnings,
         "issues": issues,
-        "axes_status": "XYZ inspection hypothesis, not a verified per-source axis contract.",
+        "axes_status": (
+            "XYZ per the generator convention; saved-source generation worktrees "
+            "are not independently attested."
+        ),
     }
 
 
@@ -623,7 +679,7 @@ def run_audit(config: dict, output: Path) -> dict:
                 generator_sha=record["parameters"]["generator_sha"] if record["parameters"] else None,
             ))
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "source_root": str(Path(config["source_root"]).resolve()),
         "training_exclusions": sorted(HOLDOUT_NAMES),
         "final_test_crops_read": 0,
@@ -631,7 +687,7 @@ def run_audit(config: dict, output: Path) -> dict:
         "status": PENDING,
     }
     summary = {
-        "schema_version": 4,
+        "schema_version": 5,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": PENDING,
         "production_training_allowed": False,
@@ -643,17 +699,42 @@ def run_audit(config: dict, output: Path) -> dict:
             "closures_define_lithology": False,
             "absence_of_closure_invalidates_lithology": False,
             "closure_values_are_final_seismic_fluid": False,
-            "fluid_policy": "Oil/gas closure labels modify fluid within corrected sand, including channels; channel identity is retained.",
-            "generator_consistency": "Recorded historical fingerprints indicate late brine mixing into channels after oil/gas; a recorded generator SHA does not establish the per-source generation worktree or command. Verify current source provenance and synthesis before treating closure masks as final seismic fluid.",
-            "provisional_fluid_policy": "Treat corrected sand outside oil/gas closures as brine only after confirming the applicable generator policy. The event-target remainder is mathematical, not an exhaustive brine label.",
+            "fluid_policy": (
+                "Use oil/gas closure fractions as a coarse operational proxy over "
+                "selected support; other is the mathematical remainder, not a physical "
+                "brine label. Channel identity is retained."
+            ),
+            "generator_consistency": (
+                "The current neighboring generator inserts channel N/G into "
+                "faulted_net_to_gross before closure/property construction, and its "
+                "synthetic channel tests pass. Per-source dirty-worktree and command "
+                "provenance are unavailable, so this does not establish how any saved "
+                "source was generated or make closures physical-fluid ground truth."
+            ),
+            "provisional_fluid_policy": (
+                "Do not infer physical brine from absence of an oil/gas closure; "
+                "other = 1 - oil - gas is only the target formula's remainder."
+            ),
             "historical_seismic_file_sha256": VERIFIED_SEISMIC_FILES,
-            "owner_approved_provisional_fluid_policy": True,
+            "owner_approved_closure_fraction_proxy": True,
         },
         "owner_decisions": {
             "physical_overlap": "Canonical 3D window intersection divided by one window's volume.",
             "directional_event_coverage": {
                 "reference": "A",
-                "events": "Peaks and troughs detected on each full original A trace before augmentation.",
+                "detector": (
+                    "Strict Z-axis local maxima/minima: each sample is compared with "
+                    "the immediately shallower and deeper sample; no prominence threshold."
+                ),
+                "event_indices": (
+                    "Use center=volume[:,:,1:-1], compare with volume[:,:,:-2] and "
+                    "volume[:,:,2:], then add one to returned k indices. Combine peak "
+                    "and trough (i,j,k) arrays."
+                ),
+                "events": (
+                    "Detect on full original A traces streamed from Zarr in XY chunks; "
+                    "exclude source endpoints and count events in shared XYZ support."
+                ),
                 "numerator": "Events in A's shared XYZ support.",
                 "denominator": "Events across full A depth on traces in the shared XY footprint.",
                 "fluid_adjustment": (
@@ -669,18 +750,45 @@ def run_audit(config: dict, output: Path) -> dict:
                     "Average geologic_age_faulted at shallowest and deepest Z indices "
                     "in the shared region; select that range in each full window."
                 ),
+                "age_label_support": (
+                    "Use same-index native property/label crop support; ignore padded "
+                    "geologic_age_faulted indices 1500:1510 and do not apply a global "
+                    "correlation-derived Z shift."
+                ),
                 "zero_target_pairs": [
                     "Same-source windows with no 3D intersection.",
                     "Windows from different source volumes.",
                 ],
                 "unavailable_cases": [
                     "Overlapping pair with zero events in A's denominator.",
-                    "Unverified alignment, missing/non-finite required labels, or empty age support.",
+                    "Unsupported native index dimensions, missing/non-finite required labels, or empty age support.",
                 ],
                 "computed_before_augmentation": True,
             },
+            "noise_and_filtering": {
+                "source_filter": (
+                    "Use the actual bandpass_bandlimits from each source's "
+                    "model_parameters text file, constrained by bandwidth_low/high "
+                    "ranges and bandwidth_ord in its matched model_config JSON."
+                ),
+                "source_noise_snr": (
+                    "Record sn_db from the source text file and compare it with the "
+                    "JSON signal_to_noise_ratio_db range; do not use source sn_db as "
+                    "the independent augmentation SNR."
+                ),
+                "augmentation": (
+                    "Keep independent 12-30 dB noise at probability 0.5; use the "
+                    "source-specific Butterworth band/order and pole-decay context."
+                ),
+            },
             "cross_volume_age_equivalence": False,
             "primary_retrieval_selection": "Directional pair-head ranking; report mu-cosine separately.",
+            "training_progress_monitor": (
+                "At every 100 completed optimizer steps and each epoch boundary if "
+                "not already logged, run no-gradient inference on fixed deterministic "
+                "train/validation monitor batches; emit component losses to stdout "
+                "and TensorBoard."
+            ),
             "rotation_and_scaling": "Applied to every view; parameters remain independently sampled.",
         },
         "manifest_sha256": content_hash(manifest),
@@ -707,6 +815,11 @@ def run_audit(config: dict, output: Path) -> dict:
                     record["split"] == split and record["parameters"] is None
                     for record in records
                 ),
+                "source_noise_snr_range_warnings": sum(
+                    record["split"] == split
+                    and any("source sn_db falls outside" in warning for warning in record["warnings"])
+                    for record in records
+                ),
             } for split in ("train", "validation")
         },
         "read_budget": dict(vars(budget)),
@@ -715,9 +828,10 @@ def run_audit(config: dict, output: Path) -> dict:
         "examples": examples,
         "limitations": [
             "Bounded, intentionally fluid-seeking examples are not prevalence estimates.",
-            "XYZ axes and configured label offset remain inspection hypotheses.",
-            "Current neighboring generator code does not prove every historical generator SHA.",
-            "The event target is not implemented; detector settings, source validity and success/adoption thresholds remain unapproved.",
+            "Generator-derived native index support is recorded; filtered seismic events are not age-horizon identities.",
+            "Current neighboring generator code and passing synthetic tests do not prove the generation worktree or command for each stored source.",
+            "The approved detector is implemented only as a helper; the pair target, validity yield and evaluation manifest remain to be implemented and checked.",
+            "Source sn_db metadata falls outside its JSON SNR range in some stores; the actual text band limits remain inside configured bandwidth ranges.",
             "No model forward/backward pass, production training or final-test prediction was run.",
             "Decoded bytes are conservative chunk estimates, not measured physical I/O.",
         ],
@@ -727,18 +841,15 @@ def run_audit(config: dict, output: Path) -> dict:
     write_json(output / "audit_report.json", summary)
     write_visual_report(output / "audit_examples.html", summary, config["seismic_key"])
     write_json(output / "target_contract.json", {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": PENDING,
         "approved": False,
         "manifest_sha256": summary["manifest_sha256"],
         "label_policy": summary["label_policy"],
         "owner_decisions": summary["owner_decisions"],
         "unresolved": [
-            "Peak/trough detector, prominence/noise thresholds and edge handling.",
-            "Verified per-source XYZ/depth mapping and age-range boundary/empty-support handling.",
-            "Current generator worktree/command provenance and consistency of oil/gas/brine channel fill.",
-            "Exact source-specific noise filter, transient context and negligible-energy handling.",
-            "Target-yield reporting, relevance eligibility, evaluation cohort thresholds and adoption criteria.",
+            "Source validity and target yield from the planned pair sampler; measure after implementation and before authorizing training.",
+            "Freeze and validate the deterministic evaluation manifest/cohorts against the approved eligibility and success criteria.",
         ],
     })
     write_json(output / "resolved_audit_config.json", config)

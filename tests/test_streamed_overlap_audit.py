@@ -60,10 +60,12 @@ def make_source(root, name="seismic__fixture", complete=True):
         chunks=(16, 16, 151),
     )
     (directory / "model_parameters_fixture.txt").write_text(
-        "bandpass_bandlimits: 4.0, 35.0\nSHA: fixture-only\n"
+        "bandpass_bandlimits: 4.0, 35.0\nsn_db: 12.0\nSHA: fixture-only\n"
     )
     (directory / "model_config_fixture.json").write_text(json.dumps({
         "digi": 4, "bandwidth_ord": 4, "cube_shape": [40, 40, 151],
+        "bandwidth_low": [4.0, 4.0], "bandwidth_high": [35.0, 35.0],
+        "signal_to_noise_ratio_db": [7.5, 12.5, 17.5],
         "seeds": {"model_params_seed": 123},
     }))
     return path
@@ -154,24 +156,45 @@ class StreamedAuditTests(unittest.TestCase):
         info = parameter_metadata(directory)
         self.assertEqual(info["bandlimits_hz"], [4, 35])
         self.assertEqual(info["sample_spacing_ms_from_digi"], 4)
+        self.assertEqual(info["configured_bandwidth_low_range_hz"], [4, 4])
+        self.assertEqual(info["configured_bandwidth_high_range_hz"], [35, 35])
+        self.assertEqual(info["source_noise_sn_db"], 12)
+        self.assertTrue(info["source_noise_snr_within_configured_range"])
         self.assertGreater(info["parameters_mtime_ns"], 0)
         self.assertGreater(info["config_mtime_ns"], 0)
         self.assertIn("dirty-tree diff", info["generator_provenance_status"])
         parameter = directory / "model_parameters_fixture.txt"
         for text in (
             "SHA: fixture-only\n",
-            "bandpass_bandlimits: 4, 35\nbandpass_bandlimits: 4, 35\nSHA: fixture-only\n",
-            "bandpass_bandlimits: 4, 126\nSHA: fixture-only\n",
-            "bandpass_bandlimits: nan, 35\nSHA: fixture-only\n",
+            "bandpass_bandlimits: 4, 35\nbandpass_bandlimits: 4, 35\nsn_db: 12\nSHA: fixture-only\n",
+            "bandpass_bandlimits: 4, 126\nsn_db: 12\nSHA: fixture-only\n",
+            "bandpass_bandlimits: nan, 35\nsn_db: 12\nSHA: fixture-only\n",
         ):
             with self.subTest(text=text):
                 parameter.write_text(text)
                 with self.assertRaises(ValueError):
                     parameter_metadata(directory)
-        parameter.write_text("bandpass_bandlimits: 4, 35\nSHA: fixture-only\n")
+        parameter.write_text("bandpass_bandlimits: 4, 35\nsn_db: 12\nSHA: fixture-only\n")
+        with self.assertRaisesRegex(ValueError, "outside configured ranges"):
+            parameter.write_text("bandpass_bandlimits: 4.02, 35\nsn_db: 12\nSHA: fixture-only\n")
+            parameter_metadata(directory)
+        parameter.write_text("bandpass_bandlimits: 4, 35\nsn_db: 20\nSHA: fixture-only\n")
+        self.assertFalse(parameter_metadata(directory)["source_noise_snr_within_configured_range"])
+        parameter.write_text("bandpass_bandlimits: 4, 35\nsn_db: 12\nSHA: fixture-only\n")
         (directory / "model_config_fixture.json").unlink()
         with self.assertRaises(FileNotFoundError):
             parameter_metadata(directory)
+
+    def test_source_noise_snr_mismatch_is_a_warning_not_a_filter_failure(self):
+        path = make_source(self.root)
+        parameter = path.parent / "model_parameters_fixture.txt"
+        parameter.write_text(
+            "bandpass_bandlimits: 4, 35\nsn_db: 20\nSHA: fixture-only\n"
+        )
+        info = inspect_source(Source(path, "train"), DEFAULT_SEISMIC_KEY)
+        self.assertTrue(info["semantic_arrays_complete"])
+        self.assertEqual(info["issues"], [])
+        self.assertIn("source sn_db falls outside", info["warnings"][0])
 
     def test_missing_labels_are_inventory_issues_not_zero_arrays(self):
         path = make_source(self.root, complete=False)
@@ -212,7 +235,10 @@ class StreamedAuditTests(unittest.TestCase):
             bounded_crop(group, (0, 0, 0), ReadBudget(), DEFAULT_SEISMIC_KEY, -1)
 
     def test_fixture_end_to_end_has_durable_unapproved_contract(self):
-        make_source(self.root / "sources")
+        train_path = make_source(self.root / "sources")
+        (train_path.parent / "model_parameters_fixture.txt").write_text(
+            "bandpass_bandlimits: 4, 35\nsn_db: 20\nSHA: fixture-only\n"
+        )
         make_source(self.root / "sources" / "validation")
         make_source(self.root / "sources" / "validation", "seismic__missing", complete=False)
         output = self.root / "output"
@@ -225,25 +251,34 @@ class StreamedAuditTests(unittest.TestCase):
         }
         with contextlib.redirect_stdout(io.StringIO()):
             result = run_audit(config, output)
+        self.assertEqual(result["schema_version"], 5)
         self.assertEqual(result["status"], PENDING)
         self.assertFalse(result["production_training_allowed"])
+        self.assertEqual(result["inventory"]["train"]["source_noise_snr_range_warnings"], 1)
         self.assertEqual(result["inventory"]["validation"]["complete_semantic_sources"], 1)
         self.assertEqual(len(result["examples"]), 2)
         self.assertTrue(result["label_policy"]["channel_identity_preserved_under_fluid_fill"])
         self.assertFalse(result["label_policy"]["closures_define_lithology"])
         self.assertGreater(result["read_budget"]["reads"], 0)
         manifest = json.loads((output / "source_manifest.json").read_text())
+        self.assertEqual(manifest["schema_version"], 4)
         self.assertEqual(content_hash(manifest), result["manifest_sha256"])
         contract = json.loads((output / "target_contract.json").read_text())
         self.assertFalse(contract["approved"])
-        self.assertEqual(contract["schema_version"], 4)
+        self.assertEqual(contract["schema_version"], 5)
         self.assertNotIn("approved_direction", contract)
+        self.assertTrue(contract["label_policy"]["owner_approved_closure_fraction_proxy"])
+        self.assertFalse(contract["label_policy"]["closure_values_are_final_seismic_fluid"])
         event_target = contract["owner_decisions"]["directional_event_coverage"]
         self.assertEqual(event_target["reference"], "A")
         self.assertTrue(event_target["computed_before_augmentation"])
+        self.assertIn("Strict Z-axis local maxima/minima", event_target["detector"])
+        self.assertIn("add one to returned k indices", event_target["event_indices"])
+        self.assertIn("same-index", event_target["age_label_support"])
         self.assertIn("different source volumes", " ".join(event_target["zero_target_pairs"]))
         self.assertIn("abs(oil_A-oil_B)", event_target["fluid_adjustment"])
-        self.assertIn("Peak/trough detector", contract["unresolved"][0])
+        self.assertNotIn("detector", " ".join(contract["unresolved"]).lower())
+        self.assertTrue(contract["unresolved"])
         self.assertTrue((output / "audit_examples.html").is_file())
         with self.assertRaisesRegex(ValueError, "read-only source tree"):
             run_audit(config, self.root / "sources" / "forbidden-output")
