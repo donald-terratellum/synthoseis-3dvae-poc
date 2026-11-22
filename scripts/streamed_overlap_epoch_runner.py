@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import os
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -17,7 +17,7 @@ import zarr
 from torch.utils.tensorboard import SummaryWriter
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_checkpoint import restore_epoch_state
+from scripts.streamed_overlap_checkpoint import _validate_hashes, restore_epoch_state
 from scripts.streamed_overlap_diagnostics import diagnostic_report, verify_diagnostics
 from scripts.streamed_overlap_evaluation import (
     StreamedEpochValidator, _checkpoint_state, _identity, _validate_evaluation_parameters, evaluate_checkpoint,
@@ -28,6 +28,7 @@ from scripts.streamed_overlap_guardrails import (
 from scripts.streamed_overlap_integrity import (
     _digest_array, load_manifest, open_validation_sources, verify_validation_preflight,
 )
+from scripts.streamed_overlap_initialization import prepare_suite_initial_checkpoints
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record, _sync_directory
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
@@ -906,6 +907,27 @@ def run_arm_epochs(
     return result
 
 
+def _validate_suite_inputs(
+    *, monitor_batches: dict, validate_epoch, lpips_loss_fn,
+    manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
+    formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
+    historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
+) -> dict:
+    _validate_hashes(hashes)
+    _validate_evaluation_bindings(hashes, formal_config, guardrail_config, historical)
+    _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
+    _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
+    _validate_epoch_inputs(
+        monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
+        manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
+    )
+    workload = suite_workload(matching_config, search_manifest)
+    if (hashes.get("matching") != matching_config_hash(matching_config)
+            or formal_config["final_epoch"] != matching_config["final_epoch"]):
+        raise ValueError("Evaluation and suite budget must match the frozen matching configuration.")
+    return workload
+
+
 def run_suite_epochs(
     journals: dict[str, BatchJournal],
     runtime_factory: Callable[[str], AbstractContextManager[ArmRuntime]] | None = None, *,
@@ -929,17 +951,12 @@ def run_suite_epochs(
     )
     if metadata["initialization_sha256"] != suite_initialization.evidence_sha256:
         raise ValueError("The suite must use the initialization pin recorded in suite metadata.")
-    _validate_evaluation_bindings(hashes, formal_config, guardrail_config, historical)
-    _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
-    _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
-    _validate_epoch_inputs(
-        monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
-        manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
+    workload = _validate_suite_inputs(
+        monitor_batches=monitor_batches, validate_epoch=validate_epoch, lpips_loss_fn=lpips_loss_fn,
+        manifest_path=manifest_path, source_root=source_root, search_manifest=search_manifest,
+        diagnostic_manifest=diagnostic_manifest, formal_config=formal_config, guardrail_manifest=guardrail_manifest,
+        guardrail_config=guardrail_config, historical=historical, matching_config=matching_config, hashes=hashes,
     )
-    workload = suite_workload(matching_config, search_manifest)
-    if (hashes.get("matching") != matching_config_hash(matching_config)
-            or formal_config["final_epoch"] != matching_config["final_epoch"]):
-        raise ValueError("Evaluation and suite budget must match the frozen matching configuration.")
     for arm in ("S1", "S2", "S3"):
         journal = journals[arm]
         initial = suite_initialization.initial_checkpoints[arm]
@@ -1006,3 +1023,95 @@ def run_suite_epochs(
             raise RuntimeError(f"{arm} runtime suppressed an arm failure.")
         del runtime
     return results
+
+
+def run_suite(
+    suite_dir: Path, *, resume: bool, attempt_id: str, monitor_batches: dict, validate_epoch, lpips_loss_fn,
+    manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
+    formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
+    historical: HistoricalReconstruction, matching_config: dict, hashes: dict,
+) -> dict[str, dict]:
+    """Prepare a fresh suite or reopen an existing one, then run its arms in order.
+
+    The caller must enforce launch approval, resource limits and log capture.
+    """
+    if not isinstance(resume, bool) or not isinstance(attempt_id, str) or not attempt_id or any(
+        character in attempt_id for character in "\r\n"
+    ):
+        raise ValueError("An explicit fresh/resume mode and single-line attempt ID are required.")
+    _validate_suite_inputs(
+        monitor_batches=monitor_batches, validate_epoch=validate_epoch, lpips_loss_fn=lpips_loss_fn,
+        manifest_path=manifest_path, source_root=source_root, search_manifest=search_manifest,
+        diagnostic_manifest=diagnostic_manifest, formal_config=formal_config, guardrail_manifest=guardrail_manifest,
+        guardrail_config=guardrail_config, historical=historical, matching_config=matching_config, hashes=hashes,
+    )
+    if not torch.backends.mps.is_available() or os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "0":
+        raise RuntimeError("The streamed suite requires MPS without CPU fallback.")
+    source = source_root.resolve(strict=True)
+    destination = suite_dir.resolve()
+    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
+    if (not source.is_dir() or "fake_data_validation_v2" in source_root.parts
+            or "fake_data_validation_v2" in source.parts or forbidden.is_relative_to(source)
+            or "fake_data_validation_v2" in suite_dir.parts or "fake_data_validation_v2" in destination.parts
+            or forbidden.is_relative_to(destination) or destination.is_relative_to(forbidden)
+            or destination.is_relative_to(source) or source.is_relative_to(destination)):
+        raise ValueError("Suite and source paths must be separate and outside validation-v2.")
+
+    sampler = None
+    if not resume:
+        sampler = StreamedPairSampler(source, "train", matching_config["sampler_seed"])
+        if sampler.source_manifest_hash != hashes["source"]:
+            raise ValueError("Training sampler does not match the frozen source manifest.")
+        suite_dir.mkdir()
+        _sync_directory(suite_dir.parent)
+
+    with ExitStack() as stack:
+        journals = {}
+        for arm in ("S1", "S2", "S3"):
+            directory = suite_dir / arm
+            if not resume:
+                directory.mkdir()
+                (directory / "evaluation").mkdir()
+                _sync_directory(directory)
+                _sync_directory(suite_dir)
+            journal = BatchJournal(directory / "batch_metrics.csv", STEP_FIELDS, create=not resume)
+            stack.callback(journal.close)
+            if not resume:
+                journal.reconcile(watermark=None, attempt_id=f"bootstrap:{attempt_id}",
+                                  expected_step=0, expected_exposure=0)
+            journals[arm] = journal
+        metadata_path = suite_dir / "suite_metadata.json"
+        if resume and (metadata_path.exists() or metadata_path.is_symlink()):
+            checkpoints = {arm: suite_dir / arm / "initial.pt" for arm in ("S1", "S2", "S3")}
+            metadata = verify_suite_run_metadata(
+                suite_dir, checkpoints, matching_config=matching_config, expected_hashes=hashes,
+            )
+            initialization = SuiteInitialization(
+                suite_dir / "initialization_evidence.json", metadata["initialization_sha256"], checkpoints,
+            )
+        else:
+            if resume:
+                if any(journal._read() or journal.rows for journal in journals.values()):
+                    raise ValueError("A suite with recorded or incomplete steps cannot be reinitialized.")
+                for journal in journals.values():
+                    journal.reconcile(watermark=None, attempt_id=f"bootstrap:{attempt_id}",
+                                      expected_step=0, expected_exposure=0)
+            if sampler is None:
+                sampler = StreamedPairSampler(source, "train", matching_config["sampler_seed"])
+            if sampler.source_manifest_hash != hashes["source"]:
+                raise ValueError("Training sampler does not match the frozen source manifest.")
+            prepared = prepare_suite_initial_checkpoints(
+                suite_dir, journals, sampler=sampler, device="mps", hashes=hashes,
+                matching_config=matching_config, source_root=source,
+            )
+            initialization = SuiteInitialization(
+                prepared["evidence_path"], prepared["evidence_sha256"], prepared["initial_checkpoints"],
+            )
+        return run_suite_epochs(
+            journals, attempt_id=attempt_id, monitor_batches=monitor_batches, validate_epoch=validate_epoch,
+            lpips_loss_fn=lpips_loss_fn, manifest_path=manifest_path, source_root=source,
+            search_manifest=search_manifest, diagnostic_manifest=diagnostic_manifest,
+            formal_config=formal_config, guardrail_manifest=guardrail_manifest, guardrail_config=guardrail_config,
+            historical=historical, matching_config=matching_config, hashes=hashes,
+            suite_initialization=initialization,
+        )

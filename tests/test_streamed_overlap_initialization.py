@@ -17,7 +17,7 @@ from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
     ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime,
-    run_arm_epochs, run_suite_epochs,
+    run_arm_epochs, run_suite, run_suite_epochs,
 )
 from scripts.streamed_overlap_initialization import (
     _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
@@ -36,6 +36,7 @@ from torch.utils.tensorboard import SummaryWriter
 class FixtureSampler:
     def __init__(self, seed, source_hash):
         streams = np.random.SeedSequence(seed).spawn(2)
+        self.source_manifest_hash = source_hash
         self.state = {
             "schema": "streamed-pair-sampler-v1", "split": "train", "source_manifest_hash": source_hash,
             "batches_drawn": 0, "pair_rng": np.random.default_rng(streams[0]).bit_generator.state,
@@ -213,6 +214,67 @@ class ArmInitializationTests(unittest.TestCase):
             expected_hashes=self.hashes, expected_evidence_sha256=result["evidence_sha256"],
         )
         self.assertEqual(evidence["initialization"]["device"], "mps")
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_suite_workflow_prepares_and_reopens_three_matched_arms(self):
+        suite = self.source.parent / "workflow"
+        arguments = {
+            "attempt_id": "first-run", "monitor_batches": {}, "validate_epoch": object(),
+            "lpips_loss_fn": object(), "manifest_path": self.source.parent / "manifest",
+            "source_root": self.source, "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": {"final_epoch": self.config["final_epoch"]}, "guardrail_manifest": {},
+            "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
+        }
+        captures = []
+
+        def coordinate(journals, **kwargs):
+            self.assertEqual(set(journals), {"S1", "S2", "S3"})
+            self.assertTrue(all(journal.lock_fd != -1 for journal in journals.values()))
+            captures.append((journals, kwargs["suite_initialization"]))
+            return {"S1": {"status": "fixture"}}
+
+        with patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler", return_value=self.sampler), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_suite_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs", side_effect=coordinate), \
+             patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            result = run_suite(suite, resume=False, **arguments)
+            self.assertEqual(result, {"S1": {"status": "fixture"}})
+            first_journals, first_initialization = captures[-1]
+            self.assertTrue(all(journal.lock_fd == -1 for journal in first_journals.values()))
+            initial_bytes = {arm: path.read_bytes() for arm, path in first_initialization.initial_checkpoints.items()}
+            for arm in ("S1", "S2", "S3"):
+                self.assertTrue((suite / arm / "evaluation").is_dir())
+                self.assertEqual((suite / arm / "last.pt").read_bytes(), initial_bytes[arm])
+            with self.assertRaises(FileExistsError):
+                run_suite(suite, resume=False, **arguments)
+            run_suite(suite, resume=True, **{**arguments, "attempt_id": "resume"})
+            second_journals, resumed = captures[-1]
+            self.assertEqual(resumed, first_initialization)
+            self.assertTrue(all(journal.lock_fd == -1 for journal in second_journals.values()))
+            self.assertEqual({arm: path.read_bytes() for arm, path in resumed.initial_checkpoints.items()},
+                             initial_bytes)
+            with patch("scripts.streamed_overlap_epoch_runner.run_suite_epochs", side_effect=RuntimeError("stop")):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    run_suite(suite, resume=True, **{**arguments, "attempt_id": "retry"})
+            for arm in ("S1", "S2", "S3"):
+                journal = BatchJournal(suite / arm / "batch_metrics.csv", STEP_FIELDS, create=False)
+                journal.close()
+            interrupted = self.source.parent / "interrupted-workflow"
+            with patch("scripts.streamed_overlap_initialization.save_suite_run_metadata",
+                       side_effect=OSError("interrupted bootstrap")):
+                with self.assertRaisesRegex(OSError, "interrupted bootstrap"):
+                    run_suite(interrupted, resume=False, **arguments)
+            retained = {arm: (interrupted / arm / "initial.pt").read_bytes() for arm in ("S1", "S2", "S3")}
+            journal_path = interrupted / "S2" / "batch_metrics.csv"
+            journal_bytes = journal_path.read_bytes()
+            journal_path.write_bytes(journal_bytes + b"partial")
+            with self.assertRaisesRegex(ValueError, "recorded or incomplete steps"):
+                run_suite(interrupted, resume=True, **{**arguments, "attempt_id": "torn-retry"})
+            self.assertEqual(journal_path.read_bytes(), journal_bytes + b"partial")
+            journal_path.write_bytes(journal_bytes)
+            run_suite(interrupted, resume=True, **{**arguments, "attempt_id": "bootstrap-retry"})
+            self.assertEqual({arm: (interrupted / arm / "initial.pt").read_bytes() for arm in retained}, retained)
+            self.assertTrue((interrupted / "suite_metadata.json").is_file())
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
     def test_default_runtime_constructs_mps_arm_without_optimizer_step(self):

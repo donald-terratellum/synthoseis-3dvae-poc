@@ -4,6 +4,24 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+`run_suite` now connects fresh S1/S2/S3 checkpoint preparation and journal
+ownership to the sequential coordinator, and reopens the same suite for resume.
+It can finish an interrupted bootstrap when all three journals exist and have
+no completed or torn steps; otherwise it stops without replacing checkpoints.
+It closes journal locks on success or failure. The caller still supplies the
+frozen inputs and must enforce launch approval, resource limits and log capture.
+The shell train/resume/evaluate modes remain blocked.
+
+A synthetic MPS/ExFAT fixture exercised fresh preparation, reopening and
+interrupted bootstrap without an optimizer step. Arm execution and input
+validation were mocked. It passed in 6.94 seconds including startup, with
+658,980,864 bytes peak RSS; this is not a training-resource estimate. Temporary
+files and the empty test-created PyTorch cache directory were removed. The
+focused suite workflow, epoch and step tests passed 69 tests, with one skipped
+and 29 subtests, using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_epoch_runner.py
+tests/test_streamed_overlap_step.py`.
+
 The prepared-suite coordinator can now construct each arm's fresh E1 model,
 optimizer, scheduler, seeded training sampler and TensorBoard writer itself,
 then release the writer before starting the next arm. It creates a missing

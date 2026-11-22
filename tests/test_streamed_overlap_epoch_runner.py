@@ -14,7 +14,7 @@ from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
     complete_epoch,
-    complete_selected_checkpoint, run_arm_epochs, suite_workload,
+    complete_selected_checkpoint, run_arm_epochs, run_suite, suite_workload,
 )
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
 from scripts.streamed_overlap_targets import Window
@@ -306,6 +306,24 @@ class EpochCompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "configuration disagree"):
             self.run_completion({**self.config, "random_seed": 99})
         self.assertEqual(list(self.evaluation.iterdir()), [])
+
+    def test_fresh_suite_rejects_unbound_config_before_creating_output(self):
+        destination = self.root / "suite"
+        with patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler") as sampler:
+            with self.assertRaisesRegex(ValueError, "frozen formal evaluation"):
+                run_suite(
+                    destination, resume=False, attempt_id="fixture", monitor_batches={},
+                    validate_epoch=object(), lpips_loss_fn=object(), manifest_path=self.root / "manifest",
+                    source_root=self.source, search_manifest=self.search_manifest,
+                    diagnostic_manifest=self.diagnostic_manifest, formal_config={**self.config, "random_seed": 99},
+                    guardrail_manifest=self.guardrail_manifest, guardrail_config=self.guardrail_config,
+                    historical=self.historical, matching_config=self.matching_config, hashes={
+                        **self.hashes, "config": "a" * 64, "source": "b" * 64,
+                        "target": "c" * 64, "validation_manifest": "d" * 64,
+                    },
+                )
+            sampler.assert_not_called()
+        self.assertFalse(destination.exists())
 
     def test_changed_manifest_is_rejected_even_when_completion_exists(self):
         self.run_completion()
