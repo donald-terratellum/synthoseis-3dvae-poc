@@ -4,6 +4,26 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The prepared-suite coordinator can now construct each arm's fresh E1 model,
+optimizer, scheduler, seeded training sampler and TensorBoard writer itself,
+then release the writer before starting the next arm. It creates a missing
+epoch CSV only for an untouched epoch-zero arm; a missing CSV for an advanced
+or interrupted arm is an error, not a new log. Existing CSVs are preserved.
+The per-arm runner still restores the checkpoint and reconciles the journal.
+This connects the existing training pieces, but the caller must still prepare
+the suite, locks, manifests and fixed inputs. The shell's train/resume/evaluate
+modes remain blocked; this is not a launch command or training approval.
+
+The focused runtime, recovery and joint-step fixture tests passed 67 tests,
+with one skipped and 29 subtests, using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_epoch_runner.py
+tests/test_streamed_overlap_step.py`. The suite integration fixture mocked arm
+execution and sampler/model construction. A separate synthetic MPS test used
+the real S3 model, optimizer and TensorBoard writer with a mocked sampler and
+no optimizer step. Those two focused tests took 4.49 seconds and 524,959,744
+bytes peak RSS including startup; this is not a training-resource estimate.
+No real data was used for this wiring.
+
 The prepared-suite coordinator now checks the formal-evaluation,
 reconstruction-guardrail and historical-reference hashes against the
 checkpoint-bound suite hashes before opening an arm runtime or reading

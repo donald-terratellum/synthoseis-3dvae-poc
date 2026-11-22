@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import os
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -33,14 +33,16 @@ from scripts.streamed_overlap_matching import (
     ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
     verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_run_metadata,
 )
-from scripts.streamed_overlap_model import StreamedPairVAE
+from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
 )
 from scripts.streamed_overlap_search import run_bounded_searches, verify_search_manifest
 from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
-from scripts.train import EarlyStoppingState, streamed_monitor_hash, train_streamed_epoch
+from scripts.train import (
+    EarlyStoppingState, initialize_streamed_epoch_metrics, streamed_monitor_hash, train_streamed_epoch,
+)
 from src.tokenizer.core.model_adapter import choose_torch_device
 
 
@@ -474,6 +476,31 @@ class ArmRuntime:
     writer: SummaryWriter
 
 
+@contextmanager
+def _arm_runtime(
+    arm: str, initial: Path, journal: BatchJournal, source_root: Path, matching_config: dict, hashes: dict,
+):
+    sampler = StreamedPairSampler(source_root, "train", matching_config["sampler_seed"])
+    if sampler.source_manifest_hash != hashes["source"]:
+        raise ValueError("Training sampler does not match the frozen source manifest.")
+    epoch_csv = initial.parent / "training_metrics.csv"
+    if not epoch_csv.exists() and not epoch_csv.is_symlink():
+        state, _ = _checkpoint_state(initial.with_name("last.pt"))
+        if state.get("completed_epoch") != 0 or journal.rows:
+            raise FileNotFoundError("Cannot recreate a missing epoch CSV for an advanced or interrupted arm.")
+        initialize_streamed_epoch_metrics(epoch_csv)
+    if epoch_csv.is_symlink() or not epoch_csv.is_file():
+        raise ValueError("The epoch CSV must be a regular file.")
+    tensorboard = initial.parent / "tensorboard"
+    if tensorboard.is_symlink() or (tensorboard.exists() and not tensorboard.is_dir()):
+        raise ValueError("TensorBoard output must be a regular directory.")
+    model = fresh_e1_model(arm, matching_config["model_seed"], matching_config["head_seed"]).to("mps")
+    optimizer = build_optimizer(model)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=6, min_lr=1e-5)
+    with SummaryWriter(log_dir=str(tensorboard)) as writer:
+        yield ArmRuntime(model, optimizer, scheduler, sampler, EarlyStoppingState(float("inf"), 0), writer)
+
+
 def suite_workload(matching_config: dict, search_manifest: dict) -> dict:
     """Count clean-run exposure and scheduled evaluations without authorizing a launch."""
     config_hash = matching_config_hash(matching_config)
@@ -880,7 +907,8 @@ def run_arm_epochs(
 
 
 def run_suite_epochs(
-    journals: dict[str, BatchJournal], runtime_factory: Callable[[str], AbstractContextManager[ArmRuntime]], *,
+    journals: dict[str, BatchJournal],
+    runtime_factory: Callable[[str], AbstractContextManager[ArmRuntime]] | None = None, *,
     attempt_id: str, monitor_batches: dict, validate_epoch, lpips_loss_fn,
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, guardrail_manifest: dict, guardrail_config: dict,
@@ -892,7 +920,7 @@ def run_suite_epochs(
             or not isinstance(suite_initialization.evidence_path, Path)
             or suite_initialization.evidence_path.name != "initialization_evidence.json"
             or not isinstance(journals, dict) or set(journals) != {"S1", "S2", "S3"}
-            or not callable(runtime_factory) or not isinstance(attempt_id, str)
+            or (runtime_factory is not None and not callable(runtime_factory)) or not isinstance(attempt_id, str)
             or not attempt_id or any(character in attempt_id for character in "\r\n")):
         raise ValueError("A prepared suite, three journals and an explicit attempt are required.")
     metadata = verify_suite_run_metadata(
@@ -953,7 +981,9 @@ def run_suite_epochs(
     for arm in ("S1", "S2", "S3"):
         initial = suite_initialization.initial_checkpoints[arm]
         completed = False
-        with runtime_factory(arm) as runtime:
+        context = (_arm_runtime(arm, initial, journals[arm], source_root, matching_config, hashes)
+                   if runtime_factory is None else runtime_factory(arm))
+        with context as runtime:
             if not isinstance(runtime, ArmRuntime) or runtime.model.arm != arm:
                 raise ValueError("The runtime factory must provide the requested arm.")
             results[arm] = run_arm_epochs(

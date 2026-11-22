@@ -8,7 +8,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, create_autospec, patch
+from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import numpy as np
 import torch
@@ -16,7 +16,8 @@ import torch
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
-    ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, run_arm_epochs, run_suite_epochs,
+    ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime,
+    run_arm_epochs, run_suite_epochs,
 )
 from scripts.streamed_overlap_initialization import (
     _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
@@ -212,6 +213,22 @@ class ArmInitializationTests(unittest.TestCase):
             expected_hashes=self.hashes, expected_evidence_sha256=result["evidence_sha256"],
         )
         self.assertEqual(evidence["initialization"]["device"], "mps")
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "MPS is unavailable")
+    def test_default_runtime_constructs_mps_arm_without_optimizer_step(self):
+        initial = self.prepare()["initial_checkpoint"]
+        sampler = Mock(source_manifest_hash=self.hashes["source"])
+        with patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler", return_value=sampler), \
+             patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            with _arm_runtime("S3", initial, self.journal, self.source, self.config, self.hashes) as runtime:
+                self.assertEqual(runtime.model.arm, "S3")
+                self.assertTrue(all(parameter.device.type == "mps" and parameter.requires_grad
+                                    for parameter in runtime.model.parameters()))
+                self.assertEqual([group["name"] for group in runtime.optimizer.param_groups],
+                                 ["encoder", "decoder", "overlap", "coverage"])
+                runtime.writer.add_scalar("smoke", 1, 0)
+        self.assertTrue((initial.parent / "training_metrics.csv").is_file())
+        self.assertTrue(list((initial.parent / "tensorboard").glob("events.out.tfevents.*")))
 
     def test_suite_preflight_verifies_all_fresh_arms_without_mutating_rng(self):
         evidence = self.prepare_suite()
@@ -657,6 +674,60 @@ class ArmInitializationTests(unittest.TestCase):
             self.assertEqual(result, {arm: {"arm": arm} for arm in ("S1", "S2", "S3")})
             self.assertEqual(calls, [(action, arm) for arm in ("S1", "S2", "S3")
                                      for action in ("open", "run", "close")])
+            calls.clear()
+            created_samplers = []
+
+            def fresh_sampler(root, split, seed):
+                self.assertEqual((root, split, seed), (self.source, "train", self.config["sampler_seed"]))
+                sampler = Mock(source_manifest_hash=self.hashes["source"])
+                created_samplers.append(sampler)
+                return sampler
+
+            models = {}
+
+            def fresh_model(arm, model_seed, head_seed):
+                self.assertEqual((model_seed, head_seed), (self.config["model_seed"], self.config["head_seed"]))
+                model = create_autospec(StreamedPairVAE, instance=True)
+                model.arm = arm
+                model.to.return_value = model
+                models[arm] = model
+                return model
+
+            writer = MagicMock()
+            writer.__enter__.return_value = writer
+            with patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler", side_effect=fresh_sampler) as samplers, \
+                 patch("scripts.streamed_overlap_epoch_runner.fresh_e1_model", side_effect=fresh_model), \
+                 patch("scripts.streamed_overlap_epoch_runner.build_optimizer", return_value=Mock()), \
+                 patch("scripts.streamed_overlap_epoch_runner.torch.optim.lr_scheduler.ReduceLROnPlateau"), \
+                 patch("scripts.streamed_overlap_epoch_runner.SummaryWriter", return_value=writer):
+                result = run_suite_epochs(journals, **arguments)
+                self.assertEqual(result, {arm: {"arm": arm} for arm in ("S1", "S2", "S3")})
+                self.assertEqual(samplers.call_count, 3)
+                self.assertTrue(all(call.args == (self.source, "train", self.config["sampler_seed"])
+                                    for call in samplers.call_args_list))
+                self.assertEqual(len({id(sampler) for sampler in created_samplers}), 3)
+                self.assertEqual(writer.__exit__.call_count, 3)
+                for arm, model in models.items():
+                    model.to.assert_called_once_with("mps")
+                    self.assertTrue((arms[arm].initial_checkpoint.parent / "training_metrics.csv").is_file())
+                missing_csv = arms["S1"].initial_checkpoint.parent / "training_metrics.csv"
+                originals = {arm: (item.initial_checkpoint.parent / "training_metrics.csv").read_bytes()
+                             for arm, item in arms.items()}
+                run_suite_epochs(journals, **arguments)
+                for arm, item in arms.items():
+                    self.assertEqual((item.initial_checkpoint.parent / "training_metrics.csv").read_bytes(),
+                                     originals[arm])
+                missing_csv.unlink()
+                with patch("scripts.streamed_overlap_epoch_runner.StreamedPairSampler",
+                           return_value=Mock(source_manifest_hash="changed")):
+                    with self.assertRaisesRegex(ValueError, "frozen source manifest"):
+                        run_suite_epochs(journals, **arguments)
+                self.assertFalse(missing_csv.exists())
+                with patch("scripts.streamed_overlap_epoch_runner._checkpoint_state",
+                           return_value=({"completed_epoch": 1}, "a" * 64)):
+                    with self.assertRaisesRegex(FileNotFoundError, "Cannot recreate"):
+                        run_suite_epochs(journals, **arguments)
+                self.assertFalse(missing_csv.exists())
 
     def test_suite_rejects_unlocked_journal_before_opening_runtime(self):
         formal = {"final_epoch": self.config["final_epoch"]}
