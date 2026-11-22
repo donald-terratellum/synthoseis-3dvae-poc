@@ -125,8 +125,23 @@ RNGs and training mode were restored. The check used a 0.5 MPS memory-fraction
 guard and a test-only sparse-input probability of 0.5; its untrained-head loss
 values are not retrieval results. This does not establish full training headroom.
 
-The epoch helper requires a formal validation callback, but that evaluator,
-retrieval/selection, runner wiring and integrated local smoke are not implemented.
+The opt-in ranking calculation module now handles linear-gain NDCG@10 with
+candidate-ID tie-breaking, frozen eligibility checks, an explicitly seeded repeated
+uniform-random baseline, paired source-cluster bootstrap, separate same/different
+source candidate summaries, and matched-S1 mu-cosine comparisons. Its retrieval
+metric-only gate compares each depth cohort with the same random baseline and
+requires independent-seed replication; absent replication remains pending. Seeds
+and repetition counts are explicit, not approved launch settings. Synthetic tests
+exercise the calculations and the existing bound manifest passes the 300-query
+eligibility check without reading source cubes.
+
+These are numeric calculations on supplied scores, not a model evaluator or an
+adoption decision. They do not establish that the semantic head was trained, verify
+source fingerprints immediately before scoring, validate checkpoint identity or
+replication provenance, or apply reconstruction guardrails. No model was scored.
+The epoch helper still requires a formal validation callback, and checkpoint
+selection, bounded tokenizer searches, runner wiring and integrated local smoke are
+not implemented.
 The sampler's source-manifest hash covers inventory metadata, not full
 training-source contents. The journal currently reads completed CSV rows into
 memory; its long-run memory behavior must be assessed before launch. Keep train,
