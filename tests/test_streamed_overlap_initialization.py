@@ -741,7 +741,7 @@ class ArmInitializationTests(unittest.TestCase):
             "attempt_id": "attempt", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
             "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
             "search_manifest": search, "diagnostic_manifest": {},
-            "formal_config": formal, "guardrail_manifest": {},
+            "formal_config": formal, "guardrail_manifest": {"manifest_sha256": "f" * 64},
             "guardrail_config": {}, "historical": historical, "matching_config": self.config, "hashes": self.hashes,
             "suite_initialization": suite,
         }
@@ -758,6 +758,7 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner.open_validation_sources", return_value={}), \
              patch("scripts.streamed_overlap_epoch_runner.verify_search_manifest") as search_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.verify_diagnostics") as diagnostics_preflight, \
+             patch("scripts.streamed_overlap_epoch_runner._verify_reconstruction_inputs") as guardrail_preflight, \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm, \
              patch("scripts.streamed_overlap_epoch_runner._suite_cosine_comparisons",
                    return_value={"fixture": True}) as cosine:
@@ -827,6 +828,12 @@ class ArmInitializationTests(unittest.TestCase):
                  "target_implementation_sha256": self.hashes["target"]}, {}, {}, max_wall_seconds=30,
             )
             diagnostics_preflight.side_effect = None
+            guardrail_preflight.side_effect = ValueError("changed guardrail inputs")
+            with self.assertRaisesRegex(ValueError, "changed guardrail inputs"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            self.assertEqual(calls, [])
+            run_arm.assert_not_called()
+            guardrail_preflight.side_effect = None
             fail_s2 = True
             with self.assertRaisesRegex(RuntimeError, "interrupted S2"):
                 run_suite_epochs(journals, runtime_factory, **arguments)
@@ -994,7 +1001,7 @@ class ArmInitializationTests(unittest.TestCase):
             "attempt_id": "evaluation", "monitor_batches": {}, "validate_epoch": object(), "lpips_loss_fn": object(),
             "manifest_path": self.suite_dir / "manifest", "source_root": self.source,
             "search_manifest": {}, "diagnostic_manifest": {},
-            "formal_config": {"diagnostic_max_wall_seconds": 30}, "guardrail_manifest": {},
+            "formal_config": {"diagnostic_max_wall_seconds": 30}, "guardrail_manifest": {"manifest_sha256": "f" * 64},
             "guardrail_config": {}, "historical": object(), "matching_config": self.config, "hashes": self.hashes,
             "suite_initialization": SuiteInitialization(evidence["path"], evidence["evidence_sha256"], checkpoints),
             "evaluate_only": True,
@@ -1008,6 +1015,7 @@ class ArmInitializationTests(unittest.TestCase):
              patch("scripts.streamed_overlap_epoch_runner.open_validation_sources", return_value={}), \
              patch("scripts.streamed_overlap_epoch_runner.verify_search_manifest"), \
              patch("scripts.streamed_overlap_epoch_runner.verify_diagnostics"), \
+             patch("scripts.streamed_overlap_epoch_runner._verify_reconstruction_inputs"), \
              patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", return_value={}) as run_arm, \
              patch("scripts.streamed_overlap_epoch_runner._suite_cosine_comparisons", return_value={}), \
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train, \

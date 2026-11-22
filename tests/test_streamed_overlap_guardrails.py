@@ -14,8 +14,8 @@ import zarr
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
-    HistoricalReconstruction, SelectedReconstruction, _verify_historical_reconstruction, complete_reconstruction_comparison,
-    complete_selected_reconstruction,
+    HistoricalReconstruction, SelectedReconstruction, _verify_historical_reconstruction, _verify_reconstruction_inputs,
+    complete_reconstruction_comparison, complete_selected_reconstruction,
 )
 from scripts.streamed_overlap_evaluation import _identity
 from scripts.streamed_overlap_guardrails import compare_reconstruction_guardrails
@@ -480,6 +480,31 @@ class ReconstructionProducerTests(unittest.TestCase):
         }
         self.assertEqual(compare_reconstruction_guardrails(manifest, candidate, {"P0b": first})["status"],
                          "PASS_NUMERIC_ONLY")
+
+    def test_guardrail_input_preflight_verifies_runtime_and_full_store(self):
+        manifest = self.freeze()
+        config = {"device": "cpu", "max_wall_seconds": 60}
+        _verify_reconstruction_inputs(manifest, config, self.lpips)
+        changed = copy.deepcopy(manifest)
+        changed["protocol"]["runtime"]["versions"]["torch"] = "different"
+        with self.assertRaisesRegex(ValueError, "runtime or LPIPS"):
+            _verify_reconstruction_inputs(changed, config, self.lpips)
+        with torch.no_grad():
+            self.lpips.weight[0] = 2
+        with self.assertRaisesRegex(ValueError, "runtime or LPIPS"):
+            _verify_reconstruction_inputs(manifest, config, self.lpips)
+        with torch.no_grad():
+            self.lpips.weight[0] = 1
+        group = zarr.open_group(str(self.stores["real"]), mode="r+")
+        patches = group["patches"]
+        assert isinstance(patches, zarr.Array)
+        patches[1, 0, 0, 0] = 123
+        with self.assertRaisesRegex(ValueError, "differs from its frozen"):
+            _verify_reconstruction_inputs(manifest, config, self.lpips)
+        with patch("scripts.streamed_overlap_epoch_runner._verify_stores"), \
+             patch("scripts.streamed_overlap_epoch_runner.time.monotonic", side_effect=[0, 61]):
+            with self.assertRaisesRegex(TimeoutError, "wall-time limit"):
+                _verify_reconstruction_inputs(manifest, config, self.lpips)
 
     def test_changed_store_lpips_and_checkpoint_fail_closed(self):
         manifest = self.freeze()

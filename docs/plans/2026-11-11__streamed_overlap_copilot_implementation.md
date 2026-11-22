@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+Before opening any arm, the prepared-suite coordinator now rechecks the full
+frozen synthetic and real reconstruction guardrail stores, reconstruction
+runtime and LPIPS state. It uses the existing guardrail wall-time setting and
+logs the observed verification time. A missing or changed store, incompatible
+runtime, or expired check stops the suite before training; fresh suite
+initialization may already have written checkpoints. The check runs on fresh,
+resume and evaluation-only suite calls, and is repeated during reconstruction
+evaluation. It reads the historical guardrail stores, not the new final-test
+set; it does not verify complete training volumes or guarantee inputs cannot
+change afterward. The wall limit is checked between reads, not a hard watchdog.
+The low-level single-arm runner does not perform this suite-level preflight.
+
+The guardrail, initialization, epoch, integrity and search tests passed
+102 tests and 35 subtests using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_guardrails.py tests/test_streamed_overlap_initialization.py
+tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_integrity.py
+tests/test_streamed_overlap_search.py`. The store checks used tiny synthetic
+Zarr fixtures; no real-data preflight, training or evaluation ran.
+
 Suite preparation and the programmatic suite and arm runners now verify the
 historical P0b report and checkpoint before training can start or resume. The
 check rehashes both files and requires the report's checkpoint identity, frozen

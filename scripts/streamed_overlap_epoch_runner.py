@@ -346,6 +346,24 @@ def _validate_reconstruction_config(guardrail_manifest: dict, guardrail_config: 
     return expected
 
 
+def _verify_reconstruction_inputs(guardrail_manifest: dict, guardrail_config: dict, lpips_loss_fn) -> None:
+    deadline = time.monotonic() + guardrail_config["max_wall_seconds"]
+    protocol = guardrail_manifest["protocol"]
+    device = choose_torch_device(guardrail_config["device"])
+
+    def verify_runtime() -> None:
+        if (protocol.get("runtime") != _reconstruction_runtime()
+                or lpips_fingerprint(lpips_loss_fn) != protocol["lpips_sha256"]
+                or {parameter.device.type for parameter in lpips_loss_fn.parameters()} != {device.type}):
+            raise ValueError("Reconstruction runtime or LPIPS differs from the frozen protocol.")
+
+    verify_runtime()
+    _verify_stores(guardrail_manifest, deadline)
+    verify_runtime()
+    if time.monotonic() > deadline:
+        raise TimeoutError("Guardrail input verification exceeded its wall-time limit.")
+
+
 def complete_selected_reconstruction(
     checkpoint_path: Path, journal, manifest_path: Path, source_root: Path,
     search_manifest: dict, diagnostic_manifest: dict, formal_config: dict, *,
@@ -409,14 +427,7 @@ def complete_selected_reconstruction(
         if report.get("checkpoint") != identity:
             raise ValueError("Reconstruction measurement checkpoint differs from the selection.")
         _measurement(report, guardrail_manifest, expected, identity["arm"])
-        deadline = time.monotonic() + guardrail_config["max_wall_seconds"]
-        protocol = guardrail_manifest["protocol"]
-        device = choose_torch_device(guardrail_config["device"])
-        if (protocol.get("runtime") != _reconstruction_runtime()
-                or lpips_fingerprint(lpips_loss_fn) != protocol["lpips_sha256"]
-                or {parameter.device.type for parameter in lpips_loss_fn.parameters()} != {device.type}):
-            raise ValueError("Reconstruction runtime or LPIPS differs from the frozen protocol.")
-        _verify_stores(guardrail_manifest, deadline)
+        _verify_reconstruction_inputs(guardrail_manifest, guardrail_config, lpips_loss_fn)
         verify_checkpoints()
         return record
     attempt = directory / f"checkpoint-{identity['epoch']:06d}-{uuid.uuid4().hex}"
@@ -1249,6 +1260,14 @@ def run_suite_epochs(
         raise ValueError("Validation manifest or source path changed during evaluation-input preflight.")
     open_validation_sources(root, manifest)
     del groups
+    print("Verifying frozen reconstruction guardrail inputs.", flush=True)
+    started = time.monotonic()
+    _verify_reconstruction_inputs(guardrail_manifest, guardrail_config, lpips_loss_fn)
+    print(json.dumps({
+        "status": "RECONSTRUCTION_GUARDRAIL_INPUTS_VERIFIED",
+        "manifest_sha256": guardrail_manifest["manifest_sha256"],
+        "elapsed_seconds": time.monotonic() - started,
+    }, sort_keys=True), flush=True)
     print(json.dumps(workload, sort_keys=True), flush=True)
     s1_initial = suite_initialization.initial_checkpoints["S1"]
     s1 = SelectedReconstruction(
