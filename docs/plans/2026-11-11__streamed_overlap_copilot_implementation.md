@@ -4,6 +4,22 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The per-arm runner and matched-record verifier now require a hash-bound
+`streamed-matching-config-v1`, stored in each checkpoint as `hashes["matching"]`.
+It explicitly names the run and experiment seed, model/head/sampler seeds,
+monitor/validation seeds, final epoch, batches per epoch and sparse-view
+probability. The arm runner checks its runtime arguments against this configuration
+before restore or training; the verifier checks both initial/final checkpoint
+bindings and the recorded final run, seed and exposure. Before every restore,
+the arm helper also requires a separately retained fresh E1 initial checkpoint,
+and requires `last.pt` to be byte-identical to it at epoch zero. A retained
+snapshot alone does not prove a resumed trajectory actually started from it.
+No budget or probability default is selected. The matching configuration is not
+the complete suite configuration; the future suite runner must persist it,
+retain initial checkpoints, and invoke the verifier. These checks do not
+authorize a launch.
+The portable streamed suite passed 184 tests, with one skipped and 42 subtests.
+
 An opt-in `verify_matched_arm_records` helper now checks a candidate S2/S3
 against S1 using retained epoch-zero and reconciled final checkpoints plus
 committed journal provenance. It verifies the specified fresh E1 weights and
@@ -15,7 +31,7 @@ RNG state, or authorize adoption. The suite runner must retain each arm's
 initial checkpoint, bind the seeds to its frozen configuration, and invoke
 this verifier; the helper does not launch training. Only synthetic evidence
 was checked in this continuation. It does not check the recorded optimizer
-rules or certify that the supplied seeds are bound to the suite configuration.
+rules or certify that the matching configuration is bound to the full suite configuration.
 The portable streamed suite passed 178 tests, with one skipped and 21 subtests.
 
 The per-arm epoch helper now requires the frozen reconstruction configuration

@@ -23,6 +23,28 @@ class ArmEvidence:
     journal: BatchJournal
 
 
+def matching_config_hash(config: dict) -> str:
+    required = {
+        "schema", "run_id", "experiment_seed", "model_seed", "head_seed", "sampler_seed",
+        "monitor_seed", "validation_seed", "final_epoch", "batches_per_epoch", "sparse_probability",
+    }
+    if (not isinstance(config, dict) or set(config) != required
+            or config["schema"] != "streamed-matching-config-v1"
+            or not isinstance(config["run_id"], str) or not config["run_id"]
+            or any(character in config["run_id"] for character in "\r\n")
+            or any(isinstance(config[key], bool) or not isinstance(config[key], int)
+                   or not 0 <= config[key] < 2**32
+                   for key in ("experiment_seed", "model_seed", "head_seed", "sampler_seed",
+                               "monitor_seed", "validation_seed"))
+            or any(isinstance(config[key], bool) or not isinstance(config[key], int) or config[key] < 1
+                   for key in ("final_epoch", "batches_per_epoch"))
+            or isinstance(config["sparse_probability"], bool)
+            or not isinstance(config["sparse_probability"], (int, float))
+            or not math.isfinite(config["sparse_probability"]) or not 0 <= config["sparse_probability"] <= 1):
+        raise ValueError("An explicit valid matching configuration is required.")
+    return content_hash(config)
+
+
 def _permitted_file(path: Path) -> None:
     if ("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in path.resolve().parts
             or path.is_symlink() or not path.is_file()):
@@ -92,6 +114,36 @@ def _initial_state(state: dict, arm: str, final: dict, model_seed: int, head_see
                    or actual[key].shape != expected[key].shape
                    or not torch.equal(actual[key], expected[key]) for key in expected)):
         raise ValueError(f"{arm} initial model is not the specified fresh E1 initialization.")
+
+
+def verify_arm_initial_checkpoint(
+    initial_checkpoint: Path, checkpoint_path: Path, *, arm: str, matching_config: dict, expected_hashes: dict,
+) -> str:
+    """Verify the retained fresh checkpoint before an arm restores or advances."""
+    config_hash = matching_config_hash(matching_config)
+    if arm not in {"S1", "S2", "S3"} or expected_hashes.get("matching") != config_hash:
+        raise ValueError("Initial verification requires the bound arm and matching configuration.")
+    for path in (initial_checkpoint, checkpoint_path):
+        _permitted_file(path)
+    if initial_checkpoint.samefile(checkpoint_path):
+        raise ValueError("The initial checkpoint must be retained separately from last.pt.")
+    initial, initial_hash = _checkpoint_state(initial_checkpoint)
+    current, current_hash = _checkpoint_state(checkpoint_path)
+    if (current.get("arm") != arm or current.get("hashes") != expected_hashes
+            or type(current.get("completed_epoch")) is not int or current["completed_epoch"] < 0
+            or current.get("batches_per_epoch") != matching_config["batches_per_epoch"]):
+        raise ValueError("Current checkpoint does not match the arm configuration.")
+    _initial_state(
+        initial, arm, current, matching_config["model_seed"], matching_config["head_seed"],
+        matching_config["sampler_seed"],
+    )
+    if current.get("completed_epoch") == 0 and initial_hash != current_hash:
+        raise ValueError("An epoch-zero last checkpoint must match the retained initial checkpoint.")
+    for path, digest in ((initial_checkpoint, initial_hash), (checkpoint_path, current_hash)):
+        _permitted_file(path)
+        if _digest(path) != digest:
+            raise ValueError("Initial or current checkpoint changed during verification.")
+    return initial_hash
 
 
 def _valid_pair(pair: object, category: str) -> bool:
@@ -194,12 +246,16 @@ def _recorded_stream(evidence: ArmEvidence, identity: dict, batches_per_epoch: i
 
 
 def verify_matched_arm_records(
-    reference: ArmEvidence, candidate: ArmEvidence, *, model_seed: int, head_seed: int, sampler_seed: int,
+    reference: ArmEvidence, candidate: ArmEvidence, *, matching_config: dict,
 ) -> dict:
     """Compare fresh initial states and committed records; does not establish adoption readiness."""
-    for seed in (model_seed, head_seed, sampler_seed):
-        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
-            raise ValueError("Explicit nonnegative 32-bit initialization and sampler seeds are required.")
+    config_hash = matching_config_hash(matching_config)
+    matching_config = dict(matching_config)
+    if matching_config_hash(matching_config) != config_hash:
+        raise ValueError("Matching configuration changed during verification.")
+    model_seed, head_seed, sampler_seed = (
+        matching_config[key] for key in ("model_seed", "head_seed", "sampler_seed")
+    )
     loaded = []
     evidence_files = []
     recovery_snapshots = []
@@ -219,6 +275,12 @@ def verify_matched_arm_records(
                 or (arm is None and actual_arm not in {"S2", "S3"})):
             raise ValueError("Reference must be S1 and candidate must be S2 or S3.")
         identity = _identity(final, final_hash, item.journal, final.get("hashes", {}).get("validation_manifest"))
+        if (final["hashes"].get("matching") != config_hash
+                or identity["run_id"] != matching_config["run_id"]
+                or identity["experiment_seed"] != matching_config["experiment_seed"]
+                or identity["epoch"] != matching_config["final_epoch"]
+                or final["batches_per_epoch"] != matching_config["batches_per_epoch"]):
+            raise ValueError("Arm checkpoint does not match the frozen matching configuration.")
         if (item.journal.position is None or item.journal.position.logical_step != identity["step"]
                 or item.journal.position.cumulative_exposure != 12 * identity["step"]):
             raise ValueError("Arm evidence must use the reconciled final checkpoint.")
@@ -250,10 +312,11 @@ def verify_matched_arm_records(
     if any(_recovery_files(journal) != snapshot for journal, snapshot in recovery_snapshots):
         raise ValueError("Journal recovery records changed during verification.")
     result = {
-        "schema": "streamed-matched-arm-records-v1", "status": "MATCHED_RECORDED_STREAMS_ONLY",
+        "schema": "streamed-matched-arm-records-v2", "status": "MATCHED_RECORDED_STREAMS_ONLY",
         "reference": left[2], "candidate": right[2],
         "initial_checkpoint_sha256": {"S1": left[4], right[2]["arm"]: right[4]},
         "stream_sha256": content_hash(left[3]), "steps": left[2]["step"],
+        "matching_config_sha256": config_hash,
         "model_seed": model_seed, "head_seed": head_seed, "sampler_seed": sampler_seed,
         "limitation": (
             "Recorded streams and RNG states only; records do not prove source data or actual model inputs "

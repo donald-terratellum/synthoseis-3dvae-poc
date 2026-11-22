@@ -1,5 +1,6 @@
 import copy
 import json
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,13 +12,21 @@ import torch
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record
-from scripts.streamed_overlap_matching import ArmEvidence, verify_matched_arm_records
+from scripts.streamed_overlap_matching import (
+    ArmEvidence, matching_config_hash, verify_arm_initial_checkpoint, verify_matched_arm_records,
+)
 from scripts.streamed_overlap_matching import _recorded_stream
 from scripts.streamed_overlap_model import fresh_e1_model
 
 
+MATCHING_CONFIG = {
+    "schema": "streamed-matching-config-v1", "run_id": "suite", "experiment_seed": 7,
+    "model_seed": 10, "head_seed": 11, "sampler_seed": 12, "monitor_seed": 13, "validation_seed": 14,
+    "final_epoch": 1, "batches_per_epoch": 2, "sparse_probability": 0.5,
+}
 HASHES = {
     "config": "a" * 64, "source": "b" * 64, "target": "c" * 64, "validation_manifest": "d" * 64,
+    "matching": content_hash(MATCHING_CONFIG),
 }
 
 
@@ -120,7 +129,7 @@ class MatchedArmEvidenceTests(unittest.TestCase):
 
     def verify(self):
         return verify_matched_arm_records(
-            self.reference, self.candidate, model_seed=10, head_seed=11, sampler_seed=12,
+            self.reference, self.candidate, matching_config=MATCHING_CONFIG,
         )
 
     def mutate_checkpoint(self, path, mutate):
@@ -130,10 +139,12 @@ class MatchedArmEvidenceTests(unittest.TestCase):
 
     def test_compares_fresh_initialization_and_live_records_after_replay(self):
         result = self.verify()
+        self.assertEqual(result["schema"], "streamed-matched-arm-records-v2")
         self.assertEqual(result["status"], "MATCHED_RECORDED_STREAMS_ONLY")
         self.assertEqual(result["steps"], 2)
         self.assertEqual(result["reference"]["arm"], "S1")
         self.assertEqual(result["candidate"]["arm"], "S3")
+        self.assertEqual(result["matching_config_sha256"], content_hash(MATCHING_CONFIG))
         self.assertEqual(result["sha256"], content_hash({
             key: value for key, value in result.items() if key != "sha256"
         }))
@@ -145,6 +156,40 @@ class MatchedArmEvidenceTests(unittest.TestCase):
                 self.mutate_checkpoint(path, lambda state: state.update(model=model_state))
         with patch("scripts.streamed_overlap_matching.fresh_e1_model", side_effect=fresh_e1_model):
             self.assertEqual(self.verify()["status"], "MATCHED_RECORDED_STREAMS_ONLY")
+
+    def test_initial_checkpoint_is_verified_before_epoch_zero_restore(self):
+        item = self.reference
+        shutil.copyfile(item.initial_checkpoint, item.final_checkpoint)
+
+        def verify_initial(initial=item.initial_checkpoint):
+            return verify_arm_initial_checkpoint(
+                initial, item.final_checkpoint, arm="S1",
+                matching_config=MATCHING_CONFIG, expected_hashes=HASHES,
+            )
+
+        self.assertEqual(len(verify_initial()), 64)
+        with self.assertRaisesRegex(ValueError, "retained separately"):
+            verify_initial(item.final_checkpoint)
+        self.mutate_checkpoint(
+            item.final_checkpoint, lambda state: state["training"]["torch_rng"].add_(1),
+        )
+        with self.assertRaisesRegex(ValueError, "epoch-zero last checkpoint"):
+            verify_initial()
+
+    def test_retained_initial_checkpoint_is_reverified_for_resume(self):
+        item = self.candidate
+        self.assertEqual(len(verify_arm_initial_checkpoint(
+            item.initial_checkpoint, item.final_checkpoint, arm="S3",
+            matching_config=MATCHING_CONFIG, expected_hashes=HASHES,
+        )), 64)
+        self.mutate_checkpoint(
+            item.initial_checkpoint, lambda state: state["model"]["vae.weight"].add_(1),
+        )
+        with self.assertRaisesRegex(ValueError, "fresh E1 initialization"):
+            verify_arm_initial_checkpoint(
+                item.initial_checkpoint, item.final_checkpoint, arm="S3",
+                matching_config=MATCHING_CONFIG, expected_hashes=HASHES,
+            )
 
     def test_s2_is_checked_against_s1(self):
         self.candidate = self.arm("S2")
@@ -159,10 +204,42 @@ class MatchedArmEvidenceTests(unittest.TestCase):
         self.mutate_checkpoint(
             self.candidate.initial_checkpoint, lambda state: state["model"]["vae.weight"].sub_(1),
         )
+        self.mutate_checkpoint(
+            self.candidate.initial_checkpoint, lambda state: state.update(sampler=sampler_state(13)),
+        )
         with self.assertRaisesRegex(ValueError, "sampler.*specified stream seed"):
-            verify_matched_arm_records(
-                self.reference, self.candidate, model_seed=10, head_seed=11, sampler_seed=13,
-            )
+            self.verify()
+
+    def test_seed_and_exposure_configuration_must_match_checkpoint(self):
+        for key, value in (("model_seed", 20), ("sampler_seed", 13), ("final_epoch", 2),
+                           ("batches_per_epoch", 3), ("sparse_probability", 0.1)):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "frozen matching configuration"):
+                    verify_matched_arm_records(
+                        self.reference, self.candidate, matching_config={**MATCHING_CONFIG, key: value},
+                    )
+
+    def test_matching_configuration_requires_explicit_valid_settings(self):
+        cases = (
+            {key: value for key, value in MATCHING_CONFIG.items() if key != "final_epoch"},
+            {**MATCHING_CONFIG, "sampler_seed": True},
+            {**MATCHING_CONFIG, "batches_per_epoch": 0},
+            {**MATCHING_CONFIG, "sparse_probability": float("nan")},
+            {**MATCHING_CONFIG, "sparse_probability": 1.01},
+            {**MATCHING_CONFIG, "unexpected": 1},
+        )
+        for config in cases:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "valid matching configuration"):
+                matching_config_hash(config)
+
+    def test_checkpoint_must_finish_configured_epoch_and_use_run_identity(self):
+        for key, value in (("run_id", "other"), ("experiment_seed", 8), ("final_epoch", 2)):
+            config = {**MATCHING_CONFIG, key: value}
+            for item in (self.reference, self.candidate):
+                for path in (item.initial_checkpoint, item.final_checkpoint):
+                    self.mutate_checkpoint(path, lambda state: state["hashes"].update(matching=content_hash(config)))
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "frozen matching configuration"):
+                verify_matched_arm_records(self.reference, self.candidate, matching_config=config)
 
     def test_mismatched_live_augmentation_or_final_rng_is_rejected(self):
         row = self.candidate.journal.rows[-1]
@@ -224,7 +301,7 @@ class MatchedArmEvidenceTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_matching._checkpoint_state") as load:
             with self.assertRaisesRegex(ValueError, "outside validation-v2"):
                 verify_matched_arm_records(
-                    forbidden, self.candidate, model_seed=10, head_seed=11, sampler_seed=12,
+                    forbidden, self.candidate, matching_config=MATCHING_CONFIG,
                 )
             load.assert_not_called()
 

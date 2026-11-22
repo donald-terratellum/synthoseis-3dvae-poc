@@ -21,6 +21,7 @@ from scripts.streamed_overlap_guardrails import (
 )
 from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
 from scripts.streamed_overlap_journal import BatchJournal, _atomic_record, _sync_directory
+from scripts.streamed_overlap_matching import matching_config_hash, verify_arm_initial_checkpoint
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
 )
@@ -587,7 +588,8 @@ def run_arm_epochs(
     epoch_csv: Path, checkpoint_path: Path, hashes: dict, early_stopping,
     manifest_path: Path, source_root: Path, search_manifest: dict, diagnostic_manifest: dict,
     formal_config: dict, evaluation_dir: Path, guardrail_manifest: dict, guardrail_config: dict,
-    historical: HistoricalReconstruction, s1: SelectedReconstruction | None,
+    historical: HistoricalReconstruction, s1: SelectedReconstruction | None, matching_config: dict,
+    initial_checkpoint: Path,
 ) -> dict:
     """Resume one arm from its full epoch state and finish evaluation before advancing."""
     if hashes.get("formal_evaluation") != content_hash(formal_config):
@@ -596,6 +598,18 @@ def run_arm_epochs(
             or not isinstance(formal_config.get("final_epoch"), int)
             or formal_config["final_epoch"] < 1):
         raise ValueError("An explicit positive final epoch is required.")
+    if (hashes.get("matching") != matching_config_hash(matching_config)
+            or not isinstance(run_id, str) or run_id != matching_config["run_id"]
+            or any(isinstance(value, bool) or not isinstance(value, int) or value != matching_config[key]
+                   for key, value in (
+                       ("experiment_seed", seed), ("batches_per_epoch", batches_per_epoch),
+                       ("monitor_seed", monitor_seed), ("validation_seed", validation_seed),
+                   ))
+            or isinstance(sparse_probability, bool) or not isinstance(sparse_probability, (int, float))
+            or not math.isfinite(sparse_probability)
+            or sparse_probability != matching_config["sparse_probability"]
+            or formal_config["final_epoch"] != matching_config["final_epoch"]):
+        raise ValueError("Arm arguments must match the frozen matching configuration.")
     _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
     if (hashes.get("reconstruction_guardrail") != content_hash(guardrail_config)
             or hashes.get("reconstruction_reference") != _reference_hash(historical)):
@@ -606,6 +620,10 @@ def run_arm_epochs(
                 not isinstance(s1, SelectedReconstruction) or s1.selection_kind != "reconstruction"
             ))):
         raise ValueError("S1 needs P0b only; S2 and S3 require the selected S1 reconstruction reference.")
+    verify_arm_initial_checkpoint(
+        initial_checkpoint, checkpoint_path, arm=model.arm,
+        matching_config=matching_config, expected_hashes=hashes,
+    )
     restored = restore_epoch_state(
         checkpoint_path, model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
         early_stopping=early_stopping, journal=journal, expected_hashes=hashes,
