@@ -1540,11 +1540,9 @@ def run_suite(
         )
 
 
-def run_suite_from_record(
-    record_path: Path, suite_dir: Path, *, expected_config_sha256: str, resume: bool, attempt_id: str,
-    evaluate_only: bool = False,
-) -> dict[str, dict]:
-    """Run or evaluate a pinned record; approval, resource limits and logging remain external."""
+def _read_pinned_suite_record(
+    record_path: Path, suite_dir: Path, expected_config_sha256: str,
+) -> tuple[dict, HistoricalReconstruction, dict]:
     if not isinstance(record_path, Path) or not isinstance(suite_dir, Path) or not _sha256(expected_config_sha256):
         raise ValueError("A suite record, destination and explicit configuration hash are required.")
     _permitted_file(record_path)
@@ -1578,6 +1576,39 @@ def run_suite_from_record(
         Path(historical["checkpoint_path"]), historical["checkpoint_sha256"], historical["checkpoint_label"],
     )
     _reference_hash(reference)
+    return record, reference, hashes
+
+
+def suite_storage_preflight_from_record(
+    record_path: Path, suite_dir: Path, *, expected_config_sha256: str,
+    checkpoint_upper_bytes: dict[str, int], other_output_bytes: int, free_reserve_bytes: int,
+) -> dict:
+    """Review clean-run storage against a pinned suite record without starting it."""
+    record, reference, hashes = _read_pinned_suite_record(record_path, suite_dir, expected_config_sha256)
+    matching = record["matching_config"]
+    formal = record["formal_config"]
+    _validate_evaluation_bindings(hashes, formal, record["guardrail_config"], reference)
+    _validate_formal_config(record["search_manifest"], record["diagnostic_manifest"], formal)
+    _validate_reconstruction_config(record["guardrail_manifest"], record["guardrail_config"], formal)
+    if (hashes.get("matching") != matching_config_hash(matching)
+            or formal["final_epoch"] != matching["final_epoch"]
+            or record["search_manifest"].get("validation_manifest_sha256") != hashes["validation_manifest"]
+            or record["diagnostic_manifest"].get("validation_manifest_sha256") != hashes["validation_manifest"]):
+        raise ValueError("Suite input record has inconsistent matching or evaluation settings.")
+    report = suite_storage_preflight(
+        matching, record["search_manifest"], suite_dir, checkpoint_upper_bytes=checkpoint_upper_bytes,
+        other_output_bytes=other_output_bytes, free_reserve_bytes=free_reserve_bytes,
+    )
+    report["suite_config_sha256"] = expected_config_sha256
+    return report
+
+
+def run_suite_from_record(
+    record_path: Path, suite_dir: Path, *, expected_config_sha256: str, resume: bool, attempt_id: str,
+    evaluate_only: bool = False,
+) -> dict[str, dict]:
+    """Run or evaluate a pinned record; approval, resource limits and logging remain external."""
+    record, reference, hashes = _read_pinned_suite_record(record_path, suite_dir, expected_config_sha256)
     return run_suite(
         suite_dir, resume=resume, attempt_id=attempt_id, epoch_validation=record["epoch_validation"],
         manifest_path=Path(record["manifest_path"]), source_root=Path(record["source_root"]),

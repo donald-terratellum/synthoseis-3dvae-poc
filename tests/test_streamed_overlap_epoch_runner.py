@@ -1,5 +1,8 @@
+import copy
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +20,7 @@ from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
     complete_epoch,
     complete_selected_checkpoint, prepare_epoch_inputs, run_arm_epochs, run_suite, run_suite_from_record,
-    suite_storage_preflight, suite_workload,
+    suite_storage_preflight, suite_storage_preflight_from_record, suite_workload,
 )
 from scripts.streamed_overlap_prepare import prepare
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
@@ -263,6 +266,45 @@ class EpochInputBindingTests(unittest.TestCase):
             record = json.loads(output.read_text())
             self.assertEqual(result["config_sha256"], content_hash(record))
             self.assertEqual(record["input_hashes"]["monitor"], observed["monitor"])
+            self.assertFalse((self.root / "new-suite").exists())
+            storage_options = {
+                "expected_config_sha256": result["config_sha256"],
+                "checkpoint_upper_bytes": {"S1": 1, "S2": 1, "S3": 1},
+                "other_output_bytes": 1, "free_reserve_bytes": 1,
+            }
+            with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+                storage = suite_storage_preflight_from_record(output, self.root / "new-suite", **storage_options)
+            self.assertEqual(storage["suite_config_sha256"], result["config_sha256"])
+            self.assertEqual(storage["checkpoint_counts"], {"S1": 5, "S2": 5, "S3": 6})
+            run.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "pinned configuration hash"):
+                suite_storage_preflight_from_record(
+                    output, self.root / "new-suite", **{**storage_options, "expected_config_sha256": "0" * 64},
+                )
+            with self.assertRaisesRegex(ValueError, "pinned destination"):
+                suite_storage_preflight_from_record(output, self.root / "wrong-suite", **storage_options)
+            changed_record = copy.deepcopy(record)
+            changed_record["matching_config"]["final_epoch"] = 3
+            output.write_text(json.dumps(changed_record))
+            with self.assertRaisesRegex(ValueError, "inconsistent matching"):
+                suite_storage_preflight_from_record(
+                    output, self.root / "new-suite",
+                    **{**storage_options, "expected_config_sha256": content_hash(changed_record)},
+                )
+            output.write_text(json.dumps(record))
+            command = [
+                sys.executable, "-m", "scripts.streamed_overlap_storage",
+                "--suite-record", str(output), "--suite-dir", str(self.root / "new-suite"),
+                "--config-sha256", result["config_sha256"], "--s1-checkpoint-upper-bytes", "1",
+                "--s2-checkpoint-upper-bytes", "1", "--s3-checkpoint-upper-bytes", "1",
+                "--other-output-bytes", "1", "--free-reserve-bytes", "1",
+            ]
+            review = subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(review.stdout)["suite_config_sha256"], result["config_sha256"])
+            command[-1] = str(10**30)
+            failed_review = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertNotEqual(failed_review.returncode, 0)
+            self.assertIn("Insufficient estimated suite storage", failed_review.stderr)
             self.assertFalse((self.root / "new-suite").exists())
             run_suite_from_record(
                 output, self.root / "new-suite", expected_config_sha256=result["config_sha256"],
