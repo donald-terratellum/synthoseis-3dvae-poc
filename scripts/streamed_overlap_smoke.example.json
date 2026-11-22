@@ -1,0 +1,7 @@
+{
+  "source_root": "/Volumes/CrucialX9/fake_data",
+  "seed": 20260926,
+  "sparse_probability": 0.5,
+  "mps_memory_fraction": 0.5,
+  "max_wall_seconds": 300
+}

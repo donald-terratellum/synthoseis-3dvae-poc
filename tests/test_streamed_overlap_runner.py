@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from scripts import streamed_overlap_runner as runner
+from scripts.streamed_overlap_smoke import _validate_config
 from test_streamed_overlap_audit import make_source
 from scripts.streamed_overlap_audit import DEFAULT_SEISMIC_KEY
 
@@ -165,7 +166,7 @@ class TensorBoardLifecycleTests(unittest.TestCase):
 class AuditAttemptTests(unittest.TestCase):
     def test_incomplete_execution_modes_remain_blocked_without_side_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for mode in ("train", "resume", "smoke", "evaluate"):
+            for mode in ("train", "resume", "evaluate"):
                 result = subprocess.run(
                     ["bash", "scripts/streamed_overlap_experiment.sh", "--mode", mode,
                      "--run-id", "blocked-fixture", "--output-root", temporary],
@@ -174,6 +175,81 @@ class AuditAttemptTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("TRAINING_NOT_READY", result.stderr)
             self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_smoke_attempt_requires_no_optimizer_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir()
+            config = root / "config.json"
+            config.write_text("{}")
+            output = root / "output"
+            child = mock.Mock()
+            child.wait.return_value = 0
+
+            def start_child(command):
+                self.assertIn("scripts.streamed_overlap_smoke", command)
+                output.mkdir()
+                (output / "smoke_report.json").write_text(json.dumps({
+                    "status": "NO_OPTIMIZER_SMOKE_PASSED", "optimizer_step": False,
+                }))
+                return child
+
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                 mock.patch.object(runner.subprocess, "check_output",
+                                   side_effect=["fixture", b"fixture", ""]):
+                self.assertEqual(runner.smoke_attempt(config, output, logs, "fixture"), 0)
+            manifest = json.loads((logs / "run_manifest.json").read_text())
+            self.assertEqual(manifest["status"], "smoke_complete_training_not_authorized")
+            self.assertFalse(manifest["production_training_allowed"])
+            self.assertEqual(manifest["artifact_sha256"]["smoke_report.json"],
+                             runner.file_hash(output / "smoke_report.json"))
+
+    def test_smoke_config_rejects_source_output_and_validation_v2(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sources"
+            source.mkdir()
+            config = {
+                "source_root": str(source), "seed": 1, "sparse_probability": 0.5,
+                "mps_memory_fraction": 0.5, "max_wall_seconds": 30,
+            }
+            self.assertEqual(_validate_config(config, root / "output"), source.resolve())
+            with self.assertRaisesRegex(ValueError, "outside"):
+                _validate_config(config, source / "output")
+            forbidden = root / "fake_data_validation_v2"
+            forbidden.mkdir()
+            config["source_root"] = str(forbidden)
+            with self.assertRaisesRegex(ValueError, "validation-v2"):
+                _validate_config(config, root / "output")
+
+    def test_smoke_child_cannot_claim_success_with_optimizer_step(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir()
+            config = root / "config.json"
+            config.write_text("{}")
+            output = root / "output"
+            child = mock.Mock()
+            child.wait.return_value = 0
+
+            def start_child(command):
+                del command
+                output.mkdir()
+                (output / "smoke_report.json").write_text(json.dumps({
+                    "status": "NO_OPTIMIZER_SMOKE_PASSED", "optimizer_step": True,
+                }))
+                return child
+
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=start_child), \
+                 mock.patch.object(runner.subprocess, "check_output",
+                                   side_effect=["fixture", b"fixture", ""]):
+                with self.assertRaisesRegex(ValueError, "no-optimizer"):
+                    runner.smoke_attempt(config, output, logs, "fixture")
+            manifest = json.loads((logs / "run_manifest.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertNotEqual(manifest["returncode"], 0)
 
     def test_real_fixture_attempt_records_hashes_and_never_starts_tensorboard(self):
         with tempfile.TemporaryDirectory() as temporary:

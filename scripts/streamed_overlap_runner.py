@@ -140,6 +140,81 @@ def audit_attempt(config: Path, output: Path, log_dir: Path, run_id: str) -> int
         save_json(manifest_path, manifest, replace=True)
 
 
+def smoke_attempt(config: Path, output: Path, log_dir: Path, run_id: str) -> int:
+    manifest_path = log_dir / "run_manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(f"Refusing an existing attempt manifest: {manifest_path}")
+    command = [
+        sys.executable, "-u", "-m", "scripts.streamed_overlap_smoke",
+        "--config", str(config), "--output", str(output),
+    ]
+    manifest = {
+        "schema_version": 1, "mode": "smoke", "run_id": run_id, "attempt_id": uuid.uuid4().hex,
+        "started_at_utc": utc_now(), "status": "preflight", "command": command,
+        "config_path": str(config.resolve()), "output_path": str(output.resolve()),
+        "log_path": str((log_dir / "training.log").resolve()),
+        "production_training_allowed": False, "training_device": "mps",
+        "python": sys.version, "platform": platform.platform(), "runner_sha256": file_hash(Path(__file__)),
+        "smoke_sha256": file_hash(Path(__file__).with_name("streamed_overlap_smoke.py")),
+    }
+    save_json(manifest_path, manifest)
+    returncode = 1
+    try:
+        manifest["config_sha256"] = file_hash(config)
+        resolved_config = json.loads(config.read_text())
+        if not isinstance(resolved_config, dict):
+            raise ValueError("Smoke config must be a JSON object.")
+        manifest["resolved_config"] = resolved_config
+        manifest["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        changes = subprocess.check_output(["git", "diff", "HEAD", "--binary"])
+        manifest["git_diff_sha256"] = hashlib.sha256(changes).hexdigest()
+        manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True).splitlines()
+        manifest["versions"] = {
+            package: importlib.metadata.version(package)
+            for package in ("numpy", "zarr", "torch", "tensorboard", "lpips")
+        }
+        manifest["status"] = "running"
+        save_json(manifest_path, manifest, replace=True)
+        print(f"Smoke command: {shlex.join(command)}", flush=True)
+        child = subprocess.Popen(command)
+        try:
+            returncode = child.wait()
+        except (KeyboardInterrupt, SystemExit) as interruption:
+            code = interruption.code if isinstance(interruption, SystemExit) else 130
+            returncode = code if isinstance(code, int) else 1
+            manifest["status"] = "interrupted"
+            child.send_signal(signal.SIGTERM if isinstance(interruption, SystemExit) else signal.SIGINT)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            raise
+        if returncode == 0:
+            report_path = output / "smoke_report.json"
+            report = json.loads(report_path.read_text())
+            if report.get("status") != "NO_OPTIMIZER_SMOKE_PASSED" or report.get("optimizer_step") is not False:
+                raise ValueError("Smoke child did not produce the required no-optimizer report.")
+            manifest["artifact_sha256"] = {"smoke_report.json": file_hash(report_path)}
+            manifest["status"] = "smoke_complete_training_not_authorized"
+        else:
+            manifest["status"] = "failed"
+        manifest["child_returncode"] = returncode
+        return returncode if returncode >= 0 else 128 - returncode
+    except KeyboardInterrupt:
+        manifest["status"] = "interrupted"
+        returncode = 130
+        raise
+    finally:
+        if manifest["status"] in ("preflight", "running"):
+            manifest["status"] = "failed"
+            if returncode == 0:
+                returncode = 1
+        manifest["returncode"] = returncode
+        manifest["finished_at_utc"] = utc_now()
+        save_json(manifest_path, manifest, replace=True)
+
+
 def process_identity(pid: int) -> dict | None:
     if pid <= 1:
         raise ValueError("Refusing an unsafe service PID.")
@@ -339,7 +414,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, terminate)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--action", required=True, choices=(
-        "audit", "tensorboard", "tensorboard-status", "tensorboard-stop",
+        "audit", "smoke", "tensorboard", "tensorboard-status", "tensorboard-stop",
     ))
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--run-id")
@@ -347,10 +422,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--run-dir", type=Path)
     args = parser.parse_args()
-    if args.action == "audit":
+    if args.action in {"audit", "smoke"}:
         if args.config is None or args.output is None or args.run_id is None:
-            parser.error("Audit requires --config, --output and --run-id.")
-        raise SystemExit(audit_attempt(args.config, args.output, args.log_dir, args.run_id))
+            parser.error("Audit and smoke require --config, --output and --run-id.")
+        attempt = audit_attempt if args.action == "audit" else smoke_attempt
+        raise SystemExit(attempt(args.config, args.output, args.log_dir, args.run_id))
     if args.run_dir is None:
         parser.error("TensorBoard actions require --run-dir.")
     manifest = json.loads((args.log_dir / "run_manifest.json").read_text())

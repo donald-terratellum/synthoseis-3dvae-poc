@@ -9,7 +9,8 @@ Updated: 2026-11-22.
 The opt-in `scripts.streamed_overlap_targets` module now computes canonical overlap
 and directional event-coverage targets on original seismic and same-index labels.
 Unsupported windows and unusable semantic inputs have explicit unavailable reasons.
-It is not connected to a trainer. The coarse closure fractions remain a proxy, and
+The sampler and opt-in joint-step primitives use these targets; the full training
+runner is not integrated. The coarse closure fractions remain a proxy, and
 the saved sources' generation-time worktrees remain unknown.
 
 The diagnostic yield sampler reads only discovered train/validation sources. For each
@@ -51,8 +52,8 @@ stored on the checkpoint volume, not committed. Its source inventory records met
 not cryptographic hashes of the complete source data; source-content integrity still
 needs verification before model evaluation.
 
-The opt-in pair model and augmentation helpers are implemented and tested, but not
-connected to a trainer. They use a fresh matched residual mu128 VAE, a shared trainable
+The opt-in pair model and augmentation helpers are implemented and tested, including
+joint-step primitives. They use a fresh matched residual mu128 VAE, a shared trainable
 encoder, calibrated overlap and ordered coverage heads, and a combined loss. Views
 can use extrema or sparse input masks while reconstructing normalized dense augmented
 A. A guarded local S3 forward/backward smoke used 12 real train pairs, source-band
@@ -192,7 +193,7 @@ budgeted before launch. The checkpoint volume does not support hard links; a loc
 probe confirmed file/directory fsync and atomic replacement.
 
 The independent-seed provenance check, remaining diagnostic reports, bounded
-tokenizer searches, runner wiring and an end-to-end streamed/MPS smoke remain.
+tokenizer searches, full runner wiring and an optimizer/epoch/recovery MPS smoke remain.
 Keep launch modes blocked.
 Fourteen synthetic evaluator, selection and guardrail tests used temporary files
 on the checkpoint volume and took 4.06 seconds and about 343 MiB peak RSS
@@ -205,7 +206,21 @@ no optimizer step and is neither a guardrail result nor a full-suite/MPS estimat
 The sampler's source-manifest hash covers inventory metadata, not full
 training-source contents. The journal currently reads completed CSV rows into
 memory; its long-run memory behavior must be assessed before launch. Keep train,
-resume, smoke and evaluate modes blocked. No training has been authorized.
+resume and evaluate modes blocked. No training has been authorized.
+
+The wrapper now supports a distinct no-optimizer MPS smoke. Run
+`streamed-overlap-no-optimizer-mps-smoke-20261122-03` exercised real train and
+primary-validation batches (12 pairs each), sampler replay, a combined S3 backward
+pass with finite nonzero encoder and head gradients, monitor state restoration and
+TensorBoard event writing. The report hash, smoke source hash and event file were
+verified. Including startup it took 13.36 seconds, with 1,919,434,752 bytes peak
+RSS and 2,476,277,760 bytes MPS driver allocation sampled after monitoring. These
+are neither peak MPS usage nor full-training resource estimates. This test performed
+no optimizer step and did not exercise epoch orchestration, checkpoint recovery or
+retrieval scoring. Its sparse probability and 0.5 MPS memory fraction are smoke-only
+settings, not approved training settings. The wall-time limit is checked between
+stages, not a hard watchdog. Source discovery prunes directories named
+`fake_data_validation_v2` without descending into them.
 
 The refreshed local audit `streamed-overlap-target-audit-20261122-03` inspected
 180 training and 25 validation sources. All 205 have the required semantic arrays;
@@ -254,6 +269,17 @@ bash scripts/streamed_overlap_experiment.sh --mode audit \
   --config scripts/streamed_overlap_audit.example.json \
   --run-id streamed-overlap-audit-review-01
 ```
+
+Fresh no-optimizer smoke (requires MPS and a new run ID):
+
+```bash
+bash scripts/streamed_overlap_experiment.sh --mode smoke \
+  --config scripts/streamed_overlap_smoke.example.json \
+  --run-id <new-smoke-run-id>
+```
+
+The smoke creates private output and a run manifest; `--print-commands` is
+side-effect-free. It is not a training-readiness or recovery test.
 
 For any existing run, use its actual ID and suite directory. The following completed
 local audit has a run manifest and can be inspected now:

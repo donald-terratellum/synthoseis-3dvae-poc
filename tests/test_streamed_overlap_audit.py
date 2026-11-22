@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import zarr
@@ -141,6 +142,24 @@ class StreamedAuditTests(unittest.TestCase):
             discover_sources(self.root)
         with self.assertRaisesRegex(ValueError, "parent training-source"):
             discover_sources(self.root / "validation")
+
+    def test_regenerating_validation_v2_is_never_walked(self):
+        train = make_source(self.root)
+        validation = make_source(self.root / "validation")
+        forbidden = self.root / "nested" / "fake_data_validation_v2"
+        forbidden.mkdir(parents=True)
+        real_scandir = os.scandir
+
+        def guarded_scandir(path):
+            if "fake_data_validation_v2" in Path(path).parts:
+                raise AssertionError("Regenerating dataset was accessed")
+            return real_scandir(path)
+
+        with mock.patch("os.scandir", side_effect=guarded_scandir):
+            found = discover_sources(self.root)
+        self.assertEqual({source.path for source in found}, {train.resolve(), validation.resolve()})
+        with self.assertRaisesRegex(ValueError, "parent training-source"):
+            discover_sources(forbidden)
 
     def test_validation_root_cannot_alias_final_test(self):
         make_source(self.root)
@@ -327,7 +346,7 @@ class AuditRunnerTests(unittest.TestCase):
         )
 
     def test_production_modes_and_traversal_are_rejected_without_side_effects(self):
-        for mode in ("train", "resume", "smoke", "evaluate"):
+        for mode in ("train", "resume", "evaluate"):
             result = self.invoke("--mode", mode)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(PENDING, result.stderr)
@@ -347,6 +366,14 @@ class AuditRunnerTests(unittest.TestCase):
         result = self.invoke(*args)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Refusing existing", result.stderr)
+
+    def test_smoke_print_mode_is_side_effect_free(self):
+        result = self.invoke("--mode", "smoke", "--config", str(self.config), "--run-id", "fixture",
+                             "--output-root", str(self.output), "--print-commands")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--action smoke", result.stdout)
+        self.assertFalse((self.root / "logs").exists())
+        self.assertFalse(self.output.exists())
 
     def test_failed_preflight_is_logged_and_exit_status_is_preserved(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)

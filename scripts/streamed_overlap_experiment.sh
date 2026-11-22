@@ -14,12 +14,15 @@ Monitoring an existing suite:
   --mode tensorboard-status --run-id <id> --run-dir <existing-suite-directory>
   --mode tensorboard-stop --run-id <id> --run-dir <existing-suite-directory>
 
+No-optimizer MPS smoke:
+  --mode smoke --config <smoke-config.json> --run-id <new-id>
+
 TensorBoard binds to 127.0.0.1:6006 and remains running after this shell exits.
 Only a verified run-owned PID can be reused or stopped; occupied ports are errors.
 No training or event generation occurs in these monitoring modes.
 
-This runner implements audit and monitoring, not the integrated training suite.
-Train/resume/smoke/evaluate modes remain blocked until runner integration,
+This runner implements audit, no-optimizer MPS smoke and monitoring, not training.
+Train/resume/evaluate modes remain blocked until runner integration,
 evaluation prerequisites and the separate training approval are complete.
 Audit output is LOCAL_TARGET_VALIDATION_PENDING.
 Combined stdout/stderr is captured at logs/<run-id>/training.log.
@@ -55,8 +58,8 @@ while (($#)); do
 done
 
 case "$mode" in
-  audit|tensorboard|tensorboard-status|tensorboard-stop) ;;
-  train|resume|smoke|evaluate)
+  audit|smoke|tensorboard|tensorboard-status|tensorboard-stop) ;;
+  train|resume|evaluate)
     printf 'TRAINING_NOT_READY: integrated runner and evaluation prerequisites remain incomplete; audit status is LOCAL_TARGET_VALIDATION_PENDING. No training authorized.\n' >&2
     exit 2 ;;
   *) printf 'Unknown or missing --mode. Use --help.\n' >&2; exit 2 ;;
@@ -69,7 +72,10 @@ python="${PYTHON:-.venv/bin/python}"
 output="${output_root}/${run_id}"
 log_dir="logs/${run_id}"
 command=("$python" -u -m scripts.streamed_overlap_runner --action "$mode" --log-dir "$log_dir")
-if [[ "$mode" == audit ]]; then
+if [[ "$mode" == audit || "$mode" == smoke ]]; then
+  if [[ -z "$config" ]]; then
+    printf 'Audit and smoke require --config.\n' >&2; exit 2
+  fi
   command+=(--run-id "$run_id" --config "$config" --output "$output")
 else
   if [[ -z "$run_dir" ]]; then
@@ -78,15 +84,15 @@ else
   command+=(--run-dir "$run_dir")
 fi
 if ((print_only)); then
-  if [[ "$mode" == audit ]]; then printf 'Audit output: %s\n' "$output"; fi
+  if [[ "$mode" == audit || "$mode" == smoke ]]; then printf '%s output: %s\n' "$mode" "$output"; fi
   printf 'Combined log: %s/training.log\n' "$log_dir"
   printf '%q ' "${command[@]}"; printf '\n'
   printf 'Watch output: tail -n 100 -F %q\n' "$log_dir/training.log"
   exit 0
 fi
-if [[ "$mode" == audit ]]; then
+if [[ "$mode" == audit || "$mode" == smoke ]]; then
   if [[ -e "$output" || -L "$output" || -e "$log_dir" || -L "$log_dir" ]]; then
-    printf 'Refusing existing audit output or log directory: %s, %s\n' "$output" "$log_dir" >&2
+    printf 'Refusing existing output or log directory: %s, %s\n' "$output" "$log_dir" >&2
     exit 1
   fi
 else
@@ -95,7 +101,7 @@ else
     exit 1
   fi
 fi
-if [[ "$mode" == audit ]]; then
+if [[ "$mode" == audit || "$mode" == smoke ]]; then
   mkdir -p logs
   mkdir "$log_dir"
 fi
@@ -110,8 +116,8 @@ fi
   if [[ ! -x "$python" ]]; then
     printf 'Python interpreter is not executable: %s\n' "$python" >&2; exit 1
   fi
-  if [[ "$mode" == audit && ! -f "$config" ]]; then
-    printf 'Missing audit config: %s\n' "$config" >&2; exit 2
+  if [[ ( "$mode" == audit || "$mode" == smoke ) && ! -f "$config" ]]; then
+    printf 'Missing %s config: %s\n' "$mode" "$config" >&2; exit 2
   fi
   "$python" --version
   "${command[@]}"

@@ -34,6 +34,7 @@ from scripts.streamed_fluid_labels import (
 
 
 HOLDOUT_NAMES = frozenset(("validation", "test", "test_synthoseis"))
+REGENERATING_DATASET_NAME = "fake_data_validation_v2"
 LABEL_KEYS = (
     "geologic_age_faulted",
     "faulted_lithology",
@@ -86,7 +87,8 @@ class Source:
 
 def discover_sources(root: Path) -> list[Source]:
     root = root.resolve(strict=True)
-    if (not root.is_dir() or any(part in HOLDOUT_NAMES for part in root.parts)
+    if (not root.is_dir() or any(part in HOLDOUT_NAMES or part == REGENERATING_DATASET_NAME
+                                 for part in root.parts)
             or root.name.endswith(".zarr")):
         raise ValueError("source_root must be the parent training-source directory.")
     sources: list[Source] = []
@@ -108,7 +110,7 @@ def discover_sources(root: Path) -> list[Source]:
         for current, directories, _ in os.walk(base, followlinks=False, onerror=fail_walk):
             for name in list(directories):
                 path = Path(current) / name
-                if name.startswith(".") or name in HOLDOUT_NAMES:
+                if name.startswith(".") or name in HOLDOUT_NAMES or name == REGENERATING_DATASET_NAME:
                     directories.remove(name)
                     continue
                 if path.is_symlink():
