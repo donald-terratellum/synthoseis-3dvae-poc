@@ -1,10 +1,14 @@
 import copy
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_diagnostics import bind_diagnostics, diagnostic_report, verify_diagnostics
+from scripts.streamed_overlap_diagnostics import bind_diagnostics, diagnostic_report, main, verify_diagnostics
 from scripts.streamed_overlap_integrity import _window_record
 from scripts.streamed_overlap_manifest import _window
 from tests.test_streamed_overlap_metrics import frozen_fixture, predictions
@@ -86,6 +90,43 @@ class ValidationDiagnosticTests(unittest.TestCase):
             verify_diagnostics(self.manifest, self.groups, bound, max_wall_seconds=30)
         with self.assertRaisesRegex(ValueError, "fingerprints"):
             diagnostic_report(self.manifest, self.groups, bound, predictions(self.manifest), max_wall_seconds=30)
+
+    def test_bind_cli_requires_explicit_threshold_and_refuses_existing_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            manifest = root / "manifest.json"
+            manifest.touch()
+            output = root / "diagnostics.json"
+            args = ["diagnostics", "--mode", "bind", "--source-root", str(source),
+                    "--manifest", str(manifest), "--output", str(output),
+                    "--thin-max-voxels", "2", "--max-wall-seconds", "30"]
+            sidecar = {"diagnostic_manifest_sha256": "a" * 64}
+            with patch("sys.argv", args), \
+                 patch("scripts.streamed_overlap_diagnostics.load_manifest", return_value=self.manifest), \
+                 patch("scripts.streamed_overlap_diagnostics.open_validation_sources", return_value=self.groups), \
+                 patch("scripts.streamed_overlap_diagnostics.verify_inputs"), \
+                 patch("scripts.streamed_overlap_diagnostics.bind_diagnostics", return_value=sidecar) as bind:
+                main()
+                self.assertEqual(json.loads(output.read_text()), sidecar)
+                self.assertEqual(bind.call_args.kwargs["thin_max_voxels"], 2)
+                with self.assertRaises(FileExistsError):
+                    main()
+                self.assertEqual(bind.call_count, 1)
+
+    def test_bind_cli_rejects_invalid_threshold_and_excluded_source_before_reading(self):
+        args = ["diagnostics", "--mode", "bind", "--source-root",
+                "/Volumes/CrucialX9/fake_data_validation_v2", "--manifest", "manifest.json",
+                "--output", "output.json", "--thin-max-voxels", "0", "--max-wall-seconds", "30"]
+        with patch("sys.argv", args), \
+             patch("scripts.streamed_overlap_diagnostics.open_validation_sources") as open_sources:
+            with self.assertRaises(SystemExit):
+                main()
+            args[-3] = "2"
+            with self.assertRaisesRegex(ValueError, "validation-v2"):
+                main()
+            open_sources.assert_not_called()
 
 
 if __name__ == "__main__":

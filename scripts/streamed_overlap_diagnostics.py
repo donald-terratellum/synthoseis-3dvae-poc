@@ -1,7 +1,10 @@
 """Fingerprint and report validation-only NTG and corrected-sand proxies."""
 
+import argparse
 import hashlib
+import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -9,7 +12,10 @@ import numpy as np
 
 from scripts.streamed_fluid_labels import lithology_masks
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_integrity import _digest_array, _window_record
+from scripts.streamed_overlap_integrity import (
+    _digest_array, _window_record, load_manifest, open_validation_sources, verify_inputs,
+)
+from scripts.streamed_overlap_journal import _sync_directory
 from scripts.streamed_overlap_manifest import _window
 from scripts.streamed_overlap_metrics import _eligible_queries, event_coverage_diagnostics
 from scripts.streamed_overlap_targets import _read_bounded, _supported
@@ -189,3 +195,73 @@ def diagnostic_report(
             "Correlated validation pairs are not independent geological realizations.",
         ],
     }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("bind", "verify"), required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--thin-max-voxels", type=int)
+    parser.add_argument("--bound", type=Path)
+    parser.add_argument("--max-wall-seconds", type=float, required=True)
+    args = parser.parse_args()
+    if ((args.mode == "bind" and (args.thin_max_voxels is None or args.thin_max_voxels < 1
+                                  or args.bound is not None))
+            or (args.mode == "verify" and (args.bound is None or args.thin_max_voxels is not None))
+            or not math.isfinite(args.max_wall_seconds) or args.max_wall_seconds <= 0):
+        parser.error("Bind requires a thin threshold; verify requires a bound sidecar; both require a wall limit.")
+    if "fake_data_validation_v2" in args.source_root.parts:
+        raise ValueError("The regenerating validation-v2 dataset is not permitted.")
+    root = args.source_root.resolve(strict=True)
+    output = args.output.resolve()
+    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
+    if ("fake_data_validation_v2" in root.parts or forbidden.is_relative_to(root)
+            or output.is_relative_to(root) or forbidden.is_relative_to(output)
+            or "fake_data_validation_v2" in output.parts):
+        raise ValueError("Diagnostic output and source must exclude validation-v2 and remain separate.")
+    for path in (args.manifest, args.bound):
+        if path is not None:
+            if "fake_data_validation_v2" in path.parts:
+                raise ValueError("Frozen manifests must be outside validation-v2.")
+            resolved = path.resolve(strict=True)
+            if "fake_data_validation_v2" in resolved.parts or resolved.is_relative_to(root):
+                raise ValueError("Frozen manifests must be outside source data and validation-v2.")
+    if args.output.exists() or args.output.is_symlink():
+        raise FileExistsError("Refusing to overwrite an existing diagnostic output.")
+    started = time.monotonic()
+    manifest = load_manifest(args.manifest)
+    groups = open_validation_sources(root, manifest)
+    verification = verify_inputs(manifest, groups)
+    remaining = args.max_wall_seconds - (time.monotonic() - started)
+    if remaining <= 0:
+        raise TimeoutError("Diagnostic wall-time limit exceeded; no partial output is valid.")
+    if args.mode == "bind":
+        result = bind_diagnostics(manifest, groups, thin_max_voxels=args.thin_max_voxels,
+                                  max_wall_seconds=remaining)
+    else:
+        bound = json.loads(args.bound.read_text(encoding="utf-8"))
+        verified = verify_diagnostics(manifest, groups, bound, max_wall_seconds=remaining)
+        result = {
+            "status": "VALIDATION_DIAGNOSTICS_VERIFIED",
+            "validation_manifest_sha256": manifest["manifest_sha256"],
+            "diagnostic_manifest_sha256": verified["diagnostic_manifest_sha256"],
+            "verified_windows": len(verified["windows"]), "input_verification": verification,
+        }
+    if time.monotonic() - started > args.max_wall_seconds:
+        raise TimeoutError("Diagnostic wall-time limit exceeded; no partial output is valid.")
+    with args.output.open("x", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _sync_directory(args.output.parent)
+    print(json.dumps({
+        "status": "DIAGNOSTICS_BOUND" if args.mode == "bind" else result["status"],
+        "diagnostic_manifest_sha256": result["diagnostic_manifest_sha256"],
+    }), flush=True)
+
+
+if __name__ == "__main__":
+    main()

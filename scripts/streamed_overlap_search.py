@@ -26,6 +26,14 @@ from src.tokenizer.core.jobs import compute_total_windows_from_padded_shape
 PATCH_SHAPE = (32, 32, 64)
 
 
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _implementation_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parents[1]
     paths = (
@@ -159,6 +167,7 @@ def _search_results(scores_path: Path, output_path: Path, region: Window, query:
     best_center = tuple(value + size // 2 for value, size in zip(best[1], PATCH_SHAPE))
     return {
         "window_count": len(seen), "contained_window_count": len(contained_windows),
+        "window_scores_sha256": _file_digest(scores_path), "hann_similarity_sha256": _digest_array(output),
         "query_window_rank": query_rank,
         "query_window_rank_unavailable_reason": None if query_rank is not None
         else "query origin is not on the configured tokenizer search grid",

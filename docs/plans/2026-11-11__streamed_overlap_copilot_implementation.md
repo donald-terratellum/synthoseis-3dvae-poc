@@ -250,8 +250,10 @@ source verification and startup. Parent peak RSS was 1,249,230,848 bytes; this i
 a peak measurement for the CLI child or a launch estimate. The untrained checkpoint
 and one-window ranking are a plumbing check, not a scientific result. An initial
 attempt failed because the MPS low watermark exceeded the configured high watermark;
-the corrected subprocess sets both explicitly. No production search manifest has
-been approved, and no search is yet invoked by the training runner.
+the corrected subprocess sets both explicitly. A second check after adding output
+fingerprints passed in 244.96 seconds, with 1,253,982,208 bytes parent peak RSS;
+this is still not a peak measurement for the CLI child. No production search
+manifest has been approved, and no search is yet invoked by the training runner.
 
 Separately, a diagnostic sidecar can fingerprint native-index NTG, lithology and
 channel-label windows and reverify them before reporting directional pair errors.
@@ -261,7 +263,33 @@ Window-edge runs are censored. These are diagnostic proxies, not proven geologic
 layers or proof of reservoir absence. Missing, unsupported and invalid arrays retain
 explicit reasons; a water-only window has no NTG-over-rock value. The sidecar does
 not verify checkpoint provenance, has not yet been frozen for the primary cohort,
-and is not yet connected to the evaluator or runner.
+and is not yet connected to a production suite runner.
+The sidecar can be bound or verified read-only with explicit settings, for example:
+
+```sh
+.venv/bin/python -m scripts.streamed_overlap_diagnostics --mode bind \
+  --source-root /Volumes/CrucialX9/fake_data --manifest <bound-validation-manifest.json> \
+  --output <new-private-sidecar.json> --thin-max-voxels <predeclared-threshold> \
+  --max-wall-seconds <limit>
+```
+
+Verification uses `--mode verify --bound <private-sidecar.json>` instead of
+`--thin-max-voxels`. Neither mode uses final-test crops or trains a model. The wall
+limit rejects an over-budget result but does not interrupt an in-progress source
+verification or individual array read.
+
+An opt-in epoch orchestration helper now restores an arm's full checkpoint and
+requires the last committed epoch's evaluation to finish before training advances.
+It schedules checkpoint-bound directional evaluation, bounded tokenizer search
+and diagnostic reporting every five epochs and at the final epoch, then publishes
+the appropriate reconstruction and (S3 only) retrieval selection. Completion
+records are immutable and hash-bound; interrupted evaluation attempts are preserved
+and retried, and completed reports, tokenizer checkpoint, window scores and voxel
+maps are checked on recovery. S1/S2 cosine reports are never passed as pair-head
+retrieval selections. This is a tested orchestration primitive, not a fully wired
+suite runner, launch authorization or evidence that final selected checkpoints
+have received all post-selection searches and guardrails. Train/resume/evaluate
+shell modes remain blocked.
 The existing interrupted-checkpoint/replay fixture now also runs on MPS: it uses
 a small synthetic S3 model and synthetic pairs, exercises optimizer steps, epoch
 logging, an injected checkpoint failure and deterministic replay, and never opens
