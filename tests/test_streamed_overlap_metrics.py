@@ -11,6 +11,7 @@ from scripts.streamed_overlap_metrics import (
     event_coverage_diagnostics,
     linear_ndcg_at_10,
     paired_source_bootstrap,
+    physical_overlap_diagnostics,
     retrieval_metric_gate,
     summarize_rankings,
 )
@@ -75,6 +76,47 @@ def make_report(manifest, *, arm="S3", scorer="pair_head", experiment_seed=1, re
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_overlap_diagnostics_report_categories_bins_and_matched_baselines(self):
+        manifest = frozen_fixture()
+        for query in manifest["queries"]:
+            for candidate in query["candidates"]:
+                candidate["target"]["overlap"] = (0.25, 0.5, 1.0)[candidate["id"]] \
+                    if candidate["category"] == "same_overlap" else 0.0
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        overlap = {
+            query["id"]: {candidate["id"]: candidate["target"]["overlap"]
+                          for candidate in query["candidates"]}
+            for query in manifest["queries"]
+        }
+        waveform = {
+            query["id"]: {candidate["id"]: 0.5 for candidate in query["candidates"]}
+            for query in manifest["queries"]
+        }
+        result = physical_overlap_diagnostics(manifest, overlap, constant=0.0, waveform_predictions=waveform)
+        self.assertEqual(result["overlap_bins"]["0-0.25"]["count"], 1400)
+        self.assertEqual(result["overlap_bins"]["0.25-0.5"]["count"], 200)
+        self.assertEqual(result["overlap_bins"]["0.5-0.75"]["count"], 200)
+        self.assertEqual(result["overlap_bins"]["0.75-1"]["count"], 200)
+        self.assertEqual(result["categories"]["same_overlap"]["metrics"]["prediction"]["mae"], 0)
+        self.assertAlmostEqual(result["categories"]["same_overlap"]["metrics"]["constant"]["bias"], -7 / 12)
+        self.assertEqual(result["categories"]["cross_source"]["metrics"]["waveform"]["rmse"], 0.5)
+        waveform[manifest["queries"][0]["id"]].pop(0)
+        with self.assertRaisesRegex(ValueError, "candidate IDs"):
+            physical_overlap_diagnostics(manifest, overlap, constant=0.0, waveform_predictions=waveform)
+        waveform[manifest["queries"][0]["id"]][0] = float("nan")
+        with self.assertRaisesRegex(ValueError, "finite values"):
+            physical_overlap_diagnostics(manifest, overlap, constant=0.0, waveform_predictions=waveform)
+        waveform[manifest["queries"][0]["id"]][0] = 0.5
+        candidate = manifest["queries"][0]["candidates"][3]
+        candidate["target"]["overlap"] = 0.1
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "zero physical overlap"):
+            physical_overlap_diagnostics(manifest, overlap, constant=0.0, waveform_predictions=waveform)
+
     def test_event_diagnostics_preserve_directional_errors_and_fluid_availability(self):
         manifest = frozen_fixture()
         target = manifest["queries"][0]["candidates"][0]["target"]

@@ -2,13 +2,16 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from scripts.streamed_overlap_audit import content_hash
-from scripts.streamed_overlap_evaluation import StreamedEpochValidator, evaluate_checkpoint, export_tokenizer_checkpoint
+from scripts.streamed_overlap_evaluation import (
+    StreamedEpochValidator, evaluate_checkpoint, export_tokenizer_checkpoint, physical_overlap_diagnostics,
+)
 from scripts.streamed_overlap_integrity import input_fingerprints, verify_inputs
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
@@ -74,6 +77,8 @@ class EvaluationTests(unittest.TestCase):
                 "gas_closures": np.zeros_like(array),
             }
         for query in self.manifest["queries"]:
+            for candidate in query["candidates"]:
+                candidate["target"]["overlap"] = 0.5 if candidate["category"] == "same_overlap" else 0.0
             for window in (query["window"], *(candidate["window"] for candidate in query["candidates"])):
                 window.update({"origin": [0, 0, 0], "shape": [2, 2, 5]})
         plans = [{
@@ -94,7 +99,10 @@ class EvaluationTests(unittest.TestCase):
         mu_b, _ = self.model.vae.encoder(b)
         head = self.model.coverage_head
         assert head is not None
-        loss = (head(mu_a, mu_b) - torch.tensor([0.2, 0.8])).square().mean()
+        overlap_head = self.model.overlap_head
+        assert overlap_head is not None
+        overlap_loss = (overlap_head(mu_a, mu_b) - torch.tensor([0.2, 0.8])).square().mean()
+        loss = (head(mu_a, mu_b) - torch.tensor([0.2, 0.8])).square().mean() + overlap_loss
         loss.backward()
         self.optimizer.step()
         row: dict[str, object] = dict.fromkeys(STEP_FIELDS, "")
@@ -103,6 +111,7 @@ class EvaluationTests(unittest.TestCase):
             "logical_step": 1, "completed_pairs": 12, "cumulative_exposure": 12,
             "run_id": "run-1", "arm": "S3", "seed": 3, "epoch": 1,
             "batch_index": 1, "valid_coverage": 2, "coverage_loss": loss.item(),
+            "overlap_loss": overlap_loss.item(),
         })
         self.journal.append(row)
         self.path = self.root / "checkpoint.pt"
@@ -121,7 +130,7 @@ class EvaluationTests(unittest.TestCase):
             "journal": {"event_id": "event-1", "logical_step": 1, "cumulative_exposure": 12},
         }, self.path)
 
-    def evaluate(self, *, pair_head=True):
+    def evaluate(self, *, pair_head=True, overlap=False):
         with patch("scripts.streamed_overlap_evaluation.load_manifest", return_value=self.manifest), \
              patch("scripts.streamed_overlap_evaluation.open_validation_sources", return_value=self.groups), \
              patch("scripts.streamed_overlap_evaluation.fresh_e1_model", side_effect=toy_factory):
@@ -129,8 +138,56 @@ class EvaluationTests(unittest.TestCase):
                 self.path, self.journal, self.root / "manifest.json", self.root,
                 device="cpu", inference_seed=7, encode_batch_size=11, max_wall_seconds=60,
                 random_seed=3, random_repeats=3, bootstrap_seed=4, bootstrap_repeats=10,
-                score_pair_head=pair_head,
+                score_pair_head=pair_head, score_overlap=overlap,
             )
+
+    def test_overlap_scoring_is_bound_to_trained_head_and_frozen_windows(self):
+        result = self.evaluate(overlap=True)
+        diagnostics = result["physical_overlap_diagnostics"]
+        self.assertEqual(len(diagnostics["pairs"]), 2000)
+        self.assertEqual(diagnostics["categories"]["same_overlap"]["count"], 600)
+        self.assertEqual(diagnostics["constant_baseline"], 0)
+        self.assertIn("Pearson correlation", diagnostics["waveform_protocol"])
+        self.assertAlmostEqual(diagnostics["pairs"][0]["waveform"], 1.0)
+        head = self.model.overlap_head
+        assert head is not None
+        for parameter in head.parameters():
+            self.optimizer.state[parameter]["exp_avg_sq"].zero_()
+        self.save()
+        with self.assertRaisesRegex(ValueError, "no recorded nonzero gradients"):
+            self.evaluate(overlap=True)
+
+    def test_overlap_scoring_rejects_untrained_head_and_constant_waveform(self):
+        self.optimizer = build_optimizer(self.model)
+        self.save()
+        with self.assertRaisesRegex(ValueError, "not received"):
+            self.evaluate(pair_head=False, overlap=True)
+        head = self.model.overlap_head
+        assert head is not None
+        inputs = torch.arange(40, dtype=torch.float32).reshape(2, 1, 2, 2, 5) / 40
+        a, _ = self.model.vae.encoder(inputs)
+        b, _ = self.model.vae.encoder(torch.flip(inputs, dims=[-1]))
+        (head(a, b) - torch.tensor([0.2, 0.8])).square().mean().backward()
+        self.optimizer.step()
+        self.save()
+        with patch("scripts.streamed_overlap_evaluation._read_original",
+                   return_value=np.zeros((2, 2, 5), dtype=np.float32)):
+            with self.assertRaisesRegex(ValueError, "nonconstant original windows"):
+                self.evaluate(pair_head=False, overlap=True)
+
+    def test_overlap_diagnostic_time_is_included_in_evaluation_deadline(self):
+        clock = {"expired": False}
+
+        def summarize(*args, **kwargs):
+            result = physical_overlap_diagnostics(*args, **kwargs)
+            clock["expired"] = True
+            return result
+
+        with patch("scripts.streamed_overlap_evaluation.time",
+                   SimpleNamespace(monotonic=lambda: 61.0 if clock["expired"] else 0.0)), \
+             patch("scripts.streamed_overlap_evaluation.physical_overlap_diagnostics", side_effect=summarize):
+            with self.assertRaisesRegex(TimeoutError, "wall-time limit"):
+                self.evaluate(overlap=True)
 
     def test_scoring_verifies_inputs_and_records_checkpoint_and_scorers(self):
         rng = torch.get_rng_state().clone()

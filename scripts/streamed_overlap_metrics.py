@@ -268,6 +268,75 @@ def event_coverage_diagnostics(manifest: dict, predictions: dict[str, dict[int, 
     }
 
 
+def physical_overlap_diagnostics(
+    manifest: dict, predictions: dict[str, dict[int, float]], *,
+    constant: float, waveform_predictions: dict[str, dict[int, float]],
+) -> dict:
+    """Compare numeric overlap predictions against fixed constant and waveform baselines."""
+    queries = _eligible_queries(manifest)
+    if (isinstance(constant, bool) or not isinstance(constant, Real)
+            or not math.isfinite(constant) or not 0 <= float(constant) <= 1):
+        raise ValueError("The fixed constant overlap baseline must be finite and in [0, 1].")
+    expected_queries = {query["id"] for query in queries}
+    if set(predictions) != expected_queries or set(waveform_predictions) != expected_queries:
+        raise ValueError("Overlap predictions and waveform baseline must cover exactly the eligible queries.")
+    rows = []
+    for query in queries:
+        ids = {candidate["id"] for candidate in query["candidates"]}
+        supplied = (predictions[query["id"]], waveform_predictions[query["id"]])
+        if any(not isinstance(values, dict) or set(values) != ids
+               or any(isinstance(key, bool) or not isinstance(key, int) for key in values)
+               for values in supplied):
+            raise ValueError("Overlap predictions and waveform baseline must match the candidate IDs.")
+        for candidate in query["candidates"]:
+            target = candidate["target"].get("overlap")
+            value = supplied[0][candidate["id"]]
+            waveform = supplied[1][candidate["id"]]
+            if any(isinstance(number, bool) or not isinstance(number, Real)
+                   or not math.isfinite(number) or not 0 <= float(number) <= 1
+                   for number in (target, value, waveform)):
+                raise ValueError("Overlap targets and predictions must be known finite values in [0, 1].")
+            if candidate["category"] in {"same_disjoint", "cross_source"} and target != 0:
+                raise ValueError("Disjoint and cross-source pairs must have zero physical overlap.")
+            rows.append({
+                "query_id": query["id"], "candidate_id": candidate["id"],
+                "source_id": query["window"]["source_id"], "cohort": query["cohort"],
+                "category": candidate["category"], "target": float(target),
+                "prediction": float(value), "constant": float(constant), "waveform": float(waveform),
+            })
+
+    def summarize(selected):
+        if not selected:
+            return {"count": 0, "unavailable_reason": "no pairs in eligible queries"}
+        metrics = {}
+        for name in ("prediction", "constant", "waveform"):
+            errors = np.asarray([row[name] - row["target"] for row in selected], dtype=np.float64)
+            metrics[name] = {
+                "mae": float(np.mean(np.abs(errors))),
+                "rmse": float(np.sqrt(np.mean(errors**2))), "bias": float(np.mean(errors)),
+            }
+        return {"count": len(selected), "metrics": metrics}
+
+    categories = {
+        category: summarize([row for row in rows if row["category"] == category])
+        for category in ("same_overlap", "same_disjoint", "cross_source")
+    }
+    edges = (0.0, 0.25, 0.5, 0.75, 1.0)
+    bins = {
+        f"{low:g}-{high:g}": summarize([
+            row for row in rows if low <= row["target"] < high
+            or (high == 1.0 and row["target"] == 1.0)
+        ])
+        for low, high in zip(edges, edges[1:])
+    }
+    return {
+        "manifest_sha256": manifest["manifest_sha256"], "pairs": rows, "categories": categories,
+        "overlap_bins": bins, "constant_baseline": float(constant),
+        "bin_rule": "[low, high), except the final bin includes 1",
+        "limitation": "Numeric predictions only; scorer identity, waveform protocol and head training require verification.",
+    }
+
+
 def paired_source_bootstrap(rows: tuple[QueryRanking, ...], differences, *, seed: int, repeats: int) -> tuple[float, float]:
     if (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
             or isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 2):

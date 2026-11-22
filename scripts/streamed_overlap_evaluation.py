@@ -20,7 +20,8 @@ from scripts.streamed_overlap_integrity import (
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _sync_directory
 from scripts.streamed_overlap_manifest import _window
 from scripts.streamed_overlap_metrics import (
-    _eligible_queries, calculate_rankings, event_coverage_diagnostics, linear_ndcg_at_10, summarize_rankings,
+    _eligible_queries, calculate_rankings, event_coverage_diagnostics, linear_ndcg_at_10,
+    physical_overlap_diagnostics, summarize_rankings,
 )
 from scripts.streamed_overlap_model import build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_targets import _read_bounded
@@ -88,26 +89,24 @@ def _identity(state: dict, digest: str, journal: BatchJournal, manifest_hash: st
     }
 
 
-def _require_trained_coverage(state: dict, model, journal: BatchJournal, identity: dict) -> None:
-    if identity["arm"] != "S3" or model.coverage_head is None:
-        raise ValueError("Directional scoring requires a trained S3 coverage head.")
+def _require_trained_head(state: dict, head, journal: BatchJournal, identity: dict, name: str) -> None:
     training = state.get("training")
     optimizer = training.get("optimizer") if isinstance(training, dict) else None
     if not isinstance(optimizer, dict) or not isinstance(optimizer.get("param_groups"), list):
-        raise ValueError("Directional scoring requires saved coverage optimizer state.")
-    groups = [group for group in optimizer["param_groups"] if group.get("name") == "coverage"]
-    expected = list(model.coverage_head.parameters())
+        raise ValueError(f"{name.capitalize()} scoring requires saved optimizer state.")
+    groups = [group for group in optimizer["param_groups"] if group.get("name") == name]
+    expected = list(head.parameters())
     slots = optimizer.get("state")
     if (len(groups) != 1 or not isinstance(slots, dict)
             or not isinstance(groups[0].get("params"), list)
             or len(groups[0]["params"]) != len(expected)
             or len(set(groups[0]["params"])) != len(expected)):
-        raise ValueError("Coverage optimizer state does not match the enabled head.")
+        raise ValueError(f"{name.capitalize()} optimizer state does not match the enabled head.")
     has_nonzero_gradient = False
     for parameter_id, parameter in zip(groups[0]["params"], expected):
         slot = slots.get(parameter_id)
         if not isinstance(slot, dict):
-            raise ValueError("Coverage head has not received an optimizer update.")
+            raise ValueError(f"{name.capitalize()} head has not received an optimizer update.")
         step = slot.get("step")
         if (not isinstance(step, torch.Tensor) or step.numel() != 1
                 or not math.isfinite(float(step.item())) or not 1 <= step.item() <= identity["step"]
@@ -115,23 +114,35 @@ def _require_trained_coverage(state: dict, model, journal: BatchJournal, identit
                 or any(not isinstance(slot.get(name), torch.Tensor)
                        or slot[name].shape != parameter.shape or not torch.isfinite(slot[name]).all()
                        for name in ("exp_avg", "exp_avg_sq"))):
-            raise ValueError("Coverage head has not received a valid optimizer update.")
+            raise ValueError(f"{name.capitalize()} head has not received a valid optimizer update.")
         if torch.any(slot["exp_avg_sq"] < 0):
-            raise ValueError("Coverage optimizer variance is invalid.")
+            raise ValueError(f"{name.capitalize()} optimizer variance is invalid.")
         has_nonzero_gradient |= bool(torch.any(slot["exp_avg_sq"] > 0).item())
     if not has_nonzero_gradient:
-        raise ValueError("Coverage head has no recorded nonzero gradients.")
+        raise ValueError(f"{name.capitalize()} head has no recorded nonzero gradients.")
     cutoff = next(index for index, row in enumerate(journal.rows)
                   if row["event_id"] == identity["journal_event_id"])
     stale = {event for record in journal._records() for event in record.get("uncommitted_event_ids", [])}
     valid_rows = [
         row for row in journal.rows[:cutoff + 1]
-        if row["event_id"] not in stale and row["valid_coverage"].isdigit()
-        and int(row["valid_coverage"]) > 0 and row["coverage_loss"]
+        if row["event_id"] not in stale and row[f"{name}_loss"]
+        and (name != "coverage" or (row["valid_coverage"].isdigit() and int(row["valid_coverage"]) > 0))
     ]
-    if not valid_rows or any(not math.isfinite(float(row["coverage_loss"]))
-                             or float(row["coverage_loss"]) < 0 for row in valid_rows):
-        raise ValueError("No committed valid coverage update is recorded for the head.")
+    if not valid_rows or any(not math.isfinite(float(row[f"{name}_loss"]))
+                             or float(row[f"{name}_loss"]) < 0 for row in valid_rows):
+        raise ValueError(f"No committed valid {name} update is recorded for the head.")
+
+
+def _require_trained_coverage(state: dict, model, journal: BatchJournal, identity: dict) -> None:
+    if identity["arm"] != "S3" or model.coverage_head is None:
+        raise ValueError("Directional scoring requires a trained S3 coverage head.")
+    _require_trained_head(state, model.coverage_head, journal, identity, "coverage")
+
+
+def _require_trained_overlap(state: dict, model, journal: BatchJournal, identity: dict) -> None:
+    if identity["arm"] not in {"S2", "S3"} or model.overlap_head is None:
+        raise ValueError("Physical overlap scoring requires an enabled trained head.")
+    _require_trained_head(state, model.overlap_head, journal, identity, "overlap")
 
 
 def _read_original(window_data: dict, groups: dict, fingerprints: dict, patch_shape: tuple[int, ...]) -> np.ndarray:
@@ -149,20 +160,21 @@ def _read_original(window_data: dict, groups: dict, fingerprints: dict, patch_sh
     return original
 
 
-def _read_input(window_data: dict, groups: dict, fingerprints: dict, patch_shape: tuple[int, ...]) -> np.ndarray:
-    return preprocess_for_token(_read_original(window_data, groups, fingerprints, patch_shape))
-
-
-def _query_scores(model, query, groups, fingerprints, device, encode_batch_size, deadline, score_pair_head):
+def _query_scores(model, query, groups, fingerprints, device, encode_batch_size, deadline, score_pair_head,
+                  score_overlap=False):
     windows = [query["window"], *(candidate["window"] for candidate in query["candidates"])]
     latents = []
+    originals = []
     for offset in range(0, len(windows), encode_batch_size):
         if time.monotonic() > deadline:
             raise TimeoutError("Evaluation wall-time limit exceeded; no partial report is valid.")
-        cubes = np.stack([
-            _read_input(window, groups, fingerprints, model.vae.patch_shape)
+        batch_originals = [
+            _read_original(window, groups, fingerprints, model.vae.patch_shape)
             for window in windows[offset:offset + encode_batch_size]
-        ])
+        ]
+        if score_overlap:
+            originals.extend(batch_originals)
+        cubes = np.stack([preprocess_for_token(cube) for cube in batch_originals])
         inputs = torch.from_numpy(cubes[:, None]).to(device)
         mu, _ = model.vae.encoder(inputs)
         if mu.ndim != 2 or mu.shape[0] != len(cubes) or not torch.isfinite(mu).all():
@@ -177,7 +189,20 @@ def _query_scores(model, query, groups, fingerprints, device, encode_batch_size,
         if head is None:
             raise ValueError("Trained coverage head is unavailable.")
         pair_scores = head(mu[:1].expand(len(mu) - 1, -1), mu[1:]).cpu().tolist()
-    return cosine, pair_scores
+    overlap_scores = waveform = None
+    if score_overlap:
+        head = model.overlap_head
+        if head is None:
+            raise ValueError("Trained overlap head is unavailable.")
+        overlap_scores = head(mu[:1].expand(len(mu) - 1, -1), mu[1:]).cpu().tolist()
+        vectors = [np.asarray(cube, dtype=np.float64).ravel() for cube in originals]
+        centered = [vector - vector.mean() for vector in vectors]
+        norms = [np.linalg.norm(vector) for vector in centered]
+        if any(not math.isfinite(float(norm)) or norm == 0 for norm in norms):
+            raise ValueError("Waveform baseline requires finite nonconstant original windows.")
+        waveform = [float((np.clip(np.dot(centered[0], candidate) / (norms[0] * norm), -1, 1) + 1) / 2)
+                    for candidate, norm in zip(centered[1:], norms[1:])]
+    return cosine, pair_scores, overlap_scores, waveform
 
 
 class StreamedEpochValidator:
@@ -241,7 +266,7 @@ class StreamedEpochValidator:
         device = next(iter(devices))
         rankings = []
         for query in queries:
-            cosine, _ = _query_scores(
+            cosine, _, _, _ = _query_scores(
                 model, query, groups, fingerprints, device, self.encode_batch_size, deadline, False,
             )
             candidates = query["candidates"]
@@ -335,13 +360,13 @@ def evaluate_checkpoint(
     checkpoint_path: Path, journal: BatchJournal, manifest_path: Path, source_root: Path, *,
     device: str, inference_seed: int, encode_batch_size: int, max_wall_seconds: float,
     random_seed: int, random_repeats: int, bootstrap_seed: int, bootstrap_repeats: int,
-    score_pair_head: bool,
+    score_pair_head: bool, score_overlap: bool = False,
 ) -> dict:
     """Score only a completed checkpoint against its verified frozen validation inputs."""
     if (isinstance(encode_batch_size, bool) or not isinstance(encode_batch_size, int) or encode_batch_size < 1
             or isinstance(max_wall_seconds, bool) or not isinstance(max_wall_seconds, (int, float))
             or not math.isfinite(max_wall_seconds) or max_wall_seconds <= 0
-            or not isinstance(score_pair_head, bool)):
+            or not isinstance(score_pair_head, bool) or not isinstance(score_overlap, bool)):
         raise ValueError("Explicit positive evaluation batch size and wall-time limit are required.")
     if (any(isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in (inference_seed, random_seed, bootstrap_seed))
@@ -358,6 +383,8 @@ def evaluate_checkpoint(
     model.load_state_dict(state["model"], strict=True)
     if score_pair_head:
         _require_trained_coverage(state, model, journal, identity)
+    if score_overlap:
+        _require_trained_overlap(state, model, journal, identity)
     # Validate that the checkpoint optimizer uses this architecture's parameter groups.
     expected_groups = build_optimizer(model).state_dict()["param_groups"]
     saved_optimizer = state.get("training", {}).get("optimizer", {})
@@ -371,12 +398,12 @@ def evaluate_checkpoint(
     groups = open_validation_sources(source_root.resolve(strict=True), manifest)
     verification = verify_inputs(manifest, groups)
     fingerprints = manifest["input_integrity"]["fingerprints"]["windows"]
-    scores = {"mu_cosine": {}, "pair_head": {}}
+    scores = {"mu_cosine": {}, "pair_head": {}, "overlap": {}, "waveform": {}}
     with streamed_inference_context(model, actual_device, inference_seed):
         for query in queries:
-            cosine, prediction = _query_scores(
+            cosine, prediction, overlap, waveform = _query_scores(
                 model, query, groups, fingerprints, actual_device, encode_batch_size,
-                started + max_wall_seconds, score_pair_head,
+                started + max_wall_seconds, score_pair_head, score_overlap,
             )
             candidates = query["candidates"]
             scores["mu_cosine"][query["id"]] = dict(zip((item["id"] for item in candidates), cosine))
@@ -384,6 +411,11 @@ def evaluate_checkpoint(
                 if prediction is None:
                     raise ValueError("Directional coverage scores are unavailable.")
                 scores["pair_head"][query["id"]] = dict(zip((item["id"] for item in candidates), prediction))
+            if score_overlap:
+                if overlap is None or waveform is None:
+                    raise ValueError("Physical overlap or waveform scores are unavailable.")
+                scores["overlap"][query["id"]] = dict(zip((item["id"] for item in candidates), overlap))
+                scores["waveform"][query["id"]] = dict(zip((item["id"] for item in candidates), waveform))
     reports = {}
     for scorer in ("mu_cosine", "pair_head") if score_pair_head else ("mu_cosine",):
         ranking = calculate_rankings(
@@ -397,12 +429,24 @@ def evaluate_checkpoint(
         }
         if scorer == "pair_head":
             reports[scorer]["event_coverage_diagnostics"] = event_coverage_diagnostics(manifest, scores[scorer])
-    if time.monotonic() - started > max_wall_seconds:
+    overlap_report = None
+    if score_overlap:
+        overlap_report = physical_overlap_diagnostics(
+            manifest, scores["overlap"], constant=0.0, waveform_predictions=scores["waveform"],
+        )
+        overlap_report["waveform_protocol"] = (
+            "Mean-centered Pearson correlation of original same-index XYZ windows, mapped from [-1, 1] to [0, 1]."
+        )
+    elapsed = time.monotonic() - started
+    if elapsed > max_wall_seconds:
         raise TimeoutError("Evaluation wall-time limit exceeded; no partial report is valid.")
-    return {
+    result = {
         "schema": "streamed-retrieval-evaluation-v1", "checkpoint": identity,
         "input_verification": verification, "scorers": reports, "inference_seed": inference_seed,
         "encode_batch_size": encode_batch_size, "max_wall_seconds": max_wall_seconds,
-        "elapsed_seconds": time.monotonic() - started,
+        "elapsed_seconds": elapsed,
         "limitation": "Retrieval metrics do not establish reconstruction guardrails or adoption.",
     }
+    if overlap_report is not None:
+        result["physical_overlap_diagnostics"] = overlap_report
+    return result

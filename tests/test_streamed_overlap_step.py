@@ -3,6 +3,7 @@ import unittest
 import random
 import csv
 import hashlib
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -297,7 +298,7 @@ class StreamedStepTests(unittest.TestCase):
         self.assertTrue(model.training)
         self.assertTrue(torch.equal(rng, torch.get_rng_state()))
 
-    def test_epoch_validation_logging_checkpoint_and_failed_epoch_replay(self):
+    def _epoch_validation_logging_checkpoint_and_failed_epoch_replay(self, device):
         class Writer:
             def __init__(self):
                 self.events = []
@@ -336,7 +337,7 @@ class StreamedStepTests(unittest.TestCase):
         def components():
             model = StreamedPairVAE(
                 VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8), encoder_arch="residual"), "S3",
-            )
+            ).to(device)
             optimizer = build_optimizer(model)
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=6, factor=0.5, min_lr=1e-5)
             return model, optimizer, scheduler
@@ -386,7 +387,7 @@ class StreamedStepTests(unittest.TestCase):
             def run(model, optimizer, scheduler, sampler, journal, validator, selection_state=None):
                 return train_streamed_epoch(
                     model, optimizer, scheduler, sampler, journal,
-                    lpips_fn, "cpu", writer,
+                    lpips_fn, device, writer,
                     run_id="test", seed=1, epoch=1, batches_per_epoch=2, sparse_probability=0.5,
                     monitor_batches={"train": batch, "validation": validation},
                     monitor_seed=7, validation_seed=8, validate_epoch=validator,
@@ -469,6 +470,14 @@ class StreamedStepTests(unittest.TestCase):
             self.assertEqual(rows[-1]["real_test_mae"], "")
             self.assertEqual(torch.load(root / "last.pt", weights_only=True)["completed_epoch"], 1)
             self.assertTrue(any(event[0] == "validation/mu_cosine_ndcg10" for event in writer.events))
+
+    def test_epoch_validation_logging_checkpoint_and_failed_epoch_replay(self):
+        self._epoch_validation_logging_checkpoint_and_failed_epoch_replay("cpu")
+
+    @unittest.skipUnless(os.environ.get("STREAMED_MPS_SMOKE") == "1" and torch.backends.mps.is_available(),
+                         "explicit MPS smoke opt-in and MPS are required")
+    def test_synthetic_epoch_recovery_on_mps(self):
+        self._epoch_validation_logging_checkpoint_and_failed_epoch_replay("mps")
 
     def test_monitor_runs_every_100_steps_and_once_at_epoch_boundary(self):
         class Writer:

@@ -187,12 +187,14 @@ not establish channel-simulation seeds, exact generator worktrees, or complete
 independence. Thus this is a historical reconstruction control, not a certificate
 of current semantic-label validity or fully verified geological provenance.
 
-The approved historical reconstruction manifest was frozen at private checkpoint
-volume path `historical-reconstruction-guardrail-20261122-01/manifest.json`, hash
-`f6d776046c8c0339445d013df7ef89590ab3cad1867790d7b5dd32c9b724e246`.
+The approved historical reconstruction manifest was refreshed at private checkpoint
+volume path `historical-reconstruction-guardrail-20261122-04/manifest.json`, hash
+`c7cf3ca0b9fd0307f348821a4e0b160475cdfa88452312e237358f2c741ad719`.
 It fingerprints all 5,000 synthetic and 5,000 real inputs/targets with sampled
 tokenizer reconstruction on MPS, seed 20260926 and a fixed LPIPS implementation.
-Freezing took 30.33 seconds including startup and 835,305,472 bytes peak RSS.
+The evaluator implementation is fingerprinted, so its overlap-diagnostic change
+required this refreshed manifest; all patch fingerprints match the earlier `-01`
+manifest. Freezing took 27.27 seconds including startup and 836,321,280 bytes peak RSS.
 The historical P0b reconstruction-best checkpoint is seed-20260926 epoch 40,
 SHA-256 `090e6f14e9f68941b468a7189e22a7c2dfc41de8571efa7e9ccff5273c5f439b`;
 its retrieval reference is a different checkpoint. A matched streamed S1 reference
@@ -200,12 +202,13 @@ does not exist yet. The regenerated validation-v2 sources remain off limits unti
 the owner confirms completion and they are separately audited.
 
 The full P0b reference measurement was written privately as
-`historical-reconstruction-guardrail-20261122-01/p0b_measurement.json` (file SHA-256
-`81ec68fd95d665eeae21ec7052edc2217bcf49e4c6de55a1946c0a552d16ee0e`).
+`historical-reconstruction-guardrail-20261122-04/p0b_measurement.json` (file SHA-256
+`d8a2a60a879edf94dd0e7c2f9a9d1430227b30916df5bfcac6a3c57b6b6df3aa`).
 The matched protocol produced synthetic recipe total 0.4931984 and real MAE
 0.7100480 across all 10,000 patches. The producer's numeric/identity validation
 passed; this is a reference measurement, not an experiment result or adoption.
-It took 189.20 seconds including startup, 952,975,360 bytes peak RSS and
+All per-patch metrics exactly match the earlier `-01` reference. This measurement
+took 208.07 seconds including startup, 953,303,040 bytes peak RSS and
 93,143,040 bytes MPS driver allocation sampled afterward. The 0.5 MPS
 memory-fraction guard is not a full-training memory estimate.
 
@@ -215,7 +218,12 @@ target records it. The existing frozen primary manifest's 1,800 recorded fluid
 triples passed the diagnostic's numeric checks without scoring a model or rereading
 source cubes. Missing fluid fractions are explicitly unavailable. NTG,
 thin-layer and no-reservoir diagnostics still require separately fingerprinted
-inputs; physical-overlap error and constant/waveform baselines are not implemented.
+inputs. Opt-in checkpoint scoring can also report physical-overlap MAE, RMSE and
+bias by pair category and fixed overlap bins, against a zero constant and an explicit
+waveform baseline: original-window mean-centered Pearson correlation mapped to
+`[0, 1]`. Nonconstant windows and a journal/optimizer-verified trained S2/S3
+overlap head are required. These diagnostics are numeric only and do not establish
+retrieval performance or adoption.
 
 An opt-in checkpoint selector records immutable journal-linked selection events
 and publishes separate best-reconstruction and best-retrieval aliases for
@@ -230,6 +238,19 @@ probe confirmed file/directory fsync and atomic replacement.
 The independent-seed provenance check, remaining diagnostic reports, bounded
 tokenizer searches, full runner wiring and an optimizer/epoch/recovery MPS smoke remain.
 Keep launch modes blocked.
+The existing interrupted-checkpoint/replay fixture now also runs on MPS: it uses
+a small synthetic S3 model and synthetic pairs, exercises optimizer steps, epoch
+logging, an injected checkpoint failure and deterministic replay, and never opens
+source data. With explicit `STREAMED_MPS_SMOKE=1`, the MPS fixture took 10.08
+seconds including startup and 636,141,568 bytes peak RSS while the portable
+regression suite was also running. It is skipped without that opt-in. This is
+not the required full-size, real-data end-to-end MPS runner smoke or an approval
+to train.
+
+```sh
+STREAMED_MPS_SMOKE=1 .venv/bin/python -m pytest -q \
+  tests/test_streamed_overlap_step.py -k synthetic_epoch_recovery_on_mps
+```
 Fourteen synthetic evaluator, selection and guardrail tests used temporary files
 on the checkpoint volume and took 4.06 seconds and about 343 MiB peak RSS
 including startup. This is not a real-data runtime or memory estimate.
