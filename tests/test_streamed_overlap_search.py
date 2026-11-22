@@ -13,7 +13,7 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_integrity import _digest_array, _window_record
 from scripts.streamed_overlap_manifest import _window
 from scripts.streamed_overlap_search import (
-    PATCH_SHAPE, _search_results, freeze_search_manifest, run_bounded_searches, verify_search_manifest,
+    PATCH_SHAPE, _search_results, freeze_search_manifest, main, run_bounded_searches, verify_search_manifest,
 )
 from scripts.streamed_overlap_yield import SEISMIC_KEY
 from src.tokenizer.core.io_zarr import compute_padding
@@ -72,6 +72,63 @@ class BoundedSearchTests(unittest.TestCase):
         with patch("scripts.streamed_overlap_search._implementation_hashes", return_value={}):
             with self.assertRaisesRegex(ValueError, "frozen identity"):
                 verify_search_manifest(self.manifest, self.groups, frozen)
+
+    def test_freeze_command_publishes_verified_search_manifest_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            manifest, settings, output = root / "manifest.json", root / "settings.json", root / "search.json"
+            manifest.write_text("{}")
+            settings.write_text(json.dumps({"plans": self.plans, **self.settings}))
+            argv = ["search", "--source-root", str(source), "--manifest", str(manifest), "--settings", str(settings),
+                    "--output", str(output), "--max-bind-wall-seconds", "30"]
+            with patch("sys.argv", argv), \
+                 patch("scripts.streamed_overlap_search.load_manifest", return_value=self.manifest), \
+                 patch("scripts.streamed_overlap_search.open_validation_sources", return_value=self.groups), \
+                 patch("scripts.streamed_overlap_search.verify_inputs",
+                       return_value={"status": "VALIDATION_INPUTS_VERIFIED"}):
+                main()
+                frozen = json.loads(output.read_text())
+                verify_search_manifest(self.manifest, self.groups, frozen)
+                self.assertEqual(frozen["searches"][0]["query_id"], self.query["id"])
+                with self.assertRaises(FileExistsError):
+                    main()
+                self.assertEqual(json.loads(output.read_text()), frozen)
+
+    def test_freeze_command_rejects_changed_input_timeout_and_source_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            manifest, settings, output = root / "manifest.json", root / "settings.json", root / "search.json"
+            manifest.write_text("{}")
+            settings.write_text(json.dumps({"plans": self.plans, **self.settings}))
+            argv = ["search", "--source-root", str(source), "--manifest", str(manifest), "--settings", str(settings),
+                    "--output", str(output), "--max-bind-wall-seconds", "30"]
+            with patch("sys.argv", argv), \
+                 patch("scripts.streamed_overlap_search.open_validation_sources", return_value=self.groups), \
+                 patch("scripts.streamed_overlap_search.verify_inputs",
+                       return_value={"status": "VALIDATION_INPUTS_VERIFIED"}), \
+                 patch("scripts.streamed_overlap_search.load_manifest",
+                       side_effect=[self.manifest, {**self.manifest, "changed": True}]):
+                with self.assertRaisesRegex(ValueError, "changed during"):
+                    main()
+                self.assertFalse(output.exists())
+            with patch("sys.argv", argv), \
+                 patch("scripts.streamed_overlap_search.load_manifest", return_value=self.manifest), \
+                 patch("scripts.streamed_overlap_search.open_validation_sources", return_value=self.groups), \
+                 patch("scripts.streamed_overlap_search.verify_inputs",
+                       return_value={"status": "VALIDATION_INPUTS_VERIFIED"}), \
+                 patch("scripts.streamed_overlap_search.time.monotonic", side_effect=[0, 31]):
+                with self.assertRaisesRegex(TimeoutError, "no manifest was written"):
+                    main()
+                self.assertFalse(output.exists())
+            argv[argv.index(str(output))] = str(source / "search.json")
+            with patch("sys.argv", argv):
+                with self.assertRaisesRegex(ValueError, "remain separate"):
+                    main()
+                self.assertFalse((source / "search.json").exists())
 
     def write_results(self, scores: Path, output: Path):
         padding = compute_padding(PATCH_SHAPE, patch_size=PATCH_SHAPE, base_pad=16)

@@ -8,7 +8,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import time
-from typing import Callable
+from typing import BinaryIO, Callable
 import uuid
 
 import numpy as np
@@ -1035,7 +1035,11 @@ def _bind_suite_inputs(suite_dir: Path, record: dict, *, resume: bool) -> None:
             raise ValueError("Saved suite inputs differ from the requested configuration.")
     else:
         data = (json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
-        _publish_exclusive(path, lambda handle: handle.write(data))
+
+        def write(handle: BinaryIO) -> None:
+            handle.write(data)
+
+        _publish_exclusive(path, write)
 
 
 def _suite_cosine_comparisons(results: dict, initialization: SuiteInitialization, manifest: dict,
@@ -1283,6 +1287,8 @@ def run_suite(
             or destination.is_relative_to(source) or source.is_relative_to(destination)):
         raise ValueError("Suite and source paths must be separate and outside validation-v2.")
 
+    if not isinstance(validate_epoch, StreamedEpochValidator):
+        raise ValueError("A frozen epoch validator is required to describe suite inputs.")
     record = suite_input_record(
         suite_dir, validate_epoch=validate_epoch, manifest_path=manifest_path, source_root=source_root,
         search_manifest=search_manifest, diagnostic_manifest=diagnostic_manifest, formal_config=formal_config,

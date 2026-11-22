@@ -1,5 +1,6 @@
 """Freeze and execute bounded, primary-validation tokenizer searches."""
 
+import argparse
 import hashlib
 import json
 import math
@@ -8,13 +9,17 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import BinaryIO
 
 import numpy as np
 import zarr
 
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_evaluation import export_tokenizer_checkpoint
-from scripts.streamed_overlap_integrity import _digest_array, _window_record, verify_inputs
+from scripts.streamed_overlap_integrity import (
+    _digest_array, _window_record, load_manifest, open_validation_sources, verify_inputs,
+)
+from scripts.streamed_overlap_journal import _publish_exclusive
 from scripts.streamed_overlap_manifest import _window
 from scripts.streamed_overlap_metrics import _eligible_queries
 from scripts.streamed_overlap_targets import MAX_READ_BYTES, Window, _read_bounded, _supported
@@ -274,3 +279,66 @@ def run_bounded_searches(
         "elapsed_seconds": time.monotonic() - started,
         "limitation": "Bounded tokenizer search is not pair-head retrieval or an adoption decision.",
     }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Freeze explicit bounded primary-validation tokenizer searches.")
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--settings", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--max-bind-wall-seconds", type=float, required=True)
+    args = parser.parse_args()
+    if not math.isfinite(args.max_bind_wall_seconds) or args.max_bind_wall_seconds <= 0:
+        parser.error("--max-bind-wall-seconds must be positive and finite.")
+    forbidden = Path("/Volumes/CrucialX9/fake_data_validation_v2")
+    root = args.source_root.resolve(strict=True)
+    output = args.output.resolve()
+    if (not root.is_dir() or "fake_data_validation_v2" in args.source_root.parts
+            or "fake_data_validation_v2" in root.parts or forbidden.is_relative_to(root)
+            or "fake_data_validation_v2" in args.output.parts or "fake_data_validation_v2" in output.parts
+            or forbidden.is_relative_to(output) or output.is_relative_to(forbidden)
+            or output.is_relative_to(root) or root.is_relative_to(output)):
+        raise ValueError("Search inputs and output must exclude validation-v2 and remain separate.")
+    for path in (args.manifest, args.settings):
+        resolved = path.resolve(strict=True)
+        if ("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in resolved.parts
+                or resolved.is_relative_to(root) or not resolved.is_file()):
+            raise ValueError("Search settings and validation manifest must be files outside source data and validation-v2.")
+    if args.output.exists() or args.output.is_symlink():
+        raise FileExistsError("Refusing to overwrite an existing search manifest.")
+    settings = json.loads(args.settings.read_text(encoding="utf-8"))
+    keys = {"plans", "stride", "batch_size", "max_region_bytes", "max_windows", "max_wall_seconds",
+            "device", "mps_memory_fraction"}
+    if not isinstance(settings, dict) or set(settings) != keys:
+        raise ValueError("Explicit search plans and all bounded search settings are required.")
+    started = time.monotonic()
+    manifest = load_manifest(args.manifest)
+    groups = open_validation_sources(root, manifest)
+    verification = verify_inputs(manifest, groups)
+    if time.monotonic() - started > args.max_bind_wall_seconds:
+        raise TimeoutError("Search binding wall-time limit exceeded; no manifest was written.")
+    result = freeze_search_manifest(
+        manifest, groups, settings["plans"], **{key: settings[key] for key in keys if key != "plans"},
+    )
+    verify_search_manifest(manifest, groups, result)
+    if load_manifest(args.manifest) != manifest:
+        raise ValueError("Validation manifest changed during search binding.")
+    open_validation_sources(root, manifest)
+    if time.monotonic() - started > args.max_bind_wall_seconds:
+        raise TimeoutError("Search binding wall-time limit exceeded; no manifest was written.")
+    data = (json.dumps(result, indent=2, allow_nan=False) + "\n").encode()
+
+    def write(handle: BinaryIO) -> None:
+        handle.write(data)
+
+    _publish_exclusive(args.output, write)
+    print(json.dumps({
+        "status": "BOUNDED_SEARCHES_BOUND", "search_manifest_sha256": result["search_manifest_sha256"],
+        "searches": len(result["searches"]), "input_verification": verification,
+        "limitation": "Validation-only input binding; not training readiness or geological understanding.",
+    }), flush=True)
+
+
+if __name__ == "__main__":
+    main()

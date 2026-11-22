@@ -4,6 +4,35 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The bounded tokenizer-search manifest can now be frozen from an explicit private
+settings file, without model inference or training:
+
+```sh
+.venv/bin/python -u -m scripts.streamed_overlap_search \
+  --source-root <primary-source-root> --manifest <bound-validation-manifest.json> \
+  --settings <private-search-settings.json> --output <new-private-search-manifest.json> \
+  --max-bind-wall-seconds <binding-limit>
+```
+
+The settings JSON must contain `plans` (a list of objects with `query_id`,
+`region_origin` and `region_shape`) and explicit `stride`, `batch_size`,
+`max_region_bytes`, `max_windows`, `max_wall_seconds`, `device` and
+`mps_memory_fraction`. Its `max_wall_seconds` is the later search-run limit;
+the separate command-line limit applies to binding. Select and freeze queries,
+regions and budgets before seeing model results. The command rechecks the
+primary validation fingerprints and source inventory, verifies the bounded
+regions and writes only a new manifest outside the source root. The binding
+wall limit rejects late results but does not interrupt an individual read or
+the full fingerprint check. It excludes validation-v2 and does not authorize
+training. Search manifests made with an older search implementation must be
+regenerated because the implementation fingerprint includes this script.
+The search, diagnostic, epoch and suite-initialization fixture tests passed 74
+tests and 27 subtests using `.venv/bin/python -m pytest -q
+tests/test_streamed_overlap_search.py tests/test_streamed_overlap_diagnostics.py
+tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_initialization.py`
+in 32.19 seconds. The command was not run on real data; the fixture mocks the
+validation inventory and full-input verification. No settings were selected.
+
 `run_suite` now binds and saves its resolved suite inputs before initializing an
 arm. The record includes the matching and evaluation settings, frozen manifests,
 historical-reference identities, resolved input/output paths and non-config
