@@ -723,8 +723,10 @@ def run_audit(config: dict, output: Path) -> dict:
             "directional_event_coverage": {
                 "reference": "A",
                 "detector": (
-                    "Strict Z-axis local maxima/minima: each sample is compared with "
-                    "the immediately shallower and deeper sample; no prominence threshold."
+                    "Apply scipy.ndimage.uniform_filter1d(size=5, axis=2, "
+                    "mode='nearest'), then blend 0.2 * original + 0.8 * filtered. "
+                    "Detect strict Z-axis local maxima/minima by comparing each sample "
+                    "with its immediately shallower and deeper sample; no prominence threshold."
                 ),
                 "event_indices": (
                     "Use center=volume[:,:,1:-1], compare with volume[:,:,:-2] and "
@@ -755,6 +757,11 @@ def run_audit(config: dict, output: Path) -> dict:
                     "geologic_age_faulted indices 1500:1510 and do not apply a global "
                     "correlation-derived Z shift."
                 ),
+                "depth_shape_policy": (
+                    "Do not require equal source Z dimensions. Use fully supported "
+                    "same-index windows; mark missing full support unavailable rather "
+                    "than padding, clipping, or shifting arrays."
+                ),
                 "zero_target_pairs": [
                     "Same-source windows with no 3D intersection.",
                     "Windows from different source volumes.",
@@ -772,15 +779,22 @@ def run_audit(config: dict, output: Path) -> dict:
                     "ranges and bandwidth_ord in its matched model_config JSON."
                 ),
                 "source_noise_snr": (
-                    "Record sn_db from the source text file and compare it with the "
-                    "JSON signal_to_noise_ratio_db range; do not use source sn_db as "
-                    "the independent augmentation SNR."
+                    "Record sn_db as noise already present in the stored source and "
+                    "compare it with the JSON signal_to_noise_ratio_db range; do not "
+                    "use source sn_db as the independent augmentation SNR."
                 ),
                 "augmentation": (
-                    "Keep independent 12-30 dB noise at probability 0.5; use the "
+                    "Keep independent 12-60 dB noise at probability 0.5; use the "
                     "source-specific Butterworth band/order and pole-decay context."
                 ),
             },
+            "source_cohort_policy": (
+                "Use /Volumes/CrucialX9/fake_data train and validation as the primary "
+                "cohort. The owner reports these datasets were recreated; SHA/timestamps "
+                "are not unambiguous generation-history evidence. Keep "
+                "/Volumes/CrucialX9/fake_data_validation_v2 separate until regeneration "
+                "is complete and it receives its own audit."
+            ),
             "cross_volume_age_equivalence": False,
             "primary_retrieval_selection": "Directional pair-head ranking; report mu-cosine separately.",
             "training_progress_monitor": (
@@ -841,7 +855,7 @@ def run_audit(config: dict, output: Path) -> dict:
     write_json(output / "audit_report.json", summary)
     write_visual_report(output / "audit_examples.html", summary, config["seismic_key"])
     write_json(output / "target_contract.json", {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": PENDING,
         "approved": False,
         "manifest_sha256": summary["manifest_sha256"],

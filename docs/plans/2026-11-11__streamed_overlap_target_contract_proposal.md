@@ -15,11 +15,19 @@ pair head. The [governing execution plan](2026-11-08__streamed_overlap_and_seman
 records the current event ratio, zero-target cases and window-level fluid formula.
 Any older statements below about equal-weight layers, cross-volume analog labels or
 an ongoing replacement are historical, not instructions for the new target. On
-November 22 the owner approved the strict adjacent-sample detector, native same-index
+November 22 the owner approved the smoothed strict adjacent-sample detector, native same-index
 label support, closure-mask fractions as a coarse operational fluid proxy despite
 unknown per-source generation-time worktrees, source-specific filter metadata, and the
 proposed evaluation success criteria. The executable target and yield checks remain
 to be implemented. The separate training-launch gate also remains closed.
+
+The owner reports that all datasets under `/Volumes/CrucialX9/fake_data` were
+recreated, but SHA values and timestamps do not unambiguously distinguish the initial
+and recreated outputs. Treat those fields as recorded metadata, not conclusive age or
+generation evidence. `/Volumes/CrucialX9/fake_data_validation_v2` is being regenerated;
+the existing validation cohort remains primary, and v2 is a separate optional cohort
+that must not be read, audited, or mixed until regeneration is complete. Audit it
+separately before considering it for any use.
 
 Revision: incorporates the owner's November 11 clarification of channel sand and
 closure geometry. The earlier recommendation to invalidate a whole semantic pair
@@ -407,7 +415,7 @@ fluid changes that preserve aggregate percentages, and the all-voxel denominator
 means the remainder is not an exhaustive physical brine label. On November 22 the
 owner approved closure masks as the operational proxy despite unknown per-source
 generation-time dirty-worktree provenance. Do not describe the target as physical
-fluid truth or infer brine from closure absence. The owner also approved strict
+fluid truth or infer brine from closure absence. The owner also approved smoothed strict
 adjacent-sample extrema, native same-index support excluding padding, source-specific
 filter metadata, and the evaluation success criteria below. Remaining implementation
 work is the streamed target, explicit invalid reasons, target-yield preflight and
@@ -415,14 +423,15 @@ frozen evaluation manifest/cohorts.
 
 ## 5. Noise and evaluation proposal
 
-Keep the approved added-noise SNR range 12-30 dB and independent A/B nuisance transforms.
+Keep the approved added-noise SNR range 12-60 dB and independent A/B nuisance transforms.
 For each source, use the actual `bandpass_bandlimits` in its text metadata, plus the
 matched JSON `bandwidth_low`/`bandwidth_high` ranges and `bandwidth_ord`. The 205
 inspected sources use 4 ms and order 4; actual cutoff pairs are inside the configured
 ranges (low 3.03-6.00 Hz; high 22.69-44.92 Hz). Reproduce the local generator's
 depth-only Butterworth/Gustafsson filter and pole-decay context without importing the
-neighboring checkout at training time. Record its `.txt` `sn_db`, but do not use it as
-an augmentation setting: 44/205 values fall outside JSON's source SNR range, while
+neighboring checkout at training time. The `.txt` `sn_db` describes noise already
+present in the stored source; do not use it as an augmentation setting: 44/205 values
+fall outside JSON's source SNR range, while
 filter settings remain valid. Non-finite or zero pre-noise RMS has undefined SNR and
 must get an explicit invalid reason.
 
@@ -501,23 +510,29 @@ used to generate any individual volume. Three earlier full-volume label scans di
 find channel/oil and channel/gas closure overlaps; those are positive examples, not
 an all-source audit.
 
-All stores record generator SHA
-`bd51313ebfb620800bb2973c2cea28f4b9325a15`; parameter/config file modification times
-range from November 16 through November 20 UTC. The recorded commit is available and
-an ancestor of the neighboring checkout's current `6ae391fe9f18a3af0293e60b781f32aeb81a430b`
-HEAD. The current checkout has an uncommitted 9,513-byte diff in `Faults.py` and
-`Seismic.py`; those files' modification times precede the observed source metadata
-times. This makes the dirty code a plausible generation-time context, not proof: per-run
-generation commands and dirty-worktree fingerprints were not stored. A local,
-observation-only fingerprint is preserved as
-`generator_checkout_observation.json` beside the audit output; it is not source-level
-provenance and must not be used to claim that any specific store came from that worktree.
+The audit snapshot records generator SHA
+`bd51313ebfb620800bb2973c2cea28f4b9325a15` for all stores; parameter/config file
+modification times range from November 16 through November 20 UTC. The recorded commit
+is available and an ancestor of the neighboring checkout's current
+`6ae391fe9f18a3af0293e60b781f32aeb81a430b` HEAD. The current checkout has an
+uncommitted 9,513-byte diff in `Faults.py` and `Seismic.py`; those files' modification
+times precede the observed source metadata times. This makes the dirty code a plausible
+generation-time context, not proof: per-run generation commands and dirty-worktree
+fingerprints were not stored. The owner confirms the current `fake_data` sources were
+recreated, but the available SHA/timestamp fields cannot establish which generation
+produced an individual source. A local, observation-only fingerprint is preserved
+beside the audit output; it is not source-level provenance and must not be used to
+claim that a specific store came from that worktree. The current inventory's uniform
+Z dimensions are observations, not a requirement for every source. The owner directs
+that differing deepest extents be ignored absent strong evidence of an alignment
+problem; use same-index supported windows, without global padding, clipping, or
+shifting, and mark windows unavailable when their full support is absent.
 
 The per-source `.txt` `bandpass_bandlimits` values all fall within their matched JSON
 `bandwidth_low`/`bandwidth_high` ranges. Across the 205 sources, low cutoffs are
 3.03-6.00 Hz, high cutoffs 22.69-44.92 Hz, sample spacing is 4 ms and filter order is
-4. The `.txt` `sn_db` is source-noise metadata, not a filter value or extra-noise
-augmentation setting; 44 values fall outside their JSON `signal_to_noise_ratio_db`
+4. The `.txt` `sn_db` describes noise already present in the stored source, not a
+filter value or extra-noise augmentation setting; 44 values fall outside their JSON `signal_to_noise_ratio_db`
 range and are retained as warnings: 37 in training and seven in validation. Actual
 filter metadata remains parseable for all 205 sources.
 
@@ -558,7 +573,10 @@ samples was 0.25 of interior density in training and 0.44 in validation; the pro
 not show an event-density spike at source ends. This is a small, deliberately bounded
 sensitivity sample, not ground truth or an estimate of final pair-target yield.
 
-The owner's selected detector is strict adjacent-sample extrema along Z, without
+The owner's selected detector first applies
+`scipy.ndimage.uniform_filter1d(size=5, axis=2, mode="nearest")` to each full seismic
+trace and blends the filtered and original values as `0.2 * original + 0.8 * filtered`.
+On that blended trace, detect strict adjacent-sample extrema along Z, without
 prominence or spacing thresholds. For each XY chunk, compare the center
 `volume[:,:,1:-1]` with its immediate shallower and deeper neighbors; use `np.where`
 for `center > both` peaks and `center < both` troughs, then add one to returned Z
@@ -568,12 +586,15 @@ events in A's shared XYZ support, and divide by events over A's full depth on th
 same shared-XY traces. The overlap boundary does not create extrema. Explicitly mark
 non-finite input or a zero full-depth denominator unavailable.
 
-The approved detector was checked on one full-depth `(50,50,Z)` chunk from each of
-12 training and 6 validation sources: 45,000 traces and about 269.8 MB read. No sampled
-trace had zero combined extrema. Peak-plus-trough counts per trace had train p10 /
-median / p90 of 219 / 253 / 286 and validation p10 / median / p90 of 210 / 249 / 289.
-Median densities were about 10.8 and 10.6 events per 64 samples. This bounded sample
-does not estimate final pair-target yield.
+The approved smoothed detector was checked on the same one full-depth `(50,50,Z)`
+chunk from each of 12 training and 6 validation sources: 45,000 traces and 269.82 MB
+requested. No sampled trace had zero combined extrema. Peak-plus-trough counts per
+trace had training p10 / median / p90 of 197 / 215 / 243 and validation p10 / median /
+p90 of 183.9 / 217 / 239. Median densities were about 9.18 and 9.26 events per 64
+samples. These replace the previous raw-detector counts, which are not applicable to
+the approved smoothed detector. This bounded sample does not estimate final
+pair-target yield. The updated private diagnostic is
+`local_extrema_smoothed_diagnostics.json` beside the 2026-11-22 audit output.
 
 ### Generator-derived index relationship
 
@@ -616,10 +637,11 @@ search boundary. Those estimates are not a reason to shift the approved native m
   (low 3.03-6.00 Hz, high 22.69-44.92 Hz), at 4 ms and order 4. The generator uses
   depth-only zero-phase Butterworth/Gustafsson filtering. Its pole-decay calculation
   gives per-source impulse-response lengths 446-853 samples (median 589; about
-  1.8-3.4 seconds). Keep the approved probability 0.5 and 12-30 dB augmentation SNR;
+  1.8-3.4 seconds). Keep the approved probability 0.5 and 12-60 dB augmentation SNR;
   generate independent noise after spatial transforms, use that source's exact band
   and order plus computed context, then scale to `10**(-SNR/20)` times pre-noise RMS.
-  Do not re-filter the seismic signal. The text `sn_db` is source-noise metadata, not
+  This gives RMS ratios of about 0.251 to 0.001. Do not re-filter the seismic signal.
+  The text `sn_db` describes noise already present in the stored source, not
   augmentation SNR; 44/205 values fall outside JSON's source SNR range, so record a
   warning without substituting it or rejecting otherwise valid filter metadata.
   Non-finite/zero RMS has undefined SNR and requires an explicit invalid reason.

@@ -265,18 +265,35 @@ class StreamedAuditTests(unittest.TestCase):
         self.assertEqual(content_hash(manifest), result["manifest_sha256"])
         contract = json.loads((output / "target_contract.json").read_text())
         self.assertFalse(contract["approved"])
-        self.assertEqual(contract["schema_version"], 5)
+        self.assertEqual(contract["schema_version"], 6)
         self.assertNotIn("approved_direction", contract)
         self.assertTrue(contract["label_policy"]["owner_approved_closure_fraction_proxy"])
         self.assertFalse(contract["label_policy"]["closure_values_are_final_seismic_fluid"])
         event_target = contract["owner_decisions"]["directional_event_coverage"]
         self.assertEqual(event_target["reference"], "A")
         self.assertTrue(event_target["computed_before_augmentation"])
-        self.assertIn("Strict Z-axis local maxima/minima", event_target["detector"])
+        self.assertIn("strict Z-axis local maxima/minima", event_target["detector"])
+        self.assertIn(
+            "uniform_filter1d(size=5, axis=2, mode='nearest')",
+            event_target["detector"],
+        )
+        self.assertIn("0.2 * original + 0.8 * filtered", event_target["detector"])
         self.assertIn("add one to returned k indices", event_target["event_indices"])
         self.assertIn("same-index", event_target["age_label_support"])
+        self.assertIn(
+            "Do not require equal source Z dimensions",
+            event_target["depth_shape_policy"],
+        )
         self.assertIn("different source volumes", " ".join(event_target["zero_target_pairs"]))
         self.assertIn("abs(oil_A-oil_B)", event_target["fluid_adjustment"])
+        self.assertIn(
+            "12-60 dB",
+            contract["owner_decisions"]["noise_and_filtering"]["augmentation"],
+        )
+        self.assertIn(
+            "fake_data_validation_v2",
+            contract["owner_decisions"]["source_cohort_policy"],
+        )
         self.assertNotIn("detector", " ".join(contract["unresolved"]).lower())
         self.assertTrue(contract["unresolved"])
         self.assertTrue((output / "audit_examples.html").is_file())

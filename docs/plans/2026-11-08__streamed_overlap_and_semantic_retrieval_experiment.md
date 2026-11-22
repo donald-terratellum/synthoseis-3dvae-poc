@@ -1,6 +1,6 @@
 # Streamed overlap and fluid-aware semantic retrieval: execution plan
 
-Updated: 2026-11-22, with the refreshed source inventory and the owner's revised observable-event target.
+Updated: 2026-11-22, with the refreshed source inventory and the owner's revised, smoothed observable-event target.
 
 ## 1. Authority, scope, and approval gates
 
@@ -33,14 +33,26 @@ operational proxy, with that provenance limitation recorded. Full results are in
 [target-contract proposal](2026-11-11__streamed_overlap_target_contract_proposal.md).
 No final-test crops were read.
 
-The owner has also approved the strict adjacent-sample Z-axis peak/trough detector,
+The owner reports that all datasets under `/Volumes/CrucialX9/fake_data` were
+recreated. SHA values and timestamps are inconclusive indicators of which generation
+produced a source, so do not use them alone to reject or classify sources. The owner is
+regenerating `/Volumes/CrucialX9/fake_data_validation_v2`; keep it separate from the
+current validation cohort and do not read, audit, or mix it until regeneration is
+complete. Audit it separately before considering it for any use. The current
+`/Volumes/CrucialX9/fake_data` train and validation sources remain the primary cohort.
+
+The owner has also approved a five-sample, nearest-edge depth smoother blended with
+the original seismic before strict adjacent-sample Z-axis peak/trough detection,
 same-index non-padded label support, per-source filter metadata rules, closure-proxy
 policy, and the proposed evaluation success criteria. A bounded diagnostic of 45,000
-full-depth traces from 12 training and 6 validation sources found no zero-event trace;
-the exact distribution and limits are in the proposal. These decisions are documented,
-but the streamed pair-target implementation, target-yield preflight and frozen
-evaluation manifest still need to be implemented and checked. Gate 1 remains closed
-until those steps pass; the separate training-launch gate also remains closed.
+full-depth traces from 12 training and 6 validation sources using the previous raw
+detector found no zero-event trace; its counts are historical and must not be used to
+characterize the smoothed detector. The updated smoothed-detector diagnostic scanned
+the same 45,000 traces and found no zero-event trace; p10/median/p90 event counts were
+197/215/243 for training and 184/217/239 for validation. The streamed pair-target
+implementation, target-yield preflight and frozen evaluation manifest still need to
+be implemented and checked. Gate 1 remains closed until those steps pass; the separate
+training-launch gate also remains closed.
 
 Proceed autonomously on the approved decisions below. Do not repeatedly ask about
 settled choices. Only stop for an unresolved scientific contract, failed safety or
@@ -128,10 +140,13 @@ Use the original, unaugmented dense seismic and canonical source coordinates:
   the directional target is zero. Different-source pairs also have target zero;
   numeric age values across independent volumes do not identify common horizons.
 - In the shared XY footprint, stream full-depth original A traces in XY chunks and
-  detect strict local maxima and minima along Z. A peak must be greater than both
-  adjacent samples; a trough must be less than both. Compare `volume[:,:,1:-1]`
-  with `volume[:,:,:-2]` and `volume[:,:,2:]`, then add one to each returned Z index.
-  Use no prominence threshold; the first and last Z samples are excluded naturally.
+  first apply `scipy.ndimage.uniform_filter1d` with `size=5`, `axis=2`, and
+  `mode="nearest"`. Blend the original and filtered values as
+  `0.2 * original + 0.8 * filtered`. Then detect strict local maxima and minima
+  along Z: a peak must be greater than both adjacent blended samples, and a trough
+  must be less than both. Compare `volume[:,:,1:-1]` with `volume[:,:,:-2]` and
+  `volume[:,:,2:]`, then add one to each returned Z index. Use no prominence threshold;
+  the first and last Z samples are excluded naturally.
   Sum events in A's shared XYZ region for the numerator, and sum events over the full
   A depth for those same traces for the denominator. A zero denominator for an
   overlapping pair is unavailable, with an explicit reason. The overlap boundary
@@ -139,9 +154,11 @@ Use the original, unaugmented dense seismic and canonical source coordinates:
 - In the shared XYZ region, average `geologic_age_faulted` at its shallowest and
   deepest Z indices, across the shared XY footprint. Use these two values as the
   age-range bounds. For each *full* A and B window, select voxels within this range
-  using native same-index support. The seismic's 1,499 samples correspond to the
-  first 1,499 native property/label indices; exclude padded label indices 1500:1510.
-  Do not apply a global correlation-derived +1/+2 Z shift.
+  using native same-index support wherever both arrays are available. Exclude known
+  padded label indices 1500:1510. Source volumes need not have identical Z lengths:
+  use only fully supported same-index windows and skip unsupported windows with an
+  explicit reason. Do not silently clip, pad, or shift arrays to force equal shapes,
+  and do not apply a global correlation-derived +1/+2 Z shift.
 - For each window, compute oil and gas fractions from `oil_closures > 0.5` and
   `gas_closures > 0.5`, divided by **all** selected voxels, not just sand. At voxels
   where both masks are positive, count one half toward each. Let `other = 1 - oil - gas`.
@@ -214,6 +231,19 @@ L = MAE_A + 0.1 * LPIPS_A + 0.001 * KL_A
     + 0.1 * MSE_semantic_on_valid_targets
 ```
 
+Train each arm end-to-end with one combined loss, one backward pass, and one optimizer
+step per batch. Do not detach or cache `mu_A`/`mu_B`, freeze the shared encoder, or
+precompute latents for downstream-head training. In S3, reconstruction and KL gradients
+flow through the VAE path, while overlap and semantic gradients flow through their
+heads and back through `mu_A`/`mu_B` into the same encoder; update the enabled heads
+and encoder together. The encoder's lower learning-rate multiplier is a slower update,
+not a freeze. This joint objective is the initial design; do not insert separate
+encoder/head training phases unless measured instability or validation evidence
+justifies proposing a revised schedule for approval.
+For each arm, compute fresh `mu_A` and `mu_B` from the current batch in the shared
+autograd graph. Add a synthetic gradient-flow test for every enabled objective,
+verifying nonzero gradients reach the shared encoder as well as that objective's head.
+
 Use current repository reconstruction/LPIPS/KL arithmetic, including voxel normalization
 of KL. Define valid semantic-loss reduction explicitly; log counts for each semantic
 task slice and invalid reason. Do not allow one validity category silently to dominate.
@@ -285,7 +315,7 @@ Apply independently to each view, with identical distributions across pair categ
 | Horizontal rotation about Z | Every view; uniform 0-360 degrees |
 | X flip, Y flip, X/Y swap | Each with probability 0.5 |
 | XYZ scaling | Every view; each axis independently uniform 0.9-1.1 |
-| Noise | Depth-only, probability 0.5; added-noise SNR uniform 12-30 dB |
+| Noise | Depth-only, probability 0.5; added-noise SNR uniform 12-60 dB |
 | Z flip, phase rotation, polarity reversal | Disabled |
 
 Crop sufficient real context for geometric transforms. Derive and test context bounds
@@ -317,16 +347,16 @@ but do not make the cloud trainer depend on importing that checkout. Persist exa
 per-source settings and reject missing, contradictory or Nyquist-invalid metadata;
 never substitute a global band or silently disable noise.
 
-The same `.txt` files' `sn_db` is the generator's source-noise SNR, not a filter
-parameter and not the extra-noise augmentation SNR. It falls outside its JSON
+The same `.txt` files' `sn_db` describes noise already present in the stored source,
+not a filter parameter or the extra-noise augmentation SNR. It falls outside its JSON
 `signal_to_noise_ratio_db` range in 44/205 inspected sources. Record that mismatch
 as provenance metadata/warning; do not reuse `sn_db` for augmentation or reject
 otherwise valid filter cutoffs solely for that warning. Do not read final-test seismic
 for training or selection.
 
 Added-noise RMS relative to pre-noise signal RMS is `10 ** (-SNR_dB/20)`:
-approximately 0.251 at 12 dB and 0.0316 at 30 dB. The old plan's 0.063 lower bound
-was incorrect. Normalize filtered noise to the requested RMS. A non-finite or zero
+approximately 0.251 at 12 dB and 0.001 at 60 dB. Normalize filtered noise to the
+requested RMS. A non-finite or zero
 pre-noise RMS has undefined SNR and must produce an explicit invalid reason rather
 than a silent fallback. Measure actual spectral/RMS behavior after filtering.
 
@@ -343,10 +373,13 @@ Candidate arrays:
 - `gas_closures`, `oil_closures`, `brine_closures`
 - `faults/faulted_channel_labels`
 
-An inspected synthetic seismic shape was `(300,300,1499)` while labels were
-`(300,300,1510)`. Verify the seismic-to-label mapping with existing generator/alignment
-evidence. The historical convention is seismic[z] to label[z+1]; length difference
-alone does not establish that mapping for every source/key.
+The refreshed audit observed seismic arrays `(300,300,1499)` and label arrays
+`(300,300,1510)`. The approved convention is native same-index support, excluding
+known padded label indices `1500:1510`; do not apply the historical `z+1` hypothesis.
+Different deepest Z extents are not by themselves evidence of a misalignment. Do not
+require equal Z shapes or pad/truncate arrays to match; use only fully supported
+same-index windows, and investigate only if there is strong evidence of an interior
+alignment problem.
 
 Observed float seismic chunks were `(50,50,1499)`, about 15 MB uncompressed each.
 Small streamed crops can decode multiple full-depth chunks. Bound decoded caches and
@@ -383,6 +416,8 @@ Run sequentially:
 S3 is not the old plan's z_geo arm; z_geo and spatial alignment are deferred experiments.
 S2-S1 isolates overlap; S3-S2 isolates added semantic supervision. There is no initial
 semantic-only arm, so do not claim to isolate semantic-only training.
+The arms are separate controlled comparisons, not phases within a run: do not train
+the encoder first and then freeze it for the pair heads.
 
 For S1-S3, use the same initialized VAE tensors, source stream, A/B transforms, encoder
 view mixture, reconstruction targets, optimizer rule and total A exposure for a given

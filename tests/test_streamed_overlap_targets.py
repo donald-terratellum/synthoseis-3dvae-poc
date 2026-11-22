@@ -8,6 +8,7 @@ import zarr
 from scripts.streamed_overlap_targets import (
     iter_zarr_local_extrema,
     local_extrema_indices,
+    _smooth_extrema_input,
 )
 
 
@@ -20,12 +21,28 @@ class LocalExtremaTests(unittest.TestCase):
         i, j, k = local_extrema_indices(cube)
         self.assertEqual(set(zip(i, j, k)), {
             (0, 0, 1), (0, 0, 2), (0, 0, 3), (0, 0, 4), (0, 0, 5),
-            (1, 0, 3), (1, 0, 4),
+            (1, 0, 2),
         })
+
+    def test_extrema_input_uses_weighted_five_sample_average_with_nearest_edges(self):
+        cube = np.array([[[0, 0, 4, 0, 0, 0, 5, 0, 0]]], dtype=np.float32)
+
+        smoothed = _smooth_extrema_input(cube)
+
+        np.testing.assert_allclose(
+            smoothed[0, 0],
+            [0.64, 0.64, 1.44, 0.64, 1.44, 0.8, 1.8, 0.8, 0.8],
+            rtol=0,
+            atol=1e-6,
+        )
+        i, j, k = local_extrema_indices(cube)
+        self.assertEqual(set(k.tolist()), {2, 3, 4, 5, 6})
 
     def test_nonfinite_or_non_3d_input_fails_explicitly(self):
         with self.assertRaisesRegex(ValueError, "3D"):
             local_extrema_indices(np.zeros((2, 3)))
+        with self.assertRaisesRegex(ValueError, "real numeric"):
+            local_extrema_indices(np.array([[[1 + 1j, 0, 0]]]))
         with self.assertRaisesRegex(ValueError, "non-finite"):
             local_extrema_indices(np.array([[[0.0, np.nan, 0.0]]]))
 

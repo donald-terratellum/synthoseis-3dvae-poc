@@ -4,6 +4,12 @@ from collections.abc import Iterator
 
 import numpy as np
 import zarr
+from scipy.ndimage import uniform_filter1d
+
+
+def _smooth_extrema_input(cube: np.ndarray) -> np.ndarray:
+    filtered = uniform_filter1d(cube, size=5, axis=2, mode="nearest")
+    return 0.2 * cube + 0.8 * filtered
 
 
 def local_extrema_indices(cube: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -11,15 +17,19 @@ def local_extrema_indices(cube: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.
     values = np.asarray(cube)
     if values.ndim != 3:
         raise ValueError("Local extrema require a 3D XYZ array.")
+    if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
+        raise ValueError("Local extrema input must contain real numeric amplitudes.")
+    values = values.astype(np.result_type(values.dtype, np.float32), copy=False)
     if not np.isfinite(values).all():
         raise ValueError("Local extrema input contains non-finite amplitudes.")
     if values.shape[2] < 3:
         empty = np.empty(0, dtype=np.intp)
         return empty, empty.copy(), empty.copy()
 
-    center = values[:, :, 1:-1]
-    shallower = values[:, :, :-2]
-    deeper = values[:, :, 2:]
+    smoothed = _smooth_extrema_input(values)
+    center = smoothed[:, :, 1:-1]
+    shallower = smoothed[:, :, :-2]
+    deeper = smoothed[:, :, 2:]
     peak_indices = np.where((center > shallower) & (center > deeper))
     trough_indices = np.where((center < shallower) & (center < deeper))
     return (

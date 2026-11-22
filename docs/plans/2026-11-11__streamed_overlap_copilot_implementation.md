@@ -12,12 +12,20 @@ inserts channel N/G into `faulted_net_to_gross` before closure/property construc
 13 synthetic end-to-end tests passed. This verifies current code behavior, not the
 unknown generation-time worktree/command of every saved source.
 
-The owner approved strict adjacent-sample Z-axis extrema, same-index non-padded label
+The owner approved a five-sample, nearest-edge depth smoother blended with the original
+seismic before strict adjacent-sample Z-axis extrema, same-index non-padded label
 support, closure fractions as a coarse operational fluid proxy despite provenance
 uncertainty, source-specific filter metadata, and the proposed evaluation success
-criteria. The executable target, target-yield preflight and frozen evaluation manifest
-remain to be implemented and checked. Gate 1 remains closed until those checks pass;
-the separate training-launch approval gate remains closed as well.
+criteria. Added-noise augmentation uses an independent 12-60 dB range; source `sn_db`
+describes noise already present in stored data and is not the augmentation setting.
+Different deepest Z extents are not by themselves a problem: use fully supported
+same-index windows without padding, clipping, or shifts. The owner reports that
+`fake_data` was recreated and is keeping the regenerating `fake_data_validation_v2`
+separate; do not read it until regeneration is complete, then audit separately before
+considering it for any use. The existing validation set remains primary. The executable target,
+target-yield preflight and frozen evaluation manifest remain to be implemented and
+checked. Gate 1 remains closed until those checks pass; the separate training-launch
+approval gate remains closed as well.
 
 Local implementation is on `experiment/streamed-overlap-copilot-implementation`.
 The audit tooling and local source inventory exist; pair-target generation, training,
@@ -203,20 +211,27 @@ Important approved decisions:
 - Two distinct outputs: physical canonical overlap fraction and directional,
   fluid-adjusted observable-event coverage, with A as the reference. This replaces
   equal-weight layer coverage; the event ratio is not an exact layer count.
-- Count strict adjacent-sample Z-axis peaks/troughs in the shared region relative to
-  the full A depth over shared XY, before augmentation; no prominence threshold.
-  Use same-index label support and exclude padded indices 1500:1510. Apply the
+- Smooth each seismic trace with `uniform_filter1d(size=5, axis=2, mode="nearest")`,
+  blend `0.2 * original + 0.8 * filtered`, then count strict adjacent-sample
+  Z-axis peaks/troughs in the shared region relative to the full A depth over shared
+  XY, before augmentation; no prominence threshold. Use same-index label support and
+  exclude padded indices 1500:1510. Apply the
   execution plan's window-level oil/gas/other closure-fraction correction as a coarse
   proxy, not physical-fluid truth. Disjoint or different-source pairs have zero
   coverage. Do not compare numeric age IDs across independent sources.
 - Calibrated cosine overlap on mu; an ordered learned semantic head on mu_A/mu_B.
   Select by directional pair-head ranking and measure mu-cosine retrieval independently.
   A later spatial-alignment model is deferred.
+- Train each arm end-to-end: one combined enabled-objective loss, one backward pass,
+  and one optimizer step per batch. Do not detach/cache mu or freeze the shared encoder.
+  Reconstruction/KL and enabled pair-head gradients must update the same encoder; the
+  lower encoder learning-rate multiplier slows updates but does not freeze it.
 - Fresh E1 residual mu128, skip-free decoder, 32x32x64, shared encoder; no trained
   P0b/mu512 initialization and no production search scoring changes.
 - Stream volume-balanced original fullstack inputs, 12 pairs per batch: 6 same-source
   overlap, 3 same-volume disjoint, 3 cross-volume; two zero-shift pairs; +/-25% XYZ offsets.
-- Rotation and scaling on every view, independent flips/swap and source-band depth noise, not arbitrary
+- Rotation and scaling on every view, independent flips/swap and source-band depth
+  noise (probability 0.5; additional noise SNR uniform 12-60 dB), not arbitrary
   phase/polarity invariance. Apply tokenizer normalization/extrema input; reconstruct
   noisy augmented dense A. Synthetic training only.
 - Three sequential matched arms; epochs/batches are specified at launch, not guessed.
@@ -311,9 +326,10 @@ changing an approved scientific choice, stop and ask before changing it.
 ### M3: model/trainer integration and durable recovery
 
 Implement the mu overlap calibration and directional semantic head with saved configs;
-test gradients, pair order and adapter parity. Match initialized VAE state and source
-streams across S1/S2/S3. Ensure extra head initialization and evaluation do not consume
-the data/augmentation RNG stream.
+test that each enabled loss reaches the shared encoder and its head, along with pair
+order and adapter parity. Match initialized VAE state and source streams across
+S1/S2/S3. Ensure extra head initialization and evaluation do not consume the
+data/augmentation RNG stream.
 
 Reuse reconstruction/LPIPS/KL functions. Log all component losses and all group LRs.
 Extend the streamed path's full-state save/resume rather than relaxing old resume guards
