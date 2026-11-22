@@ -170,9 +170,44 @@ changed inputs/checkpoints and restores inference RNG state. It uses a fixed
 one-patch-at-a-time sampling protocol, with no augmentation of guardrail targets.
 The numerical comparison remains **not** an adoption decision: dataset/reference
 approval, source provenance and selection provenance are not established by these
-helpers. No reconstruction manifest has been approved or frozen against real data;
-no final-test data was accessed. The recorded hashes cover decoded float32 patches
-and tokenizer inputs, not complete source-store or generation provenance.
+helpers. No final synthetic-test data was accessed. The recorded hashes cover decoded
+float32 patches and tokenizer inputs, not complete source-store or generation provenance.
+
+The owner subsequently approved auditing the historical synthetic/real candidates
+and freezing/measuring them if suitable. The historical synthetic patch store has
+5,000 baked-scaled patches from 25 historical source paths and records the old
+`label_z_offset=1`; those derived labels are not used in reconstruction and are
+not suitable as the new semantic targets. The separate historical real test store
+has 5,000 patches from four real volumes and is strictly a post-selection
+reconstruction guardrail, not an epoch-selection or untouched-test dataset.
+Archived original generation logs identify horizon, fault, closure and fan seeds
+for all 25 historical synthetic sources; none matches the corresponding seeds in
+the current 180-source training inventory snapshot. The archived seed blocks do
+not establish channel-simulation seeds, exact generator worktrees, or complete
+independence. Thus this is a historical reconstruction control, not a certificate
+of current semantic-label validity or fully verified geological provenance.
+
+The approved historical reconstruction manifest was frozen at private checkpoint
+volume path `historical-reconstruction-guardrail-20261122-01/manifest.json`, hash
+`f6d776046c8c0339445d013df7ef89590ab3cad1867790d7b5dd32c9b724e246`.
+It fingerprints all 5,000 synthetic and 5,000 real inputs/targets with sampled
+tokenizer reconstruction on MPS, seed 20260926 and a fixed LPIPS implementation.
+Freezing took 30.33 seconds including startup and 835,305,472 bytes peak RSS.
+The historical P0b reconstruction-best checkpoint is seed-20260926 epoch 40,
+SHA-256 `090e6f14e9f68941b468a7189e22a7c2dfc41de8571efa7e9ccff5273c5f439b`;
+its retrieval reference is a different checkpoint. A matched streamed S1 reference
+does not exist yet. The regenerated validation-v2 sources remain off limits until
+the owner confirms completion and they are separately audited.
+
+The full P0b reference measurement was written privately as
+`historical-reconstruction-guardrail-20261122-01/p0b_measurement.json` (file SHA-256
+`81ec68fd95d665eeae21ec7052edc2217bcf49e4c6de55a1946c0a552d16ee0e`).
+The matched protocol produced synthetic recipe total 0.4931984 and real MAE
+0.7100480 across all 10,000 patches. The producer's numeric/identity validation
+passed; this is a reference measurement, not an experiment result or adoption.
+It took 189.20 seconds including startup, 952,975,360 bytes peak RSS and
+93,143,040 bytes MPS driver allocation sampled afterward. The 0.5 MPS
+memory-fraction guard is not a full-training memory estimate.
 
 The checkpoint retrieval evaluator now also reports directional event-coverage
 errors by pair category and per-pair closure-proxy fluid mismatch where the frozen
