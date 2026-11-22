@@ -424,6 +424,7 @@ class ArmInitializationTests(unittest.TestCase):
 
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"), \
              patch("scripts.streamed_overlap_epoch_runner._reference_hash", return_value="f" * 64), \
              patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
                    side_effect=RuntimeError("restore reached")) as restore, \
@@ -541,7 +542,10 @@ class ArmInitializationTests(unittest.TestCase):
             "suite_initialization": suite,
         }
         journals = {arm: item.journal for arm, item in arms.items()}
-        with patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm:
+        with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs") as epoch_gate, \
+             patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs", side_effect=arm_runner) as run_arm:
             original = metadata["path"].read_bytes()
             metadata["path"].unlink()
             with self.assertRaisesRegex(ValueError, "regular file"):
@@ -549,6 +553,12 @@ class ArmInitializationTests(unittest.TestCase):
             run_arm.assert_not_called()
             self.assertEqual(calls, [])
             metadata["path"].write_bytes(original)
+            epoch_gate.side_effect = ValueError("invalid epoch inputs")
+            with self.assertRaisesRegex(ValueError, "invalid epoch inputs"):
+                run_suite_epochs(journals, runtime_factory, **arguments)
+            run_arm.assert_not_called()
+            self.assertEqual(calls, [])
+            epoch_gate.side_effect = None
             fail_s2 = True
             with self.assertRaisesRegex(RuntimeError, "interrupted S2"):
                 run_suite_epochs(journals, runtime_factory, **arguments)
@@ -587,7 +597,10 @@ class ArmInitializationTests(unittest.TestCase):
             (item.initial_checkpoint.parent / "evaluation").mkdir()
         arms["S3"].journal.close()
         factory = Mock()
-        with patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs") as run_arm:
+        with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"), \
+             patch("scripts.streamed_overlap_epoch_runner.run_arm_epochs") as run_arm:
             with self.assertRaisesRegex(ValueError, "locked journal"):
                 run_suite_epochs(
                     {arm: item.journal for arm, item in arms.items()}, factory,

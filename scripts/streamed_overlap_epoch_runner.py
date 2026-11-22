@@ -20,7 +20,7 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state
 from scripts.streamed_overlap_diagnostics import diagnostic_report
 from scripts.streamed_overlap_evaluation import (
-    _checkpoint_state, _identity, _validate_evaluation_parameters, evaluate_checkpoint,
+    StreamedEpochValidator, _checkpoint_state, _identity, _validate_evaluation_parameters, evaluate_checkpoint,
 )
 from scripts.streamed_overlap_guardrails import (
     _manifest as _guardrail_manifest, _measurement, _sha256, compare_reconstruction_guardrails,
@@ -38,7 +38,7 @@ from scripts.streamed_overlap_reconstruction import (
 from scripts.streamed_overlap_search import run_bounded_searches
 from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
-from scripts.train import EarlyStoppingState, train_streamed_epoch
+from scripts.train import EarlyStoppingState, streamed_monitor_hash, train_streamed_epoch
 from src.tokenizer.core.model_adapter import choose_torch_device
 
 
@@ -472,6 +472,30 @@ class ArmRuntime:
     writer: SummaryWriter
 
 
+def _validate_epoch_inputs(
+    monitor_batches: dict, validate_epoch, lpips_loss_fn, *, hashes: dict,
+    manifest_path: Path, source_root: Path, guardrail_manifest: dict,
+) -> None:
+    if (not isinstance(validate_epoch, StreamedEpochValidator)
+            or not isinstance(manifest_path, Path) or not isinstance(source_root, Path)
+            or not isinstance(validate_epoch.manifest_path, Path) or not isinstance(validate_epoch.source_root, Path)):
+        raise ValueError("A frozen epoch validator and explicit input paths are required.")
+    paths = (manifest_path, source_root, validate_epoch.manifest_path, validate_epoch.source_root)
+    if (any("fake_data_validation_v2" in path.parts or "fake_data_validation_v2" in path.resolve().parts
+            for path in paths)
+            or manifest_path.resolve() != validate_epoch.manifest_path.resolve()
+            or source_root.resolve() != validate_epoch.source_root.resolve()
+            or validate_epoch.manifest_sha256 != hashes.get("validation_manifest")
+            or validate_epoch.configuration_hash() != validate_epoch.config_sha256
+            or validate_epoch.config_sha256 != hashes.get("epoch_validation")
+            or validate_epoch.lpips_loss_fn is not lpips_loss_fn):
+        raise ValueError("Epoch validation inputs or configuration differ from the frozen suite.")
+    if hashes.get("monitor") != streamed_monitor_hash(monitor_batches):
+        raise ValueError("Fixed monitor inputs differ from the frozen monitor hash.")
+    if lpips_fingerprint(lpips_loss_fn) != guardrail_manifest["protocol"]["lpips_sha256"]:
+        raise ValueError("LPIPS does not match the frozen reconstruction guardrail.")
+
+
 def _reference_hash(historical: HistoricalReconstruction) -> str:
     if (not isinstance(historical, HistoricalReconstruction)
             or not _sha256(historical.report_sha256) or not _sha256(historical.checkpoint_sha256)
@@ -696,6 +720,10 @@ def run_arm_epochs(
         raise ValueError("Arm arguments must match the frozen matching configuration.")
     _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
     _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
+    _validate_epoch_inputs(
+        monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
+        manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
+    )
     if (hashes.get("reconstruction_guardrail") != content_hash(guardrail_config)
             or hashes.get("reconstruction_reference") != _reference_hash(historical)):
         raise ValueError("The arm must bind the frozen reconstruction configuration and reference.")
@@ -823,6 +851,12 @@ def run_suite_epochs(
     )
     if metadata["initialization_sha256"] != suite_initialization.evidence_sha256:
         raise ValueError("The suite must use the initialization pin recorded in suite metadata.")
+    _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
+    _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
+    _validate_epoch_inputs(
+        monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
+        manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,
+    )
     for arm in ("S1", "S2", "S3"):
         journal = journals[arm]
         initial = suite_initialization.initial_checkpoints[arm]

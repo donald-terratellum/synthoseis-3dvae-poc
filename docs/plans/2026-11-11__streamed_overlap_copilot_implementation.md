@@ -4,6 +4,21 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The prepared-suite and per-arm paths now verify fixed monitor inputs, the
+epoch-validator configuration and manifest/source paths, and the LPIPS state
+against the frozen reconstruction guardrail before opening an arm runtime or
+restoring a checkpoint. The validator also detects settings changed after
+construction before evaluation. These checks do not replace the complete
+resolved launch configuration, source-data revalidation, resource gates or
+separate training approval.
+
+Three synthetic input-gate and suite-order tests passed on ExFAT in 3.84 seconds
+wall time at 512,360,448 bytes peak RSS. LPIPS fingerprinting and arm execution
+were mocked; no training or real data was used, and temporary files were removed.
+This is not a training-resource estimate. The portable streamed suite passed
+225 tests, with one skipped and 54 subtests, using
+`.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The no-training `prepare_suite_initial_checkpoints` helper now prepares fresh
 S1/S2/S3 E1 checkpoints sequentially from an explicitly seeded sampler and
 device, then verifies and persists initialization evidence and suite metadata.

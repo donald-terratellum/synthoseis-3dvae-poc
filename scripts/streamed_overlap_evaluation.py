@@ -236,14 +236,19 @@ class StreamedEpochValidator:
         self.reconstruction_batch_size = reconstruction_batch_size
         self.max_wall_seconds = float(max_wall_seconds)
         self.lpips_loss_fn = lpips_loss_fn
-        self.config_sha256 = content_hash({
-            "schema": "streamed-epoch-validation-v1", "manifest_sha256": manifest_sha256,
-            "reconstruction_query_ids": reconstruction_query_ids, "reconstruction_seed": reconstruction_seed,
-            "encode_batch_size": encode_batch_size, "reconstruction_batch_size": reconstruction_batch_size,
+        self.config_sha256 = self.configuration_hash()
+
+    def configuration_hash(self) -> str:
+        return content_hash({
+            "schema": "streamed-epoch-validation-v1", "manifest_sha256": self.manifest_sha256,
+            "reconstruction_query_ids": self.reconstruction_query_ids, "reconstruction_seed": self.reconstruction_seed,
+            "encode_batch_size": self.encode_batch_size, "reconstruction_batch_size": self.reconstruction_batch_size,
             "max_wall_seconds": self.max_wall_seconds,
         })
 
     def __call__(self, model) -> dict:
+        if self.configuration_hash() != self.config_sha256:
+            raise ValueError("Epoch validation configuration changed after it was frozen.")
         if model.training or torch.is_grad_enabled():
             raise ValueError("Epoch validation requires eval mode and inference-only execution.")
         if isinstance(self.lpips_loss_fn, torch.nn.Module) and self.lpips_loss_fn.training:

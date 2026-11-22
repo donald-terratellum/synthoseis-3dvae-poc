@@ -5,12 +5,86 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
+
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_augmentation import ViewTransform
+from scripts.streamed_overlap_evaluation import StreamedEpochValidator
 from scripts.streamed_overlap_journal import BatchJournal
 from scripts.streamed_overlap_epoch_runner import (
-    HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, complete_epoch,
+    HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _completed, _validate_epoch_inputs,
+    complete_epoch,
     complete_selected_checkpoint, run_arm_epochs,
 )
+from scripts.streamed_overlap_sampler import PairBatch, PairSpec
+from scripts.streamed_overlap_targets import Window
+from scripts.train import streamed_monitor_hash
+
+
+class EpochInputBindingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.manifest_path = self.root / "manifest.json"
+        self.lpips = lambda x, y: (x - y).square().mean()
+        self.validator = StreamedEpochValidator(
+            self.manifest_path, self.root, manifest_sha256="b" * 64, reconstruction_query_ids=("query",),
+            reconstruction_seed=3, encode_batch_size=4, reconstruction_batch_size=2,
+            max_wall_seconds=60, lpips_loss_fn=self.lpips,
+        )
+        self.monitor = {}
+        for split in ("train", "validation"):
+            window = Window(f"{split}/sample", (0, 0, 0), (1, 1, 1))
+            pairs = tuple(PairSpec("same_overlap", window, window, i, i + 12) for i in range(12))
+            transform = ViewTransform(0, (1, 1, 1), False, False, False)
+            view = {"transform": transform, "noise": None, "retained_fraction": 0.3, "input_mode": "extrema"}
+            values = np.zeros((12, 1, 1, 1, 1), dtype=np.float32)
+            self.monitor[split] = PairBatch(
+                values, values.copy(), values.copy(), np.zeros(12), np.zeros(12), np.ones(12, dtype=bool),
+                (None,) * 12, pairs, tuple((view, view) for _ in range(12)),
+            )
+        self.hashes = {
+            "monitor": streamed_monitor_hash(self.monitor), "epoch_validation": self.validator.config_sha256,
+            "validation_manifest": "b" * 64,
+        }
+        self.guardrail = {"protocol": {"lpips_sha256": "c" * 64}}
+        self.fingerprint = patch("scripts.streamed_overlap_epoch_runner.lpips_fingerprint", return_value="c" * 64)
+        self.fingerprint.start()
+        self.addCleanup(self.fingerprint.stop)
+
+    def check(self, **overrides):
+        arguments = {
+            "monitor_batches": self.monitor, "validate_epoch": self.validator, "lpips_loss_fn": self.lpips,
+            "hashes": self.hashes, "manifest_path": self.manifest_path, "source_root": self.root,
+            "guardrail_manifest": self.guardrail,
+        }
+        _validate_epoch_inputs(**{**arguments, **overrides})
+
+    def test_rejects_changed_monitors_validator_and_lpips(self):
+        self.check()
+        self.monitor["train"].input_a[0, 0, 0, 0, 0] = 1
+        with self.assertRaisesRegex(ValueError, "monitor inputs"):
+            self.check()
+        self.monitor["train"].input_a[0, 0, 0, 0, 0] = 0
+        self.validator.reconstruction_seed += 1
+        with self.assertRaisesRegex(ValueError, "validation inputs or configuration"):
+            self.check()
+        self.validator.reconstruction_seed -= 1
+        with self.assertRaisesRegex(ValueError, "validation inputs or configuration"):
+            self.check(lpips_loss_fn=lambda x, y: x - y)
+        with self.assertRaisesRegex(ValueError, "validation inputs or configuration"):
+            self.check(manifest_path=self.root / "other.json")
+        with self.assertRaisesRegex(ValueError, "frozen epoch validator"):
+            self.check(validate_epoch=object())
+        with patch("scripts.streamed_overlap_epoch_runner.lpips_fingerprint", return_value="d" * 64):
+            with self.assertRaisesRegex(ValueError, "LPIPS does not match"):
+                self.check()
+
+    def test_rejects_mutated_validator_before_evaluation(self):
+        self.validator.encode_batch_size += 1
+        with self.assertRaisesRegex(ValueError, "changed after it was frozen"):
+            self.validator(object())
 
 
 class EpochCompletionTests(unittest.TestCase):
@@ -104,6 +178,7 @@ class EpochCompletionTests(unittest.TestCase):
             }),
             patch("scripts.streamed_overlap_epoch_runner.verify_suite_run_metadata",
                   return_value={"initialization_sha256": "f" * 64}),
+            patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"),
             patch("scripts.streamed_overlap_epoch_runner.complete_matched_arm",
                   return_value={"record": {"status": "MATCHED_RECORDED_STREAMS_ONLY"}}),
         ]
@@ -294,6 +369,9 @@ class EpochCompletionTests(unittest.TestCase):
                 run()
             with self.assertRaisesRegex(ValueError, "S1 needs P0b only"):
                 run("S1", s1=self.s1)
+            self.mocks[-2].side_effect = ValueError("invalid epoch inputs")
+            with self.assertRaisesRegex(ValueError, "invalid epoch inputs"):
+                run(s1=self.s1)
             restore.assert_not_called()
 
     def test_matching_configuration_is_required_before_restoring_or_training(self):
