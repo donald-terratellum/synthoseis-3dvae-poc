@@ -4,6 +4,25 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+The per-arm helper now verifies S2 and S3's completed recorded pair and
+augmentation streams against S1 before selected-checkpoint comparisons. It
+requires the initial checkpoint hashes from the pinned suite evidence, retains
+a hash-bound result under the candidate's evaluation directory, and rechecks
+the evidence before reusing a completed result. Mismatch, changed evidence,
+invalid or duplicate records stop the arm rather than producing a comparison.
+Interrupted publication is recoverable without another optimizer step. S1 has
+no matched-reference result. These are recorded-stream checks only: they do not
+prove source contents or actual tensors, verify all intermediate RNG states or
+recorded optimizer rules, establish adoption readiness, or replace the suite
+runner and its durable run metadata.
+
+Three synthetic matched-record and recovery tests passed on ExFAT in 0.92
+seconds, at 318,832,640 bytes peak RSS and 475,136 bytes MPS driver allocation
+sampled afterward. They did not train or score real data; temporary files were
+removed. These are not training-resource estimates.
+The portable streamed suite passed 215 tests, with one skipped and 54 subtests,
+using `.venv/bin/python -m pytest -q tests/test_streamed_*.py`.
+
 The per-arm epoch helper now requires the caller's pinned suite-initialization
 evidence before any restore or optimizer step. It verifies all three retained
 initial snapshots and requires the current arm's `initial.pt`, `last.pt` and

@@ -24,7 +24,8 @@ from scripts.streamed_overlap_guardrails import (
 from scripts.streamed_overlap_integrity import _digest_array, load_manifest, open_validation_sources
 from scripts.streamed_overlap_journal import BatchJournal, _atomic_record, _sync_directory
 from scripts.streamed_overlap_matching import (
-    matching_config_hash, verify_arm_initial_checkpoint, verify_saved_suite_initialization,
+    ArmEvidence, _permitted_file, matching_config_hash, verify_arm_initial_checkpoint,
+    verify_matched_arm_records, verify_saved_suite_initialization,
 )
 from scripts.streamed_overlap_reconstruction import (
     _runtime as _reconstruction_runtime, _verify_stores, lpips_fingerprint, measure_reconstruction,
@@ -603,6 +604,51 @@ def complete_reconstruction_comparison(
     return record
 
 
+def complete_matched_arm(
+    reference: ArmEvidence, candidate: ArmEvidence, *, matching_config: dict, evaluation_dir: Path,
+    expected_initial_sha256: dict[str, str],
+) -> dict:
+    """Persist or reverify matched recorded streams; this is not an adoption decision."""
+    if (not isinstance(candidate, ArmEvidence) or not isinstance(candidate.journal, BatchJournal)
+            or "fake_data_validation_v2" in evaluation_dir.parts or evaluation_dir.is_symlink()
+            or "fake_data_validation_v2" in evaluation_dir.resolve().parts or not evaluation_dir.is_dir()
+            or not evaluation_dir.resolve().is_relative_to(candidate.journal.path.parent.resolve())):
+        raise ValueError("Matched evidence requires a regular candidate-owned evaluation directory.")
+    report = verify_matched_arm_records(reference, candidate, matching_config=matching_config)
+    if report["initial_checkpoint_sha256"] != expected_initial_sha256:
+        raise ValueError("Matched streams do not use the pinned suite initial checkpoints.")
+    directory = evaluation_dir / "matched_streams"
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError("Matched-stream records require a regular directory.")
+    directory.mkdir(exist_ok=True)
+    _sync_directory(evaluation_dir)
+
+    def existing() -> list[Path]:
+        if (directory.is_symlink() or "fake_data_validation_v2" in directory.resolve().parts
+                or not directory.is_dir()):
+            raise ValueError("Matched-stream records require a regular directory.")
+        paths = []
+        for path in directory.glob("*.json"):
+            _permitted_file(path)
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(previous, dict) or previous.get("schema") != "streamed-matched-arm-records-v2"
+                    or previous.get("sha256") != content_hash({
+                        key: value for key, value in previous.items() if key != "sha256"
+                    }) or previous != report):
+                raise ValueError("Saved matched-stream record is invalid or differs from current evidence.")
+            paths.append(path)
+        if len(paths) > 1:
+            raise ValueError("Matched-stream records are duplicated.")
+        return paths
+
+    paths = existing()
+    path = paths[0] if paths else _atomic_record(directory, report)
+    if (verify_matched_arm_records(reference, candidate, matching_config=matching_config) != report
+            or existing() != [path]):
+        raise ValueError("Matched-stream evidence changed during publication.")
+    return {"path": str(path.relative_to(evaluation_dir)), "record": report}
+
+
 def run_arm_epochs(
     model, optimizer, scheduler, sampler, journal, lpips_loss_fn, writer, *,
     run_id: str, seed: int, attempt_id: str, batches_per_epoch: int, sparse_probability: float,
@@ -651,7 +697,7 @@ def run_arm_epochs(
             or not isinstance(getattr(journal, "path", None), Path)
             or journal.path.parent != initial_checkpoint.parent):
         raise ValueError("The arm must use its retained suite initialization checkpoint.")
-    verify_saved_suite_initialization(
+    suite_record = verify_saved_suite_initialization(
         suite_initialization.evidence_path, suite_initialization.initial_checkpoints,
         matching_config=matching_config, expected_hashes=hashes,
         expected_evidence_sha256=suite_initialization.evidence_sha256,
@@ -696,6 +742,15 @@ def run_arm_epochs(
         last_completion = finish()
     if last_completion is None:
         raise ValueError("The arm did not complete an epoch.")
+    matched_streams = None
+    if s1 is not None:
+        initial_hashes = suite_record["initialization"]["initial_checkpoint_sha256"]
+        matched_streams = complete_matched_arm(
+            ArmEvidence(suite_initialization.initial_checkpoints["S1"], s1.checkpoint_path, s1.journal),
+            ArmEvidence(initial_checkpoint, checkpoint_path, journal),
+            matching_config=matching_config, evaluation_dir=evaluation_dir,
+            expected_initial_sha256={"S1": initial_hashes["S1"], model.arm: initial_hashes[model.arm]},
+        )
     selected_evaluations = {}
     kinds = ("reconstruction", "retrieval") if model.arm == "S3" else ("reconstruction",)
     for kind in kinds:
@@ -713,7 +768,10 @@ def run_arm_epochs(
             candidate, historical, s1=s1, guardrail_manifest=guardrail_manifest,
             guardrail_config=guardrail_config, lpips_loss_fn=lpips_loss_fn,
         )
-    return {
+    result = {
         "last_epoch": last_completion, "selected_evaluations": selected_evaluations,
         "reconstruction_comparisons": comparisons,
     }
+    if matched_streams is not None:
+        result["matched_streams"] = matched_streams
+    return result

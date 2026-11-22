@@ -97,7 +97,13 @@ class EpochCompletionTests(unittest.TestCase):
             patch("scripts.streamed_overlap_epoch_runner.diagnostic_report", return_value={"diagnostic": "ok"}),
             patch("scripts.streamed_overlap_epoch_runner.select_checkpoints", return_value={"selection": "ok"}),
             patch("scripts.streamed_overlap_epoch_runner.verify_arm_initial_checkpoint", return_value="a" * 64),
-            patch("scripts.streamed_overlap_epoch_runner.verify_saved_suite_initialization", return_value={}),
+            patch("scripts.streamed_overlap_epoch_runner.verify_saved_suite_initialization", return_value={
+                "initialization": {"initial_checkpoint_sha256": {
+                    arm: "a" * 64 for arm in ("S1", "S2", "S3")
+                }},
+            }),
+            patch("scripts.streamed_overlap_epoch_runner.complete_matched_arm",
+                  return_value={"record": {"status": "MATCHED_RECORDED_STREAMS_ONLY"}}),
         ]
         self.mocks = [item.start() for item in self.patches]
         for item in reversed(self.patches):
@@ -204,6 +210,8 @@ class EpochCompletionTests(unittest.TestCase):
                    return_value={"completed_epoch": 4, "selection_state": {}}), \
              patch("scripts.streamed_overlap_epoch_runner.complete_epoch", side_effect=finish), \
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch", side_effect=train), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_matched_arm",
+                   side_effect=lambda *args, **kwargs: order.append("match") or {"record": {"status": "matched"}}), \
              patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
                    side_effect=lambda *args, **kwargs: order.append(kwargs["selection_kind"]) or {"done": True}), \
              patch("scripts.streamed_overlap_epoch_runner.complete_reconstruction_comparison",
@@ -227,9 +235,10 @@ class EpochCompletionTests(unittest.TestCase):
                 initial_checkpoint=self.root / "initial.pt",
                 suite_initialization=self.suite_initialization,
             )
-        self.assertEqual(order, ["evaluate", "train-5", "evaluate", "train-6", "evaluate",
+        self.assertEqual(order, ["evaluate", "train-5", "evaluate", "train-6", "evaluate", "match",
                                  "reconstruction", "retrieval", "compare-reconstruction", "compare-retrieval"])
         self.assertEqual(result["last_epoch"]["done"], 5)
+        self.assertEqual(result["matched_streams"]["record"]["status"], "matched")
         self.assertEqual(set(result["selected_evaluations"]), {"reconstruction", "retrieval"})
         self.assertEqual(result["reconstruction_comparisons"]["retrieval"]["comparison"]["status"], "FAIL")
         self.assertEqual(compare.call_count, 2)
@@ -376,6 +385,7 @@ class EpochCompletionTests(unittest.TestCase):
             train.assert_not_called()
         self.assertEqual(attempts, [("reconstruction", self.historical, None)] * 2)
         self.assertEqual(set(result["reconstruction_comparisons"]), {"reconstruction"})
+        self.mocks[-1].assert_not_called()
 
     def test_s2_compares_only_reconstruction_with_s1_reference(self):
         with patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
@@ -406,6 +416,34 @@ class EpochCompletionTests(unittest.TestCase):
         self.assertEqual(compare.call_args.args[0].selection_kind, "reconstruction")
         self.assertIs(compare.call_args.kwargs["s1"], self.s1)
         self.assertEqual(set(result["reconstruction_comparisons"]), {"reconstruction"})
+        self.assertEqual(result["matched_streams"]["record"]["status"], "MATCHED_RECORDED_STREAMS_ONLY")
+        self.mocks[-1].assert_called_once()
+
+    def test_unmatched_candidate_stops_before_selected_evaluation(self):
+        self.mocks[-1].side_effect = ValueError("unmatched streams")
+        with patch("scripts.streamed_overlap_epoch_runner.restore_epoch_state",
+                   return_value={"completed_epoch": 6, "selection_state": {}}), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_epoch", return_value={"done": True}), \
+             patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint") as selected, \
+             patch("scripts.streamed_overlap_epoch_runner.complete_reconstruction_comparison") as compare, \
+             patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch") as train:
+            with self.assertRaisesRegex(ValueError, "unmatched streams"):
+                run_arm_epochs(
+                    SimpleNamespace(arm="S2"), *self.arm_args,
+                    run_id="run", seed=1, attempt_id="resume", batches_per_epoch=2,
+                    sparse_probability=0.5, monitor_batches={}, monitor_seed=1, validation_seed=1,
+                    validate_epoch=object(), epoch_csv=self.root / "epoch.csv", checkpoint_path=self.checkpoint,
+                    hashes=self.hashes, early_stopping=object(), manifest_path=self.root / "manifest",
+                    source_root=self.source, search_manifest=self.search_manifest,
+                    diagnostic_manifest=self.diagnostic_manifest, formal_config=self.config,
+                    evaluation_dir=self.evaluation, guardrail_manifest=self.guardrail_manifest,
+                    guardrail_config=self.guardrail_config, historical=self.historical, s1=self.s1,
+                    matching_config=self.matching_config, initial_checkpoint=self.root / "initial.pt",
+                    suite_initialization=self.suite_initialization,
+                )
+            train.assert_not_called()
+            selected.assert_not_called()
+            compare.assert_not_called()
 
     def test_selected_earlier_checkpoint_is_evaluated_and_recovered(self):
         self.epoch = 6

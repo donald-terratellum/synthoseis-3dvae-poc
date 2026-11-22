@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_epoch_runner import complete_matched_arm
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS, _atomic_record
 from scripts.streamed_overlap_matching import (
     ArmEvidence, matching_config_hash, verify_arm_initial_checkpoint, verify_matched_arm_records,
@@ -148,6 +149,86 @@ class MatchedArmEvidenceTests(unittest.TestCase):
         self.assertEqual(result["sha256"], content_hash({
             key: value for key, value in result.items() if key != "sha256"
         }))
+
+    def test_matched_record_is_reused_and_changed_provenance_is_rejected(self):
+        evaluation = self.candidate.journal.path.parent / "evaluation"
+        evaluation.mkdir()
+        initial_hashes = self.verify()["initial_checkpoint_sha256"]
+        def complete():
+            return complete_matched_arm(
+                self.reference, self.candidate, matching_config=MATCHING_CONFIG, evaluation_dir=evaluation,
+                expected_initial_sha256=initial_hashes,
+            )
+
+        with self.assertRaisesRegex(ValueError, "pinned suite initial checkpoints"):
+            complete_matched_arm(
+                self.reference, self.candidate, matching_config=MATCHING_CONFIG, evaluation_dir=evaluation,
+                expected_initial_sha256={"S1": "0" * 64, "S3": initial_hashes["S3"]},
+            )
+        self.assertFalse((evaluation / "matched_streams").exists())
+        result = complete()
+        path = evaluation / result["path"]
+        original = path.read_bytes()
+        self.assertEqual(complete(), result)
+        self.assertEqual(path.read_bytes(), original)
+        row = self.candidate.journal.rows[-1]
+        provenance = self.candidate.journal.path.parent / row["provenance"]
+        record = json.loads(provenance.read_text())
+        record["augmentation"][0][0]["transform"]["angle_degrees"] = 1.0
+        provenance.write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "different committed pair or augmentation"):
+            complete()
+        self.assertEqual(path.read_bytes(), original)
+        record["augmentation"][0][0]["transform"]["angle_degrees"] = 0.0
+        provenance.write_text(json.dumps(record))
+        report = json.loads(original)
+        report["steps"] = 3
+        path.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "invalid or differs"):
+            complete()
+
+    def test_interrupted_matched_record_publication_is_recovered(self):
+        evaluation = self.candidate.journal.path.parent / "evaluation"
+        evaluation.mkdir()
+        initial_hashes = self.verify()["initial_checkpoint_sha256"]
+        def publish_then_interrupt(directory, report):
+            _atomic_record(directory, report)
+            raise OSError("interrupted")
+
+        with patch("scripts.streamed_overlap_epoch_runner._atomic_record", side_effect=publish_then_interrupt):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                complete_matched_arm(
+                    self.reference, self.candidate, matching_config=MATCHING_CONFIG, evaluation_dir=evaluation,
+                    expected_initial_sha256=initial_hashes,
+                )
+        files = list((evaluation / "matched_streams").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        result = complete_matched_arm(
+            self.reference, self.candidate, matching_config=MATCHING_CONFIG, evaluation_dir=evaluation,
+            expected_initial_sha256=initial_hashes,
+        )
+        self.assertEqual(evaluation / result["path"], files[0])
+        duplicate = files[0].with_name("duplicate.json")
+        shutil.copyfile(files[0], duplicate)
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            complete_matched_arm(
+                self.reference, self.candidate, matching_config=MATCHING_CONFIG, evaluation_dir=evaluation,
+                expected_initial_sha256=initial_hashes,
+            )
+
+    def test_s2_matched_record_uses_s1_reference(self):
+        candidate = self.arm("S2")
+        evaluation = candidate.journal.path.parent / "evaluation"
+        evaluation.mkdir()
+        initial_hashes = verify_matched_arm_records(
+            self.reference, candidate, matching_config=MATCHING_CONFIG,
+        )["initial_checkpoint_sha256"]
+        result = complete_matched_arm(
+            self.reference, candidate, matching_config=MATCHING_CONFIG, evaluation_dir=evaluation,
+            expected_initial_sha256=initial_hashes,
+        )
+        self.assertEqual(result["record"]["reference"]["arm"], "S1")
+        self.assertEqual(result["record"]["candidate"]["arm"], "S2")
 
     def test_verifies_real_fresh_e1_checkpoint_tensors(self):
         for item, arm in ((self.reference, "S1"), (self.candidate, "S3")):
