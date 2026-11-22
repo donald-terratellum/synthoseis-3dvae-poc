@@ -11,6 +11,7 @@ from unittest import mock
 
 from scripts import streamed_overlap_runner as runner
 from scripts import streamed_overlap_integration_smoke as integration_smoke
+from scripts import streamed_overlap_evaluate_child as evaluate_child
 from scripts.streamed_overlap_smoke import _validate_config
 from test_streamed_overlap_audit import make_source
 from scripts.streamed_overlap_audit import DEFAULT_SEISMIC_KEY
@@ -163,6 +164,204 @@ class TensorBoardLifecycleTests(unittest.TestCase):
                     self.fail("Concurrent lifecycle action acquired an existing lock.")
         with runner.service_lock(self.logs):
             pass
+
+
+class EvaluationAttemptTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.logs = self.root / "logs"
+        self.logs.mkdir()
+        self.suite = self.root / "suite"
+        self.suite.mkdir()
+        self.record = {
+            "schema": "streamed-suite-inputs-v1", "suite_dir": str(self.suite),
+            "manifest_path": str(self.root / "manifest"), "source_root": str(self.root / "source"),
+            "matching_config": {}, "epoch_validation": {}, "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": {}, "guardrail_manifest": {}, "guardrail_config": {},
+            "historical": {
+                "report_path": str(self.root / "report"), "report_sha256": "a" * 64,
+                "checkpoint_path": str(self.root / "checkpoint"), "checkpoint_sha256": "b" * 64,
+                "checkpoint_label": "fixture",
+            },
+            "input_hashes": {"source": "a" * 64, "target": "b" * 64, "validation_manifest": "c" * 64},
+        }
+        self.config_hash = content_hash(self.record)
+        self.path = self.root / "record.json"
+        self.path.write_text(json.dumps(self.record))
+        (self.suite / "resolved_suite_inputs.json").write_text(json.dumps(self.record))
+        self.child = mock.Mock()
+        self.child.wait.return_value = 0
+
+    def write_result(self, command):
+        self.assertIn("scripts.streamed_overlap_evaluate_child", command)
+        attempt = command[command.index("--attempt-id") + 1]
+        self.assertEqual(command[command.index("--mps-memory-fraction") + 1], "0.4")
+        final = {}
+        for arm in ("S1", "S2", "S3"):
+            directory = self.suite / arm
+            directory.mkdir()
+            checkpoint = directory / "last.pt"
+            checkpoint.write_bytes(f"{arm} checkpoint".encode())
+            final[arm] = {"arm": arm, "config_sha256": self.config_hash,
+                          "checkpoint_sha256": runner.file_hash(checkpoint)}
+        cosine = {"sources": {f"{arm}_final": {"checkpoint": final[arm]} for arm in final}}
+        head = {"checks": {"final": {"source": {"checkpoint": final["S3"]}}}}
+        hashes = {}
+        for key, report in (("mu_cosine_comparisons", cosine), ("pair_head_metric_checks", head)):
+            report["sha256"] = content_hash(report)
+            hashes[key] = report["sha256"]
+            (self.suite / f"{key}.json").write_text(json.dumps(report))
+        receipt = {
+            "schema": "streamed-evaluation-child-result-v1", "status": "REPORTS_COMPUTED_NOT_ADOPTION",
+            "suite_config_sha256": self.config_hash, "suite_dir": str(self.suite), "attempt_id": attempt,
+            "mps_memory_fraction": 0.4, "final_checkpoints": final, "report_sha256": hashes,
+        }
+        Path(command[command.index("--receipt") + 1]).write_text(json.dumps(receipt))
+        return self.child
+
+    def attempt(self):
+        return runner.evaluation_attempt(
+            self.path, self.suite, self.logs, "evaluation", config_sha256=self.config_hash,
+            mps_memory_fraction=0.4,
+        )
+
+    def test_completed_child_requires_unchanged_artifacts_and_synced_log(self):
+        with mock.patch.object(runner.subprocess, "Popen", side_effect=self.write_result), \
+             mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]), \
+             mock.patch.object(runner.platform, "platform", return_value="fixture-platform"):
+            self.assertEqual(self.attempt(), 0)
+        manifest_path = self.logs / "run_manifest.json"
+        self.assertEqual(json.loads(manifest_path.read_text())["status"], "evaluation_child_complete_log_unconfirmed")
+        with self.assertRaisesRegex(ValueError, "completed log"):
+            runner.confirm_evaluation_log(self.logs)
+        (self.logs / "training.log").write_text("captured fixture log")
+        report = self.suite / "pair_head_metric_checks.json"
+        original = report.read_text()
+        report.write_text("{}")
+        with self.assertRaisesRegex(ValueError, "report is missing or changed"):
+            runner.confirm_evaluation_log(self.logs)
+        report.write_text(original)
+        self.path.write_text("{}")
+        with self.assertRaisesRegex(ValueError, "inputs or receipt"):
+            runner.confirm_evaluation_log(self.logs)
+        self.path.write_text(json.dumps(self.record))
+        receipt = self.logs / "evaluation_receipt.json"
+        original_receipt = receipt.read_text()
+        altered = json.loads(original_receipt)
+        altered["attempt_id"] = "different-attempt"
+        receipt.write_text(json.dumps(altered))
+        with self.assertRaisesRegex(ValueError, "receipt does not match"):
+            runner.confirm_evaluation_log(self.logs)
+        receipt.write_text(original_receipt)
+        checkpoint = self.suite / "S3" / "last.pt"
+        original_checkpoint = checkpoint.read_bytes()
+        checkpoint.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "checkpoint is missing or changed"):
+            runner.confirm_evaluation_log(self.logs)
+        checkpoint.write_bytes(original_checkpoint)
+        with mock.patch.object(runner.os, "fsync", side_effect=OSError("log sync failed")):
+            with self.assertRaisesRegex(OSError, "log sync failed"):
+                runner.confirm_evaluation_log(self.logs)
+        self.assertEqual(json.loads(manifest_path.read_text())["status"], "evaluation_child_complete_log_unconfirmed")
+        runner.confirm_evaluation_log(self.logs)
+        final = json.loads(manifest_path.read_text())
+        self.assertEqual(final["status"], "evaluation_complete_training_not_authorized")
+        self.assertFalse(final["production_training_allowed"])
+        self.assertEqual(final["receipt_sha256"], runner.file_hash(self.logs / "evaluation_receipt.json"))
+        with self.assertRaises(FileExistsError):
+            self.attempt()
+
+    def test_invalid_inputs_missing_receipt_and_child_failure_are_not_success(self):
+        self.path.write_text("{}")
+        with mock.patch.object(runner.subprocess, "Popen") as start, \
+             mock.patch.object(runner.platform, "platform", return_value="fixture-platform"):
+            with self.assertRaisesRegex(ValueError, "pinned configuration hash"):
+                self.attempt()
+            start.assert_not_called()
+        self.assertFalse((self.logs / "run_manifest.json").exists())
+        self.path.write_text(json.dumps(self.record))
+        with self.assertRaisesRegex(ValueError, "logs must be separate"):
+            runner.evaluation_attempt(
+                self.path, self.suite, self.suite, "evaluation", config_sha256=self.config_hash,
+                mps_memory_fraction=0.4,
+            )
+        self.assertFalse((self.suite / "run_manifest.json").exists())
+        for returncode, error in ((0, "receipt"), (7, None)):
+            logs = self.root / f"logs-{returncode}"
+            logs.mkdir()
+            self.child.wait.return_value = returncode
+            with self.subTest(returncode=returncode), \
+                 mock.patch.object(runner.subprocess, "Popen", return_value=self.child), \
+                 mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]), \
+                 mock.patch.object(runner.platform, "platform", return_value="fixture-platform"):
+                if error:
+                    with self.assertRaisesRegex(ValueError, error):
+                        runner.evaluation_attempt(
+                            self.path, self.suite, logs, "evaluation", config_sha256=self.config_hash,
+                            mps_memory_fraction=0.4,
+                        )
+                else:
+                    self.assertEqual(runner.evaluation_attempt(
+                        self.path, self.suite, logs, "evaluation", config_sha256=self.config_hash,
+                        mps_memory_fraction=0.4,
+                    ), 7)
+            manifest = json.loads((logs / "run_manifest.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertNotEqual(manifest["returncode"], 0)
+            self.assertEqual(manifest["child_returncode"], returncode)
+
+    def test_interruption_records_failure_and_signals_only_child(self):
+        self.child.wait.side_effect = [SystemExit(143), 0]
+        with mock.patch.object(runner.subprocess, "Popen", return_value=self.child), \
+             mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]), \
+             mock.patch.object(runner.platform, "platform", return_value="fixture-platform"):
+            with self.assertRaises(SystemExit) as error:
+                self.attempt()
+        self.assertEqual(error.exception.code, 143)
+        self.child.send_signal.assert_called_once_with(runner.signal.SIGTERM)
+        manifest = json.loads((self.logs / "run_manifest.json").read_text())
+        self.assertEqual((manifest["status"], manifest["returncode"]), ("interrupted", 143))
+
+    def test_child_receipt_is_exclusive_before_evaluation(self):
+        receipt = self.logs / "receipt.json"
+        args = [
+            "child", "--suite-record", str(self.path), "--suite-dir", str(self.suite),
+            "--config-sha256", self.config_hash, "--attempt-id", "fixture", "--mps-memory-fraction", "0.4",
+            "--receipt", str(receipt),
+        ]
+        with mock.patch.object(sys, "argv", args), \
+             mock.patch.object(evaluate_child, "evaluate", return_value={"status": "fixture"}) as evaluate, \
+             contextlib.redirect_stdout(io.StringIO()):
+            evaluate_child.main()
+            self.assertEqual(json.loads(receipt.read_text()), {"status": "fixture"})
+            evaluate.reset_mock()
+            with self.assertRaisesRegex(ValueError, "new absolute file"):
+                evaluate_child.main()
+            evaluate.assert_not_called()
+
+    def test_internal_cli_routes_attempt_and_confirmation(self):
+        args = [
+            "runner", "--action", "evaluate-attempt", "--log-dir", str(self.logs), "--config", str(self.path),
+            "--run-dir", str(self.suite), "--run-id", "evaluation", "--config-sha256", self.config_hash,
+            "--mps-memory-fraction", "0.4",
+        ]
+        with mock.patch.object(sys, "argv", args), mock.patch.object(runner.signal, "signal"), \
+             mock.patch.object(runner, "evaluation_attempt", return_value=0) as attempt:
+            with self.assertRaises(SystemExit) as result:
+                runner.main()
+            self.assertEqual(result.exception.code, 0)
+            attempt.assert_called_once_with(
+                self.path, self.suite, self.logs, "evaluation", config_sha256=self.config_hash,
+                mps_memory_fraction=0.4,
+            )
+        with mock.patch.object(sys, "argv", ["runner", "--action", "confirm-evaluation-log",
+                                             "--log-dir", str(self.logs)]), \
+             mock.patch.object(runner.signal, "signal"), \
+             mock.patch.object(runner, "confirm_evaluation_log") as confirm:
+            runner.main()
+            confirm.assert_called_once_with(self.logs)
 
 
 class AuditAttemptTests(unittest.TestCase):

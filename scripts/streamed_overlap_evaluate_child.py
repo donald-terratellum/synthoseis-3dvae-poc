@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+from typing import BinaryIO
 
 import torch
 
@@ -12,6 +13,7 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
     _bind_suite_inputs, _read_pinned_suite_record, run_suite_from_record,
 )
+from scripts.streamed_overlap_journal import _publish_exclusive
 
 
 def evaluate(
@@ -66,12 +68,22 @@ def main() -> None:
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--mps-memory-fraction", type=float, required=True)
+    parser.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args()
+    if (not args.receipt.is_absolute() or args.receipt.exists() or args.receipt.is_symlink()
+            or args.receipt.parent.is_symlink() or not args.receipt.parent.is_dir()):
+        raise ValueError("Evaluation receipt requires a new absolute file in a regular directory.")
     result = evaluate(
         args.suite_record, args.suite_dir, config_sha256=args.config_sha256,
         attempt_id=args.attempt_id, mps_memory_fraction=args.mps_memory_fraction,
     )
-    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+    data = (json.dumps(result, sort_keys=True, allow_nan=False) + "\n").encode()
+
+    def write(handle: BinaryIO) -> None:
+        handle.write(data)
+
+    _publish_exclusive(args.receipt, write)
+    print(data.decode(), end="", flush=True)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import hashlib
 import fcntl
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -332,6 +333,183 @@ def confirm_prepare_log(log_dir: Path) -> None:
     save_json(manifest_path, manifest, replace=True)
 
 
+def _verify_evaluation_result(manifest: dict, log_dir: Path) -> str:
+    from scripts.streamed_overlap_audit import content_hash
+    from scripts.streamed_overlap_epoch_runner import _bind_suite_inputs, _digest, _read_pinned_suite_record
+
+    record_path = Path(manifest["record_path"])
+    suite_dir = Path(manifest["output_path"])
+    receipt_path = log_dir / "evaluation_receipt.json"
+    if (suite_dir.is_symlink() or not suite_dir.is_dir()
+            or receipt_path.is_symlink() or not receipt_path.is_file()
+            or file_hash(record_path) != manifest["record_file_sha256"]):
+        raise ValueError("Evaluation inputs or receipt are missing or changed.")
+    record, _, _ = _read_pinned_suite_record(record_path, suite_dir, manifest["suite_config_sha256"])
+    _bind_suite_inputs(suite_dir, record, resume=True)
+    receipt_bytes = receipt_path.read_bytes()
+    receipt = json.loads(receipt_bytes)
+    if (not isinstance(receipt, dict) or receipt.get("schema") != "streamed-evaluation-child-result-v1"
+            or receipt.get("status") != "REPORTS_COMPUTED_NOT_ADOPTION"
+            or receipt.get("suite_config_sha256") != manifest["suite_config_sha256"]
+            or receipt.get("suite_dir") != str(suite_dir.resolve())
+            or receipt.get("attempt_id") != manifest["attempt_id"]
+            or receipt.get("mps_memory_fraction") != manifest["mps_memory_fraction"]):
+        raise ValueError("Evaluation receipt does not match the attempt.")
+    final = receipt.get("final_checkpoints")
+    report_hashes = receipt.get("report_sha256")
+    if (not isinstance(final, dict) or set(final) != {"S1", "S2", "S3"}
+            or any(not isinstance(final[arm], dict) or final[arm].get("arm") != arm
+                   or final[arm].get("config_sha256") != manifest["suite_config_sha256"]
+                   for arm in final)
+            or not isinstance(report_hashes, dict)
+            or set(report_hashes) != {"mu_cosine_comparisons", "pair_head_metric_checks"}):
+        raise ValueError("Evaluation receipt lacks matching checkpoints or report identities.")
+    for arm, identity in final.items():
+        checkpoint = suite_dir / arm / "last.pt"
+        if (checkpoint.parent.is_symlink() or checkpoint.is_symlink() or not checkpoint.is_file()
+                or _digest(checkpoint) != identity.get("checkpoint_sha256")):
+            raise ValueError("Evaluation final checkpoint is missing or changed.")
+    reports = {}
+    report_file_hashes = {}
+    for key in ("mu_cosine_comparisons", "pair_head_metric_checks"):
+        path = suite_dir / f"{key}.json"
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Evaluation report is missing or changed.")
+        raw = path.read_bytes()
+        report = json.loads(raw)
+        if (not isinstance(report, dict) or report.get("sha256") != report_hashes[key]
+                or report.get("sha256") != content_hash({k: v for k, v in report.items() if k != "sha256"})):
+            raise ValueError("Evaluation report is missing or changed.")
+        reports[key] = report
+        report_file_hashes[path] = hashlib.sha256(raw).hexdigest()
+    if (any(reports["mu_cosine_comparisons"]["sources"][f"{arm}_final"]["checkpoint"] != final[arm]
+            for arm in ("S1", "S2", "S3"))
+            or reports["pair_head_metric_checks"]["checks"]["final"]["source"]["checkpoint"] != final["S3"]):
+        raise ValueError("Evaluation reports do not match the final checkpoint identities.")
+    if (file_hash(receipt_path) != hashlib.sha256(receipt_bytes).hexdigest()
+            or file_hash(record_path) != manifest["record_file_sha256"]
+            or any(path.is_symlink() or not path.is_file() or file_hash(path) != digest
+                   for path, digest in report_file_hashes.items())):
+        raise ValueError("Evaluation inputs or reports changed during verification.")
+    _bind_suite_inputs(suite_dir, record, resume=True)
+    return hashlib.sha256(receipt_bytes).hexdigest()
+
+
+def evaluation_attempt(
+    record_path: Path, suite_dir: Path, log_dir: Path, run_id: str, *,
+    config_sha256: str, mps_memory_fraction: float,
+) -> int:
+    """Run the evaluation-only child; successful log capture requires separate confirmation."""
+    from scripts.streamed_overlap_epoch_runner import _bind_suite_inputs, _read_pinned_suite_record
+
+    if (log_dir.is_symlink() or not log_dir.is_dir()
+            or not isinstance(run_id, str) or not run_id or any(c in run_id for c in "\r\n")
+            or isinstance(mps_memory_fraction, bool)
+            or not isinstance(mps_memory_fraction, (int, float))
+            or not math.isfinite(mps_memory_fraction) or not 0 < mps_memory_fraction <= 0.5):
+        raise ValueError("An existing log directory, run ID and explicit MPS memory fraction are required.")
+    record, _, _ = _read_pinned_suite_record(record_path, suite_dir, config_sha256)
+    log_root = log_dir.resolve()
+    for protected in (suite_dir.resolve(), Path(record["source_root"]).resolve()):
+        if log_root.is_relative_to(protected) or protected.is_relative_to(log_root):
+            raise ValueError("Evaluation logs must be separate from the suite and source directories.")
+    manifest_path = log_dir / "run_manifest.json"
+    receipt = log_dir / "evaluation_receipt.json"
+    if any(path.exists() or path.is_symlink() for path in (manifest_path, receipt)):
+        raise FileExistsError("Refusing an existing evaluation attempt manifest or receipt.")
+    attempt_id = uuid.uuid4().hex
+    command = [
+        sys.executable, "-u", "-m", "scripts.streamed_overlap_evaluate_child",
+        "--suite-record", str(record_path.resolve()), "--suite-dir", str(suite_dir.resolve()),
+        "--config-sha256", config_sha256, "--attempt-id", attempt_id,
+        "--mps-memory-fraction", str(mps_memory_fraction), "--receipt", str(receipt.resolve()),
+    ]
+    manifest = {
+        "schema_version": 1, "mode": "evaluate", "run_id": run_id, "attempt_id": attempt_id,
+        "started_at_utc": utc_now(), "status": "preflight", "command": command,
+        "record_path": str(record_path.resolve()), "output_path": str(suite_dir.resolve()),
+        "log_path": str((log_dir / "training.log").resolve()), "suite_config_sha256": config_sha256,
+        "mps_memory_fraction": mps_memory_fraction, "production_training_allowed": False,
+        "training_device": "mps", "python": sys.version, "platform": platform.platform(),
+        "runner_sha256": file_hash(Path(__file__)),
+        "evaluate_child_sha256": file_hash(Path(__file__).with_name("streamed_overlap_evaluate_child.py")),
+    }
+    save_json(manifest_path, manifest)
+    returncode = 1
+    try:
+        if suite_dir.is_symlink() or not suite_dir.is_dir():
+            raise ValueError("Evaluation requires an existing regular suite directory.")
+        record, _, _ = _read_pinned_suite_record(record_path, suite_dir, config_sha256)
+        _bind_suite_inputs(suite_dir, record, resume=True)
+        manifest["record_file_sha256"] = file_hash(record_path)
+        manifest["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        changes = subprocess.check_output(["git", "diff", "HEAD", "--binary"])
+        manifest["git_diff_sha256"] = hashlib.sha256(changes).hexdigest()
+        manifest["git_status"] = subprocess.check_output(["git", "status", "--short"], text=True).splitlines()
+        manifest["versions"] = {
+            package: importlib.metadata.version(package)
+            for package in ("numpy", "zarr", "torch", "tensorboard", "lpips")
+        }
+        manifest["status"] = "running"
+        save_json(manifest_path, manifest, replace=True)
+        print(f"Evaluation command: {shlex.join(command)}", flush=True)
+        child = subprocess.Popen(command)
+        try:
+            returncode = child.wait()
+        except (KeyboardInterrupt, SystemExit) as interruption:
+            code = interruption.code if isinstance(interruption, SystemExit) else 130
+            returncode = code if isinstance(code, int) else 1
+            manifest["status"] = "interrupted"
+            child.send_signal(signal.SIGTERM if isinstance(interruption, SystemExit) else signal.SIGINT)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            raise
+        manifest["child_returncode"] = returncode
+        if returncode == 0:
+            manifest["receipt_sha256"] = _verify_evaluation_result(manifest, log_dir)
+            manifest["status"] = "evaluation_child_complete_log_unconfirmed"
+        else:
+            manifest["status"] = "failed"
+        returncode = returncode if returncode >= 0 else 128 - returncode
+        return returncode
+    except KeyboardInterrupt:
+        manifest["status"] = "interrupted"
+        returncode = 130
+        raise
+    finally:
+        if manifest["status"] in ("preflight", "running"):
+            manifest["status"] = "failed"
+            if returncode == 0:
+                returncode = 1
+        manifest["returncode"] = returncode
+        manifest["finished_at_utc"] = utc_now()
+        save_json(manifest_path, manifest, replace=True)
+
+
+def confirm_evaluation_log(log_dir: Path) -> None:
+    manifest_path = log_dir / "run_manifest.json"
+    log_path = log_dir / "training.log"
+    if (log_dir.is_symlink() or not log_dir.is_dir()
+            or any(path.is_symlink() or not path.is_file() for path in (manifest_path, log_path))):
+        raise ValueError("Evaluation requires a regular attempt manifest and completed log.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (not isinstance(manifest, dict) or manifest.get("mode") != "evaluate"
+            or manifest.get("status") != "evaluation_child_complete_log_unconfirmed"
+            or manifest.get("production_training_allowed") is not False
+            or manifest.get("returncode") != 0 or manifest.get("child_returncode") != 0
+            or manifest.get("log_path") != str(log_path.resolve())):
+        raise ValueError("Evaluation attempt is not awaiting log confirmation.")
+    if _verify_evaluation_result(manifest, log_dir) != manifest["receipt_sha256"]:
+        raise ValueError("Evaluation receipt changed before log confirmation.")
+    with log_path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    manifest["status"] = "evaluation_complete_training_not_authorized"
+    save_json(manifest_path, manifest, replace=True)
+
+
 def process_identity(pid: int) -> dict | None:
     if pid <= 1:
         raise ValueError("Refusing an unsafe service PID.")
@@ -531,7 +709,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, terminate)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--action", required=True, choices=(
-        "audit", "smoke", "prepare", "confirm-prepare-log", "tensorboard", "tensorboard-status", "tensorboard-stop",
+        "audit", "smoke", "prepare", "confirm-prepare-log", "evaluate-attempt", "confirm-evaluation-log",
+        "tensorboard", "tensorboard-status", "tensorboard-stop",
     ))
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--run-id")
@@ -540,10 +719,22 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--mps-memory-fraction", type=float)
     parser.add_argument("--max-wall-seconds", type=float)
+    parser.add_argument("--config-sha256")
     args = parser.parse_args()
     if args.action == "confirm-prepare-log":
         confirm_prepare_log(args.log_dir)
         return
+    if args.action == "confirm-evaluation-log":
+        confirm_evaluation_log(args.log_dir)
+        return
+    if args.action == "evaluate-attempt":
+        if (args.config is None or args.run_dir is None or args.run_id is None
+                or args.config_sha256 is None or args.mps_memory_fraction is None):
+            parser.error("Evaluation requires a suite record, suite directory, run ID, config hash and MPS limit.")
+        raise SystemExit(evaluation_attempt(
+            args.config, args.run_dir, args.log_dir, args.run_id,
+            config_sha256=args.config_sha256, mps_memory_fraction=args.mps_memory_fraction,
+        ))
     if args.action in {"audit", "smoke", "prepare"}:
         if args.config is None or args.output is None or args.run_id is None:
             parser.error("Audit, smoke and prepare require --config, --output and --run-id.")

@@ -15,13 +15,23 @@ decision. A changed input record or invalid returned report fails.
 This child is a runner component, not a complete launch command: it does not
 capture a durable combined log, start TensorBoard, establish disk or memory
 headroom, or verify historical measurement provenance. It can write evaluation
-reports and journal recovery records and is not atomic. The outer logged runner
-and local resource checks remain to be integrated; shell train/resume/evaluate
-remain blocked and no training is authorized.
-Initialization, epoch and runner fixtures passed 88 tests and 42 subtests using
-`.venv/bin/python -m pytest -q tests/test_streamed_overlap_initialization.py
-tests/test_streamed_overlap_epoch_runner.py tests/test_streamed_overlap_runner.py`.
-The child test mocked MPS and suite execution; no real evaluation or training ran.
+reports and journal recovery records and is not atomic.
+
+The runner's `evaluate-attempt` action now invokes that child and creates an
+attempt manifest and exclusive receipt. A successful child remains
+`evaluation_child_complete_log_unconfirmed` until `confirm-evaluation-log`
+rechecks the record, receipt, final checkpoint hashes and separate reports,
+then syncs the combined log. The caller must invoke confirmation only after
+the stdout/stderr capture pipeline succeeds; confirmation cannot independently
+prove that `tee` captured all output. Interruption and child failures are
+recorded without reporting completion. Checking the checkpoints again adds
+disk I/O. These actions are components for future shell integration, not
+resource approval: shell train/resume/evaluate remain blocked, and no training
+is authorized.
+Runner, initialization and epoch fixtures passed 93 tests and 44 subtests using
+`.venv/bin/python -m pytest -q tests/test_streamed_overlap_runner.py
+tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_epoch_runner.py`.
+They used synthetic files and mocked child execution; no real suite was evaluated.
 
 For a prospective fresh suite, review storage against a prepared suite record:
 
