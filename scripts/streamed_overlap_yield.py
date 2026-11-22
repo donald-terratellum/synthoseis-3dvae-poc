@@ -28,7 +28,7 @@ from scripts.streamed_overlap_targets import (
 SEISMIC_KEY = "seismicCubes_cumsum_fullstack"
 
 
-def _origin(group, rng, *, depth_margin=0):
+def _origin(group, rng, *, depth_margin=0) -> tuple[int, int, int]:
     keys = (SEISMIC_KEY, *LABEL_KEYS)
     if any(key not in group for key in keys):
         raise ValueError("Source is missing required seismic or semantic arrays.")
@@ -41,7 +41,11 @@ def _origin(group, rng, *, depth_margin=0):
     maxima[2] -= depth_margin
     if any(value < 0 for value in maxima):
         raise ValueError("Source has insufficient fully supported same-index windows.")
-    return tuple(int(rng.integers(0, maximum + 1)) for maximum in maxima)
+    return (
+        int(rng.integers(0, maxima[0] + 1)),
+        int(rng.integers(0, maxima[1] + 1)),
+        int(rng.integers(0, maxima[2] + 1)),
+    )
 
 
 def run_preflight(root: Path, seed: int, samples_per_source: int) -> dict:

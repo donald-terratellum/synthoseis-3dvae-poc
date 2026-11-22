@@ -139,7 +139,7 @@ class PairTargetTests(unittest.TestCase):
                          "a:zero_event_denominator")
         self.source["geologic_age_faulted"][0, 0, 1] = np.nan
         self.assertEqual(pair_target(self.source, self.source, self.a, self.b).unavailable_reason,
-                         "nonfinite:shared_age_bounds")
+                         "a:nonfinite:labels")
         source = {key: np.repeat(value, 2, axis=0) for key, value in self.source.items()}
         source["geologic_age_faulted"][0] = 0
         source["geologic_age_faulted"][1] = 2
@@ -147,6 +147,15 @@ class PairTargetTests(unittest.TestCase):
         b = Window("s", (0, 0, 1), (2, 1, 5))
         self.assertEqual(pair_target(source, source, a, b).unavailable_reason,
                          "a:empty_age_support")
+
+    def test_nonfinite_negative_is_unavailable_not_zero(self):
+        other = Window("other", self.b.origin, self.b.shape)
+        other_source = {key: value.copy() for key, value in self.source.items()}
+        other_source["gas_closures"] = other_source["gas_closures"].astype(float)
+        other_source["gas_closures"][0, 0, 1] = np.nan
+        result = pair_target(self.source, other_source, self.a, other)
+        self.assertIsNone(result.coverage)
+        self.assertEqual(result.unavailable_reason, "b:nonfinite:labels")
 
     def test_excludes_known_padded_label_tail(self):
         source = {

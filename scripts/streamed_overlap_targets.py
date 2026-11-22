@@ -33,11 +33,20 @@ class Window:
 
     @property
     def end(self) -> tuple[int, int, int]:
-        return tuple(start + size for start, size in zip(self.origin, self.shape))
+        return (
+            self.origin[0] + self.shape[0],
+            self.origin[1] + self.shape[1],
+            self.origin[2] + self.shape[2],
+        )
 
     @property
     def slices(self) -> tuple[slice, slice, slice]:
-        return tuple(slice(start, end) for start, end in zip(self.origin, self.end))
+        end = self.end
+        return (
+            slice(self.origin[0], end[0]),
+            slice(self.origin[1], end[1]),
+            slice(self.origin[2], end[2]),
+        )
 
 
 @dataclass(frozen=True)
@@ -144,6 +153,15 @@ def pair_target(
             ):
                 return PairTarget(None if key == seismic_key else overlap, None,
                                   f"{label}:unusable_dtype:{key}")
+    window_labels = []
+    for label, source, window in (("a", source_a, window_a), ("b", source_b, window_b)):
+        seismic_crop = _read_bounded(source[seismic_key], window.slices)
+        if not np.isfinite(seismic_crop).all():
+            return PairTarget(overlap, None, f"{label}:nonfinite:seismic")
+        arrays = [_read_bounded(source[key], window.slices) for key in keys[1:]]
+        if any(not np.isfinite(array).all() for array in arrays):
+            return PairTarget(overlap, None, f"{label}:nonfinite:labels")
+        window_labels.append(arrays)
     if not same or overlap == 0:
         return PairTarget(overlap, 0.0)
 
@@ -158,11 +176,8 @@ def pair_target(
     low, high = sorted((float(shallow.mean(dtype=np.float64)), float(deep.mean(dtype=np.float64))))
 
     fractions = []
-    for label, source, window in (("a", source_a, window_a), ("b", source_b, window_b)):
-        arrays = [_read_bounded(source[key], window.slices) for key in keys[1:]]
-        if any(not np.isfinite(array).all() for array in arrays):
-            return PairTarget(overlap, None, f"{label}:nonfinite:labels")
-        result = _fluid_fractions(*arrays, low, high)
+    for label, arrays in zip(("a", "b"), window_labels):
+        result = _fluid_fractions(arrays[0], arrays[1], arrays[2], low, high)
         if result is None:
             return PairTarget(overlap, None, f"{label}:empty_age_support")
         fractions.append(result)
