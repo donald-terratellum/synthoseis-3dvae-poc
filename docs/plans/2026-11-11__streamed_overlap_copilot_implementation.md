@@ -4,6 +4,20 @@ Updated: 2026-11-22.
 
 ## Local continuation: post-selection evaluation
 
+An opt-in `verify_matched_arm_records` helper now checks a candidate S2/S3
+against S1 using retained epoch-zero and reconciled final checkpoints plus
+committed journal provenance. It verifies the specified fresh E1 weights and
+initial sampler seed, matching configuration, exposure, recorded pair and
+augmentation streams, and initial/final RNG states. Replayed stale records
+are excluded. Its result is limited to recorded evidence: it does not prove
+the source data or actual tensors were unchanged, verify every intermediate
+RNG state, or authorize adoption. The suite runner must retain each arm's
+initial checkpoint, bind the seeds to its frozen configuration, and invoke
+this verifier; the helper does not launch training. Only synthetic evidence
+was checked in this continuation. It does not check the recorded optimizer
+rules or certify that the supplied seeds are bound to the suite configuration.
+The portable streamed suite passed 178 tests, with one skipped and 21 subtests.
+
 The per-arm epoch helper now requires the frozen reconstruction configuration
 and historical reference hashes before restoring or training. After final
 selection, it runs the recoverable reconstruction comparison for S1/S2's
