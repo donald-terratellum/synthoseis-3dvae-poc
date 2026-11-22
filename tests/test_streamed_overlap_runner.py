@@ -224,7 +224,7 @@ class EvaluationAttemptTests(unittest.TestCase):
     def attempt(self):
         return runner.evaluation_attempt(
             self.path, self.suite, self.logs, "evaluation", config_sha256=self.config_hash,
-            mps_memory_fraction=0.4,
+            mps_memory_fraction=0.4, min_suite_free_bytes=1, min_log_free_bytes=1,
         )
 
     def test_completed_child_requires_unchanged_artifacts_and_synced_log(self):
@@ -269,6 +269,8 @@ class EvaluationAttemptTests(unittest.TestCase):
         final = json.loads(manifest_path.read_text())
         self.assertEqual(final["status"], "evaluation_complete_training_not_authorized")
         self.assertFalse(final["production_training_allowed"])
+        self.assertGreaterEqual(final["free_space_preflight"]["suite"]["available_bytes"], 1)
+        self.assertGreaterEqual(final["free_space_preflight"]["log"]["available_bytes"], 1)
         self.assertEqual(final["receipt_sha256"], runner.file_hash(self.logs / "evaluation_receipt.json"))
         with self.assertRaises(FileExistsError):
             self.attempt()
@@ -285,7 +287,7 @@ class EvaluationAttemptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "logs must be separate"):
             runner.evaluation_attempt(
                 self.path, self.suite, self.suite, "evaluation", config_sha256=self.config_hash,
-                mps_memory_fraction=0.4,
+                mps_memory_fraction=0.4, min_suite_free_bytes=1, min_log_free_bytes=1,
             )
         self.assertFalse((self.suite / "run_manifest.json").exists())
         for returncode, error in ((0, "receipt"), (7, None)):
@@ -300,17 +302,61 @@ class EvaluationAttemptTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, error):
                         runner.evaluation_attempt(
                             self.path, self.suite, logs, "evaluation", config_sha256=self.config_hash,
-                            mps_memory_fraction=0.4,
+                            mps_memory_fraction=0.4, min_suite_free_bytes=1, min_log_free_bytes=1,
                         )
                 else:
                     self.assertEqual(runner.evaluation_attempt(
                         self.path, self.suite, logs, "evaluation", config_sha256=self.config_hash,
-                        mps_memory_fraction=0.4,
+                        mps_memory_fraction=0.4, min_suite_free_bytes=1, min_log_free_bytes=1,
                     ), 7)
             manifest = json.loads((logs / "run_manifest.json").read_text())
             self.assertEqual(manifest["status"], "failed")
             self.assertNotEqual(manifest["returncode"], 0)
             self.assertEqual(manifest["child_returncode"], returncode)
+
+    def test_free_space_floors_block_child_and_record_measurements(self):
+        for suite_free, log_free, failed in ((99, 200, "suite"), (100, 199, "log")):
+            logs = self.root / f"logs-{failed}"
+            logs.mkdir()
+            with self.subTest(failed=failed), \
+                 mock.patch("scripts.streamed_overlap_epoch_runner._filesystem_available_bytes",
+                            side_effect=[suite_free, log_free]) as available, \
+                 mock.patch.object(runner.subprocess, "Popen") as start, \
+                 mock.patch.object(runner.platform, "platform", return_value="fixture-platform"):
+                with self.assertRaisesRegex(OSError, f"Insufficient free space for evaluation {failed}"):
+                    runner.evaluation_attempt(
+                        self.path, self.suite, logs, "evaluation", config_sha256=self.config_hash,
+                        mps_memory_fraction=0.4, min_suite_free_bytes=100, min_log_free_bytes=200,
+                    )
+                self.assertEqual(available.call_args_list, [mock.call(self.suite), mock.call(logs)])
+                start.assert_not_called()
+            manifest = json.loads((logs / "run_manifest.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["free_space_preflight"]["suite"]["available_bytes"], suite_free)
+            self.assertEqual(manifest["free_space_preflight"]["log"]["available_bytes"], log_free)
+
+        with mock.patch.object(runner.subprocess, "Popen") as start:
+            for value in (0, -1, True, 1.5):
+                with self.subTest(invalid=value), self.assertRaisesRegex(ValueError, "free-space floors"):
+                    runner.evaluation_attempt(
+                        self.path, self.suite, self.logs, "evaluation", config_sha256=self.config_hash,
+                        mps_memory_fraction=0.4, min_suite_free_bytes=value, min_log_free_bytes=1,
+                    )
+            start.assert_not_called()
+        self.assertFalse((self.logs / "run_manifest.json").exists())
+
+    def test_free_space_equal_to_floors_permits_child(self):
+        self.child.wait.return_value = 7
+        with mock.patch("scripts.streamed_overlap_epoch_runner._filesystem_available_bytes",
+                        side_effect=[100, 200]), \
+             mock.patch.object(runner.subprocess, "Popen", return_value=self.child) as start, \
+             mock.patch.object(runner.subprocess, "check_output", side_effect=["fixture", b"fixture", ""]), \
+             mock.patch.object(runner.platform, "platform", return_value="fixture-platform"):
+            self.assertEqual(runner.evaluation_attempt(
+                self.path, self.suite, self.logs, "evaluation", config_sha256=self.config_hash,
+                mps_memory_fraction=0.4, min_suite_free_bytes=100, min_log_free_bytes=200,
+            ), 7)
+        start.assert_called_once()
 
     def test_interruption_records_failure_and_signals_only_child(self):
         self.child.wait.side_effect = [SystemExit(143), 0]
@@ -345,7 +391,7 @@ class EvaluationAttemptTests(unittest.TestCase):
         args = [
             "runner", "--action", "evaluate-attempt", "--log-dir", str(self.logs), "--config", str(self.path),
             "--run-dir", str(self.suite), "--run-id", "evaluation", "--config-sha256", self.config_hash,
-            "--mps-memory-fraction", "0.4",
+            "--mps-memory-fraction", "0.4", "--min-suite-free-bytes", "100", "--min-log-free-bytes", "200",
         ]
         with mock.patch.object(sys, "argv", args), mock.patch.object(runner.signal, "signal"), \
              mock.patch.object(runner, "evaluation_attempt", return_value=0) as attempt:
@@ -354,8 +400,15 @@ class EvaluationAttemptTests(unittest.TestCase):
             self.assertEqual(result.exception.code, 0)
             attempt.assert_called_once_with(
                 self.path, self.suite, self.logs, "evaluation", config_sha256=self.config_hash,
-                mps_memory_fraction=0.4,
+                mps_memory_fraction=0.4, min_suite_free_bytes=100, min_log_free_bytes=200,
             )
+        with mock.patch.object(sys, "argv", args[:-4]), mock.patch.object(runner.signal, "signal"), \
+             mock.patch.object(runner, "evaluation_attempt") as attempt, \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                runner.main()
+            self.assertEqual(result.exception.code, 2)
+            attempt.assert_not_called()
         with mock.patch.object(sys, "argv", ["runner", "--action", "confirm-evaluation-log",
                                              "--log-dir", str(self.logs)]), \
              mock.patch.object(runner.signal, "signal"), \

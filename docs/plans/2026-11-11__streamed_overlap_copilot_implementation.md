@@ -24,11 +24,23 @@ rechecks the record, receipt, final checkpoint hashes and separate reports,
 then syncs the combined log. The caller must invoke confirmation only after
 the stdout/stderr capture pipeline succeeds; confirmation cannot independently
 prove that `tee` captured all output. Interruption and child failures are
-recorded without reporting completion. Checking the checkpoints again adds
-disk I/O. These actions are components for future shell integration, not
+recorded without reporting completion. Before launching the child,
+`evaluate-attempt` now requires explicit `--min-suite-free-bytes` and
+`--min-log-free-bytes` floors, measures available bytes at both existing
+directories, records those measurements in the attempt manifest and fails if
+either falls below its floor. The caller must choose floors covering all
+remaining evaluation writes, logs, retries, filesystem overhead and reserve;
+when paths share a filesystem or storage pool, both floors must account for
+their combined use. These floors are not verified output estimates, the
+measurements are not reservations, and concurrent use can invalidate them.
+
+Checking the checkpoints again adds disk I/O. The MPS fraction is per process,
+not a combined memory bound: bounded tokenizer searches start separate
+processes with their own frozen MPS setting. Memory headroom is still
+unverified. These actions are components for future shell integration, not
 resource approval: shell train/resume/evaluate remain blocked, and no training
-is authorized.
-Runner, initialization and epoch fixtures passed 93 tests and 44 subtests using
+is authorized. No real evaluation has been run.
+Runner, initialization and epoch fixtures passed 95 tests and 50 subtests using
 `.venv/bin/python -m pytest -q tests/test_streamed_overlap_runner.py
 tests/test_streamed_overlap_initialization.py tests/test_streamed_overlap_epoch_runner.py`.
 They used synthetic files and mocked child execution; no real suite was evaluated.

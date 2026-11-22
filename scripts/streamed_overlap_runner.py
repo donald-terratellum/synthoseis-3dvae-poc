@@ -398,16 +398,21 @@ def _verify_evaluation_result(manifest: dict, log_dir: Path) -> str:
 def evaluation_attempt(
     record_path: Path, suite_dir: Path, log_dir: Path, run_id: str, *,
     config_sha256: str, mps_memory_fraction: float,
+    min_suite_free_bytes: int, min_log_free_bytes: int,
 ) -> int:
     """Run the evaluation-only child; successful log capture requires separate confirmation."""
-    from scripts.streamed_overlap_epoch_runner import _bind_suite_inputs, _read_pinned_suite_record
+    from scripts.streamed_overlap_epoch_runner import (
+        _bind_suite_inputs, _filesystem_available_bytes, _read_pinned_suite_record,
+    )
 
     if (log_dir.is_symlink() or not log_dir.is_dir()
             or not isinstance(run_id, str) or not run_id or any(c in run_id for c in "\r\n")
             or isinstance(mps_memory_fraction, bool)
             or not isinstance(mps_memory_fraction, (int, float))
-            or not math.isfinite(mps_memory_fraction) or not 0 < mps_memory_fraction <= 0.5):
-        raise ValueError("An existing log directory, run ID and explicit MPS memory fraction are required.")
+            or not math.isfinite(mps_memory_fraction) or not 0 < mps_memory_fraction <= 0.5
+            or any(type(value) is not int or value <= 0
+                   for value in (min_suite_free_bytes, min_log_free_bytes))):
+        raise ValueError("An existing log directory, run ID, MPS limit and positive free-space floors are required.")
     record, _, _ = _read_pinned_suite_record(record_path, suite_dir, config_sha256)
     log_root = log_dir.resolve()
     for protected in (suite_dir.resolve(), Path(record["source_root"]).resolve()):
@@ -442,6 +447,18 @@ def evaluation_attempt(
         record, _, _ = _read_pinned_suite_record(record_path, suite_dir, config_sha256)
         _bind_suite_inputs(suite_dir, record, resume=True)
         manifest["record_file_sha256"] = file_hash(record_path)
+        manifest["free_space_preflight"] = {
+            "suite": {"directory": str(suite_dir.resolve()), "minimum_bytes": min_suite_free_bytes,
+                      "available_bytes": _filesystem_available_bytes(suite_dir)},
+            "log": {"directory": str(log_dir.resolve()), "minimum_bytes": min_log_free_bytes,
+                    "available_bytes": _filesystem_available_bytes(log_dir)},
+        }
+        for name, measurement in manifest["free_space_preflight"].items():
+            if measurement["available_bytes"] < measurement["minimum_bytes"]:
+                raise OSError(
+                    f"Insufficient free space for evaluation {name}: need {measurement['minimum_bytes']} bytes, "
+                    f"available {measurement['available_bytes']} bytes."
+                )
         manifest["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         changes = subprocess.check_output(["git", "diff", "HEAD", "--binary"])
         manifest["git_diff_sha256"] = hashlib.sha256(changes).hexdigest()
@@ -720,6 +737,8 @@ def main() -> None:
     parser.add_argument("--mps-memory-fraction", type=float)
     parser.add_argument("--max-wall-seconds", type=float)
     parser.add_argument("--config-sha256")
+    parser.add_argument("--min-suite-free-bytes", type=int)
+    parser.add_argument("--min-log-free-bytes", type=int)
     args = parser.parse_args()
     if args.action == "confirm-prepare-log":
         confirm_prepare_log(args.log_dir)
@@ -729,11 +748,14 @@ def main() -> None:
         return
     if args.action == "evaluate-attempt":
         if (args.config is None or args.run_dir is None or args.run_id is None
-                or args.config_sha256 is None or args.mps_memory_fraction is None):
-            parser.error("Evaluation requires a suite record, suite directory, run ID, config hash and MPS limit.")
+                or args.config_sha256 is None or args.mps_memory_fraction is None
+                or args.min_suite_free_bytes is None or args.min_log_free_bytes is None):
+            parser.error("Evaluation requires a suite record, suite directory, run ID, config hash, "
+                         "MPS limit and free-space floors for suite and logs.")
         raise SystemExit(evaluation_attempt(
             args.config, args.run_dir, args.log_dir, args.run_id,
             config_sha256=args.config_sha256, mps_memory_fraction=args.mps_memory_fraction,
+            min_suite_free_bytes=args.min_suite_free_bytes, min_log_free_bytes=args.min_log_free_bytes,
         ))
     if args.action in {"audit", "smoke", "prepare"}:
         if args.config is None or args.output is None or args.run_id is None:

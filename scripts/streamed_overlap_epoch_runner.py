@@ -559,6 +559,13 @@ def suite_workload(matching_config: dict, search_manifest: dict) -> dict:
     }
 
 
+def _filesystem_available_bytes(directory: Path) -> int:
+    filesystem = os.statvfs(directory)
+    if filesystem.f_frsize <= 0 or filesystem.f_bavail < 0:
+        raise RuntimeError("Filesystem did not provide a valid available-space measurement.")
+    return filesystem.f_frsize * filesystem.f_bavail
+
+
 def suite_storage_preflight(
     matching_config: dict, search_manifest: dict, suite_dir: Path, *,
     checkpoint_upper_bytes: dict[str, int], other_output_bytes: int, free_reserve_bytes: int,
@@ -583,10 +590,7 @@ def suite_storage_preflight(
     checkpoint_bytes = sum(counts[arm] * checkpoint_upper_bytes[arm] for arm in counts)
     transient_bytes = max(checkpoint_upper_bytes.values())
     required = checkpoint_bytes + transient_bytes + other_output_bytes + free_reserve_bytes
-    filesystem = os.statvfs(directory)
-    if filesystem.f_frsize <= 0 or filesystem.f_bavail < 0:
-        raise RuntimeError("Filesystem did not provide a valid available-space measurement.")
-    available = filesystem.f_frsize * filesystem.f_bavail
+    available = _filesystem_available_bytes(directory)
     if available < required:
         raise OSError(
             f"Insufficient estimated suite storage at {directory}: need {required} bytes, "
