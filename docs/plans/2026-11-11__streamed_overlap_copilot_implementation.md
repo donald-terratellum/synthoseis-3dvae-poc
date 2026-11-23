@@ -2,6 +2,63 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: real preparation and preflight
+
+The first real prepared-suite preflight failed before training: the `-04`
+historical guardrail had stale `checkpoint_identity` and `input_fingerprint`
+implementation hashes. All other frozen runtime fields matched. Preparation and
+the suite input check now reject a changed reconstruction runtime before suite
+initialization; the existing full store/runtime verification still runs later.
+These checks do not approve a launch.
+
+The approved historical guardrail was refrozen for the current runtime at
+`/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-05/manifest.json`
+(logical SHA-256 `54625d89c982f3ba9cd6bb80532c6b7cc9df94fe0fa203560863b5e06aa7f19f`).
+All 5,000 synthetic and 5,000 historical real input/target fingerprints and the
+sampling protocol match `-04`. P0b was remeasured on all 10,000 patches; every
+per-patch metric matched the earlier report exactly. The new private
+`p0b_measurement.json` has file SHA-256
+`af8c010352ff825f35248b0f1c6dab0c23eb9c2c4d521703cc651f38dcbf8a64`.
+The historical real store remains a post-selection guardrail, not an untouched
+final-test dataset. The refreeze and measurement took 237.75 seconds, with
+835,256,320 bytes peak process RSS and 93,143,040 bytes MPS driver allocation
+sampled afterward. Runtime changes can invalidate this new manifest too.
+
+An opt-in disposable test now freezes a smoke-only bounded search and diagnostic
+manifest, runs real suite-record preparation, and invokes the internal runner
+through its actual primary-validation, search, 3,300-window diagnostic, historical
+reference and full reconstruction-store preflights. It reaches the S1 arm but
+injects an interruption before its first optimizer step; all three checkpoints
+remain at epoch zero and all three journals are empty. The owned TensorBoard
+service is stopped. No preflight is mocked; the training epoch is replaced solely
+to stop execution, and optimizer steps are explicitly forbidden.
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-05/manifest.json \
+STREAMED_REAL_PREFLIGHT_CHECKPOINT=checkpoints/geoaware_p0b_r2_seed20260926_r2/vae_best.pt \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_initialization.py \
+  -k real_prepared_runner_preflights_before_optimizer_on_mps
+```
+
+The final smoke took 347.59 seconds, with 1,775,321,088 bytes peak process RSS
+and 75,972,608 bytes MPS driver allocation sampled afterward. Neither is aggregate
+TensorBoard/tokenizer memory; sampled MPS allocation is not peak. Its one search
+region, thin-run threshold, one-epoch/one-batch budget, two bootstrap/random
+repeats and one-byte disk floors are disposable settings, not formal experimental
+choices or resource review. The limits are checked between operations, not hard
+watchdogs. Temporary suite and smoke bindings were removed. Focused preparation,
+runner, guardrail, checkpoint, matching, step, metric, search and diagnostic
+regressions passed (187 tests, five skipped, 91 subtests).
+
+This validates real preflight and preparation, not trained matched arms, actual
+tokenizer searches, formal retrieval, selected reconstruction guardrails or
+geological understanding. Full train/resume/formal-evaluate integration,
+aggregate resource review, independent-seed replication and separate launch
+approval remain outstanding; public train/resume execution remains blocked.
+
 ## Local continuation: record-bound S1 replay and epoch validation
 
 An opt-in disposable MPS fixture now connects the internal record-bound runner
@@ -29,7 +86,7 @@ not production settings or a scientific comparison.
 PYTORCH_ENABLE_MPS_FALLBACK=0 \
 STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
 STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
-STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-04/manifest.json \
+STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-05/manifest.json \
   .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_initialization.py \
   -k real_runner_interruption_resume_and_incomplete_evaluation_on_mps
 ```

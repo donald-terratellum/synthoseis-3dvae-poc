@@ -346,16 +346,21 @@ def _validate_reconstruction_config(guardrail_manifest: dict, guardrail_config: 
     return expected
 
 
+def _validate_reconstruction_runtime(guardrail_manifest: dict) -> None:
+    if guardrail_manifest["protocol"].get("runtime") != _reconstruction_runtime():
+        raise ValueError("Reconstruction runtime differs from the frozen protocol.")
+
+
 def _verify_reconstruction_inputs(guardrail_manifest: dict, guardrail_config: dict, lpips_loss_fn) -> None:
     deadline = time.monotonic() + guardrail_config["max_wall_seconds"]
     protocol = guardrail_manifest["protocol"]
     device = choose_torch_device(guardrail_config["device"])
 
     def verify_runtime() -> None:
-        if (protocol.get("runtime") != _reconstruction_runtime()
-                or lpips_fingerprint(lpips_loss_fn) != protocol["lpips_sha256"]
+        _validate_reconstruction_runtime(guardrail_manifest)
+        if (lpips_fingerprint(lpips_loss_fn) != protocol["lpips_sha256"]
                 or {parameter.device.type for parameter in lpips_loss_fn.parameters()} != {device.type}):
-            raise ValueError("Reconstruction runtime or LPIPS differs from the frozen protocol.")
+            raise ValueError("Reconstruction LPIPS differs from the frozen protocol.")
 
     verify_runtime()
     _verify_stores(guardrail_manifest, deadline)
@@ -673,6 +678,7 @@ def prepare_epoch_inputs(
         raise ValueError("Reconstruction queries must belong to the frozen eligible manifest.")
     if not torch.backends.mps.is_available() or os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") != "0":
         raise RuntimeError("Preparing streamed epoch inputs requires MPS without CPU fallback.")
+    _validate_reconstruction_runtime(guardrail_manifest)
     with torch.random.fork_rng(devices=[]):
         lpips = SliceLPIPSLoss().to("mps").eval()
     if lpips_fingerprint(lpips) != guardrail_manifest["protocol"]["lpips_sha256"]:
@@ -1087,6 +1093,7 @@ def _validate_suite_inputs(
     _validate_evaluation_bindings(hashes, formal_config, guardrail_config, historical)
     _validate_formal_config(search_manifest, diagnostic_manifest, formal_config)
     _validate_reconstruction_config(guardrail_manifest, guardrail_config, formal_config)
+    _validate_reconstruction_runtime(guardrail_manifest)
     _validate_epoch_inputs(
         monitor_batches, validate_epoch, lpips_loss_fn, hashes=hashes,
         manifest_path=manifest_path, source_root=source_root, guardrail_manifest=guardrail_manifest,

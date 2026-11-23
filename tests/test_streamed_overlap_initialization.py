@@ -24,6 +24,7 @@ from scripts import train as training
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state, save_epoch_state
+from scripts.streamed_overlap_diagnostics import bind_diagnostics
 from scripts.streamed_overlap_epoch_runner import (
     ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime, _bind_suite_inputs,
     prepare_epoch_inputs, run_arm_epochs, run_suite, run_suite_epochs, run_suite_from_record, suite_input_record,
@@ -33,7 +34,7 @@ from scripts.streamed_overlap_evaluate_child import evaluate as evaluate_child
 from scripts.streamed_overlap_initialization import (
     _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
 )
-from scripts.streamed_overlap_integrity import load_manifest
+from scripts.streamed_overlap_integrity import load_manifest, open_validation_sources
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _rngs_equal, save_suite_initialization, save_suite_run_metadata, verify_arm_initial_checkpoint,
@@ -42,7 +43,9 @@ from scripts.streamed_overlap_matching import (
 )
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_metrics import _eligible_queries
+from scripts.streamed_overlap_prepare import prepare as prepare_suite_record
 from scripts.streamed_overlap_sampler import StreamedPairSampler
+from scripts.streamed_overlap_search import freeze_search_manifest
 from scripts.streamed_overlap_smoke import _validate_config
 from scripts.train import EarlyStoppingState, SliceLPIPSLoss, train_streamed_pair_step
 from torch.utils.tensorboard import SummaryWriter
@@ -609,6 +612,132 @@ class ArmInitializationTests(unittest.TestCase):
         finally:
             if owners:
                 runner.stop_tensorboard(suite, logs)
+
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_RUNNER_SMOKE_CONFIG")
+        and os.environ.get("STREAMED_REAL_RUNNER_VALIDATION_MANIFEST")
+        and os.environ.get("STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST")
+        and os.environ.get("STREAMED_REAL_PREFLIGHT_CHECKPOINT")
+        and torch.backends.mps.is_available(),
+        "Explicit real-data preflight smoke configuration and historical checkpoint are required",
+    )
+    def test_real_prepared_runner_preflights_before_optimizer_on_mps(self):
+        config = json.loads(Path(os.environ["STREAMED_REAL_RUNNER_SMOKE_CONFIG"]).read_text())
+        manifest_path = Path(os.environ["STREAMED_REAL_RUNNER_VALIDATION_MANIFEST"]).resolve()
+        guardrail_path = Path(os.environ["STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST"]).resolve()
+        historical_checkpoint = Path(os.environ["STREAMED_REAL_PREFLIGHT_CHECKPOINT"]).resolve()
+        historical_report = guardrail_path.parent / "p0b_measurement.json"
+        suite = self.source.parent / "real-preflight-smoke"
+        source = _validate_config(config, suite)
+        manifest = load_manifest(manifest_path)
+        guardrail = json.loads(guardrail_path.read_text())
+        reference = json.loads(historical_report.read_text())["checkpoint"]
+        self.assertEqual(reference["checkpoint_sha256"], runner.file_hash(historical_checkpoint))
+        seed = config["seed"]
+        query = _eligible_queries(manifest)[0]
+        matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "disposable-preflight-smoke",
+            "experiment_seed": seed, "model_seed": seed, "head_seed": (seed + 1) % 2**32,
+            "sampler_seed": seed, "monitor_seed": seed, "validation_seed": seed,
+            "final_epoch": 1, "batches_per_epoch": 1, "sparse_probability": config["sparse_probability"],
+        }
+        started = time.monotonic()
+        with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+            print("Smoke: freezing disposable search and diagnostics inputs.", flush=True)
+            groups = open_validation_sources(source, manifest)
+            search = freeze_search_manifest(
+                manifest, groups, [{
+                    "query_id": query["id"], "region_origin": query["window"]["origin"],
+                    "region_shape": query["window"]["shape"],
+                }], stride=16, batch_size=4, max_region_bytes=262144, max_windows=100,
+                max_wall_seconds=600, device="mps", mps_memory_fraction=config["mps_memory_fraction"],
+            )
+            diagnostics = bind_diagnostics(manifest, groups, thin_max_voxels=5, max_wall_seconds=900)
+            del groups
+            search_path = self.source.parent / "smoke-search.json"
+            diagnostic_path = self.source.parent / "smoke-diagnostics.json"
+            search_path.write_text(json.dumps(search))
+            diagnostic_path.write_text(json.dumps(diagnostics))
+            sampler = StreamedPairSampler(source, "train", seed)
+            settings = {
+                "suite_dir": str(suite), "source_root": str(source), "validation_manifest": str(manifest_path),
+                "source_sha256": sampler.source_manifest_hash, "target_sha256": manifest["target_implementation_sha256"],
+                "validation_manifest_sha256": manifest["manifest_sha256"], "matching_config": matching,
+                "epoch_validation": {
+                    "reconstruction_query_ids": [query["id"]], "encode_batch_size": 4,
+                    "reconstruction_batch_size": 1, "max_wall_seconds": 900,
+                },
+                "formal_config": {
+                    "final_epoch": 1, "device": "mps", "inference_seed": seed, "encode_batch_size": 4,
+                    "max_wall_seconds": 900, "random_seed": seed, "random_repeats": 2,
+                    "bootstrap_seed": seed, "bootstrap_repeats": 2, "diagnostic_max_wall_seconds": 900,
+                    "search_manifest_sha256": search["search_manifest_sha256"],
+                    "diagnostic_manifest_sha256": diagnostics["diagnostic_manifest_sha256"],
+                },
+                "guardrail_config": {
+                    "manifest_sha256": guardrail["manifest_sha256"], "device": "mps", "max_wall_seconds": 900,
+                },
+                "search_manifest": str(search_path), "diagnostic_manifest": str(diagnostic_path),
+                "guardrail_manifest": str(guardrail_path),
+                "historical": {
+                    "report_path": str(historical_report), "report_sha256": runner.file_hash(historical_report),
+                    "checkpoint_path": str(historical_checkpoint), "checkpoint_sha256": reference["checkpoint_sha256"],
+                    "checkpoint_label": reference["checkpoint_label"],
+                },
+            }
+            record_path = self.source.parent / "real-preflight-inputs.json"
+            print("Smoke: preparing the real suite record without training.", flush=True)
+            prepared = prepare_suite_record(
+                settings, record_path, mps_memory_fraction=config["mps_memory_fraction"], max_wall_seconds=900,
+            )
+            self.assertEqual(prepared["status"], "SUITE_INPUTS_PREPARED_NOT_AUTHORIZED")
+            self.assertFalse(suite.exists())
+            logs = self.source.parent / "real-preflight-logs"
+            logs.mkdir()
+            with socket.socket() as sock:
+                sock.bind((runner.HOST, 0))
+                port = sock.getsockname()[1]
+            start = runner.start_tensorboard
+            owners = []
+
+            def start_service(run_dir, log_dir):
+                owner = start(run_dir, log_dir, port=port)
+                owners.append(owner)
+                return owner
+
+            print("Smoke: running actual suite preflights, stopping at the first arm.", flush=True)
+            try:
+                with patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
+                           side_effect=KeyboardInterrupt) as train, \
+                     patch.object(runner, "start_tensorboard", side_effect=start_service):
+                    with self.assertRaises(KeyboardInterrupt):
+                        runner.training_attempt(
+                            record_path, suite, logs, logs, matching["run_id"], resume=False,
+                            config_sha256=prepared["config_sha256"], epochs=1, batches_per_epoch=1,
+                            mps_memory_fraction=config["mps_memory_fraction"],
+                            min_suite_free_bytes=1, min_log_free_bytes=1,
+                        )
+                train.assert_called_once()
+                self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"], "interrupted")
+                self.assertTrue(runner.ready(owners[0]))
+                for arm in ("S1", "S2", "S3"):
+                    state = torch.load(suite / arm / "last.pt", map_location="cpu", weights_only=True)
+                    self.assertEqual(state["completed_epoch"], 0)
+                    with (suite / arm / "batch_metrics.csv").open(newline="") as stream:
+                        self.assertEqual(list(csv.DictReader(stream)), [])
+                self.assertFalse((logs / "evaluation_receipt.json").exists())
+                print(json.dumps({
+                    "status": "DISPOSABLE_PREPARED_RUNNER_PREFLIGHT_PASSED",
+                    "optimizer_steps": 0, "searches": len(search["searches"]),
+                    "diagnostic_windows": len(diagnostics["windows"]),
+                    "validation_manifest_sha256": manifest["manifest_sha256"],
+                    "elapsed_seconds": time.monotonic() - started,
+                    "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                    "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
+                }, sort_keys=True), flush=True)
+            finally:
+                if owners:
+                    runner.stop_tensorboard(suite, logs)
 
     def test_evaluation_child_applies_mps_limit_and_never_enables_training(self):
         record = suite_input_record(self.suite_dir, **self.suite_inputs())
@@ -1356,6 +1485,7 @@ class ArmInitializationTests(unittest.TestCase):
         journals = {arm: item.journal for arm, item in arms.items()}
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_runtime"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs") as epoch_gate, \
              patch("scripts.streamed_overlap_epoch_runner._verify_historical_reconstruction"), \
              patch("scripts.streamed_overlap_epoch_runner.verify_validation_preflight") as validation_preflight, \
@@ -1551,6 +1681,7 @@ class ArmInitializationTests(unittest.TestCase):
         factory = Mock()
         with patch("scripts.streamed_overlap_epoch_runner._validate_formal_config"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_config"), \
+             patch("scripts.streamed_overlap_epoch_runner._validate_reconstruction_runtime"), \
              patch("scripts.streamed_overlap_epoch_runner._validate_epoch_inputs"), \
              patch("scripts.streamed_overlap_epoch_runner._verify_historical_reconstruction"), \
              patch("scripts.streamed_overlap_epoch_runner.suite_workload", return_value={"schema": "fixture"}), \

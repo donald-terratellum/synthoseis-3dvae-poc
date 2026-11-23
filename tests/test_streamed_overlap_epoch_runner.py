@@ -55,10 +55,13 @@ class EpochInputBindingTests(unittest.TestCase):
             "monitor": streamed_monitor_hash(self.monitor), "epoch_validation": self.validator.config_sha256,
             "validation_manifest": "b" * 64,
         }
-        self.guardrail = {"protocol": {"lpips_sha256": "c" * 64}}
+        self.guardrail = {"protocol": {"lpips_sha256": "c" * 64, "runtime": {"fixture": True}}}
         self.fingerprint = patch("scripts.streamed_overlap_epoch_runner.lpips_fingerprint", return_value="c" * 64)
         self.fingerprint.start()
         self.addCleanup(self.fingerprint.stop)
+        runtime = patch("scripts.streamed_overlap_epoch_runner._reconstruction_runtime", return_value={"fixture": True})
+        runtime.start()
+        self.addCleanup(runtime.stop)
 
     def check(self, **overrides):
         arguments = {
@@ -157,6 +160,14 @@ class EpochInputBindingTests(unittest.TestCase):
                 prepare_epoch_inputs(**{**arguments, "epoch_validation": {
                     **settings, "reconstruction_query_ids": ["not-eligible"],
                 }})
+            samplers.clear()
+            with patch("scripts.streamed_overlap_epoch_runner._reconstruction_runtime",
+                       return_value={"fixture": "changed"}), \
+                 patch("scripts.streamed_overlap_epoch_runner.SliceLPIPSLoss") as make_lpips:
+                with self.assertRaisesRegex(ValueError, "Reconstruction runtime differs"):
+                    prepare_epoch_inputs(**arguments)
+                make_lpips.assert_not_called()
+                self.assertEqual(samplers, [])
 
     def test_suite_connects_explicit_epoch_settings_before_bootstrap(self):
         prepared = (self.monitor, self.validator, self.lpips, {})
@@ -205,7 +216,8 @@ class EpochInputBindingTests(unittest.TestCase):
             "schema": "streamed-reconstruction-guardrail-v1", "usage": "post_selection_guardrail",
             "protocol": {"input_mode": "tokenizer", "latent_mode": "sampled",
                          "sampling_method": "normal_reparameterization", "seed": 1,
-                         "patch_shape": [32, 32, 64], "lpips_sha256": "c" * 64, "device": "mps"},
+                         "patch_shape": [32, 32, 64], "lpips_sha256": "c" * 64, "device": "mps",
+                         "runtime": {"fixture": True}},
             "datasets": {domain: [{"id": domain, "input_sha256": "a" * 64, "target_sha256": "d" * 64}]
                          for domain in ("synthetic", "real")},
         }
@@ -267,6 +279,12 @@ class EpochInputBindingTests(unittest.TestCase):
             self.assertEqual(result["config_sha256"], content_hash(record))
             self.assertEqual(record["input_hashes"]["monitor"], observed["monitor"])
             self.assertFalse((self.root / "new-suite").exists())
+            with patch("scripts.streamed_overlap_epoch_runner._reconstruction_runtime",
+                       return_value={"fixture": "changed"}):
+                with self.assertRaisesRegex(ValueError, "Reconstruction runtime differs"):
+                    prepare(config, self.root / "stale-inputs.json", mps_memory_fraction=0.5,
+                            max_wall_seconds=30)
+                self.assertFalse((self.root / "stale-inputs.json").exists())
             storage_options = {
                 "expected_config_sha256": result["config_sha256"],
                 "checkpoint_upper_bytes": {"S1": 1, "S2": 1, "S3": 1},

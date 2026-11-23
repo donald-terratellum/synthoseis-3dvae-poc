@@ -487,11 +487,11 @@ class ReconstructionProducerTests(unittest.TestCase):
         _verify_reconstruction_inputs(manifest, config, self.lpips)
         changed = copy.deepcopy(manifest)
         changed["protocol"]["runtime"]["versions"]["torch"] = "different"
-        with self.assertRaisesRegex(ValueError, "runtime or LPIPS"):
+        with self.assertRaisesRegex(ValueError, "runtime differs"):
             _verify_reconstruction_inputs(changed, config, self.lpips)
         with torch.no_grad():
             self.lpips.weight[0] = 2
-        with self.assertRaisesRegex(ValueError, "runtime or LPIPS"):
+        with self.assertRaisesRegex(ValueError, "LPIPS differs"):
             _verify_reconstruction_inputs(manifest, config, self.lpips)
         with torch.no_grad():
             self.lpips.weight[0] = 1
