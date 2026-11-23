@@ -1,5 +1,10 @@
 import hashlib
+import json
+import os
+import resource
+import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,14 +14,19 @@ import numpy as np
 import torch
 
 from scripts.streamed_overlap_audit import content_hash
+from scripts.streamed_overlap_diagnostics import bind_diagnostics
 from scripts.streamed_overlap_evaluation import (
-    StreamedEpochValidator, evaluate_checkpoint, export_tokenizer_checkpoint, physical_overlap_diagnostics,
+    StreamedEpochValidator, _checkpoint_state, _identity, evaluate_checkpoint, export_tokenizer_checkpoint,
+    physical_overlap_diagnostics,
 )
-from scripts.streamed_overlap_epoch_runner import complete_selected_checkpoint
-from scripts.streamed_overlap_integrity import input_fingerprints, verify_inputs
+from scripts.streamed_overlap_epoch_runner import _formal_reports, complete_selected_checkpoint
+from scripts.streamed_overlap_integrity import input_fingerprints, load_manifest, open_validation_sources, verify_inputs
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
+from scripts.streamed_overlap_metrics import _eligible_queries
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
+from scripts.streamed_overlap_search import freeze_search_manifest
 from scripts.streamed_overlap_selection import select_checkpoints
+from scripts.streamed_overlap_smoke import _validate_config
 from scripts.streamed_overlap_yield import SEISMIC_KEY
 from src.model import VAE3D
 from scripts.train import compute_vae_losses, streamed_inference_context
@@ -59,6 +69,100 @@ def toy_factory(arm, model_seed, head_seed):
     with torch.random.fork_rng():
         torch.manual_seed(10)
         return StreamedPairVAE(ToyVAE(), arm)
+
+
+class RealFormalEvaluationSmoke(unittest.TestCase):
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_RUNNER_SMOKE_CONFIG")
+        and os.environ.get("STREAMED_REAL_RUNNER_VALIDATION_MANIFEST")
+        and os.environ.get("STREAMED_REAL_EVALUATION_CHECKPOINT")
+        and torch.backends.mps.is_available(),
+        "Explicit disposable S3 checkpoint and real-data MPS smoke configuration are required",
+    )
+    def test_s3_formal_retrieval_diagnostics_and_tokenizer_search_on_mps(self):
+        config = json.loads(Path(os.environ["STREAMED_REAL_RUNNER_SMOKE_CONFIG"]).read_text())
+        manifest_path = Path(os.environ["STREAMED_REAL_RUNNER_VALIDATION_MANIFEST"]).resolve(strict=True)
+        checkpoint = Path(os.environ["STREAMED_REAL_EVALUATION_CHECKPOINT"]).resolve(strict=True)
+        if "fake_data_validation_v2" in manifest_path.parts or "fake_data_validation_v2" in checkpoint.parts:
+            raise ValueError("The regenerating validation-v2 dataset is not permitted.")
+        original_digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = _validate_config(config, root / "search")
+            if checkpoint.is_relative_to(source) or manifest_path.is_relative_to(source):
+                raise ValueError("Smoke checkpoint and manifest must be outside the source root.")
+            copy = root / "last.pt"
+            shutil.copyfile(checkpoint, copy)
+            shutil.copyfile(checkpoint.parent / "batch_metrics.csv", root / "batch_metrics.csv")
+            shutil.copytree(checkpoint.parent / "recovery", root / "recovery")
+            journal = BatchJournal(root / "batch_metrics.csv", STEP_FIELDS, create=False)
+            try:
+                torch.mps.set_per_process_memory_fraction(config["mps_memory_fraction"])
+                manifest = load_manifest(manifest_path)
+                state, digest = _checkpoint_state(copy)
+                identity = _identity(state, digest, journal, manifest["manifest_sha256"])
+                self.assertEqual(identity["arm"], "S3")
+                self.assertEqual(identity["epoch"], 1)
+                self.assertEqual(identity["step"], 1)
+                self.assertEqual(digest, original_digest)
+                groups = open_validation_sources(source, manifest)
+                query = _eligible_queries(manifest)[0]
+                search = freeze_search_manifest(
+                    manifest, groups, [{
+                        "query_id": query["id"], "region_origin": query["window"]["origin"],
+                        "region_shape": query["window"]["shape"],
+                    }], stride=16, batch_size=4, max_region_bytes=262144, max_windows=100,
+                    max_wall_seconds=900, device="mps", mps_memory_fraction=config["mps_memory_fraction"],
+                )
+                diagnostics = bind_diagnostics(manifest, groups, thin_max_voxels=5, max_wall_seconds=900)
+                del groups
+                formal = {
+                    "device": "mps", "inference_seed": config["seed"], "encode_batch_size": 4,
+                    "max_wall_seconds": 900, "random_seed": config["seed"], "random_repeats": 2,
+                    "bootstrap_seed": config["seed"], "bootstrap_repeats": 2,
+                    "diagnostic_max_wall_seconds": 900,
+                }
+                attempt = root / "evaluation"
+                attempt.mkdir()
+                started = time.monotonic()
+                print("Smoke: scoring real S3 retrieval, tokenizer search and validation diagnostics.", flush=True)
+                with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+                    report, artifacts = _formal_reports(
+                        copy, journal, manifest_path, source, manifest, identity,
+                        search, diagnostics, formal, attempt,
+                    )
+                self.assertEqual(report["checkpoint"], identity)
+                self.assertEqual(set(report["scorers"]), {"mu_cosine", "pair_head"})
+                eligible = _eligible_queries(manifest)
+                pairs = sum(len(query["candidates"]) for query in eligible)
+                for scorer in ("mu_cosine", "pair_head"):
+                    self.assertEqual(len(report["scorers"][scorer]["rows"]), len(eligible))
+                coverage = report["scorers"]["pair_head"]["event_coverage_diagnostics"]
+                self.assertEqual(len(coverage["pairs"]), pairs)
+                self.assertEqual(len(report["physical_overlap_diagnostics"]["pairs"]), pairs)
+                self.assertEqual(set(artifacts), {"retrieval", "tokenizer_search", "diagnostics"})
+                for artifact in artifacts.values():
+                    path = root / artifact["path"]
+                    self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), artifact["sha256"])
+                search_report = json.loads((attempt / "tokenizer_search.json").read_text())
+                diagnostic_report = json.loads((attempt / "diagnostics.json").read_text())
+                self.assertEqual(search_report["checkpoint"]["checkpoint"], identity)
+                self.assertEqual(len(search_report["searches"]), 1)
+                self.assertGreater(search_report["searches"][0]["contained_window_count"], 0)
+                self.assertEqual(len(diagnostic_report["pairs"]), pairs)
+                self.assertEqual(diagnostic_report["diagnostic_manifest_sha256"],
+                                 diagnostics["diagnostic_manifest_sha256"])
+                self.assertEqual(hashlib.sha256(checkpoint.read_bytes()).hexdigest(), original_digest)
+                torch.mps.synchronize()
+                print(json.dumps({
+                    "status": "DISPOSABLE_S3_FORMAL_PIPELINE_PASSED", "optimizer_steps": 0,
+                    "queries": len(eligible), "pairs": pairs, "tokenizer_searches": 1,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                    "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
+                }, sort_keys=True), flush=True)
+            finally:
+                journal.close()
 
 
 class EvaluationTests(unittest.TestCase):

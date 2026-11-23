@@ -2,6 +2,45 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: real S3 formal evaluation pipeline
+
+An opt-in evaluation smoke copies the existing one-step disposable S3 checkpoint
+and its journal/recovery records into a temporary directory, then invokes the
+real formal-report path with MPS and no optimizer steps. It scores all 300
+primary-validation queries and 3,000 pairs, producing separate encoder
+mu-cosine and trained pair-head rankings, physical-overlap diagnostics,
+fingerprinted geology-proxy diagnostics, and one real bounded tokenizer CLI
+search. It checks checkpoint identities, report file hashes, result coverage
+and the original checkpoint hash. The temporary outputs were removed.
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+STREAMED_REAL_EVALUATION_CHECKPOINT=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/disposable-integration-smoke-20261122-02/last.pt \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_evaluation.py \
+  -k s3_formal_retrieval_diagnostics_and_tokenizer_search_on_mps
+```
+
+The report path took 547.21 seconds after binding the smoke search and diagnostic
+inputs; the whole test took 587.61 seconds. Peak process RSS was 1,522,860,032
+bytes and MPS driver allocation sampled afterward was 1,133,330,432 bytes.
+Neither is aggregate tokenizer-subprocess memory; the sampled MPS value is not
+peak or a production estimate. The one search, thin-run threshold and two
+random/bootstrap repeats are smoke settings, not formal experimental settings.
+The evaluation wall limits are checked between operations except for the
+tokenizer child timeout; they are not overall process watchdogs.
+
+This tests the formal-report components on a disposable checkpoint with one
+committed batch, not the full completion/recovery orchestration or a matched
+S1/S2/S3 comparison. It is not evidence that the auxiliary task improved the
+encoder or geological understanding. Reconstruction guardrails for selected
+streamed checkpoints, full-suite integration, aggregate resource review,
+independent-seed replication and separate launch approval remain outstanding.
+The focused evaluation, metrics, search, diagnostics, epoch, guardrail,
+initialization and runner regressions passed (166 tests, five skipped,
+72 subtests). Public train/resume execution remains blocked.
+
 ## Local continuation: real preparation and preflight
 
 The first real prepared-suite preflight failed before training: the `-04`
