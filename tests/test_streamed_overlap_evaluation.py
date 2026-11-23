@@ -153,12 +153,17 @@ class RealFormalEvaluationSmoke(unittest.TestCase):
                 self.assertEqual(diagnostic_report["diagnostic_manifest_sha256"],
                                  diagnostics["diagnostic_manifest_sha256"])
                 self.assertEqual(hashlib.sha256(checkpoint.read_bytes()).hexdigest(), original_digest)
+                evaluation_bytes = sum(path.stat().st_size for path in attempt.rglob("*") if path.is_file())
+                temporary_bytes = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
                 torch.mps.synchronize()
                 print(json.dumps({
                     "status": "DISPOSABLE_S3_FORMAL_PIPELINE_PASSED", "optimizer_steps": 0,
                     "queries": len(eligible), "pairs": pairs, "tokenizer_searches": 1,
                     "elapsed_seconds": time.monotonic() - started,
+                    "evaluation_file_bytes_after_completion": evaluation_bytes,
+                    "temporary_file_bytes_after_completion": temporary_bytes,
                     "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                    "children_max_rss_platform_units": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
                     "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
                 }, sort_keys=True), flush=True)
             finally:

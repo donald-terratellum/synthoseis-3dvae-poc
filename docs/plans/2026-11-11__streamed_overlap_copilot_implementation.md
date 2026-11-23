@@ -2,6 +2,60 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: formal resource and storage evidence
+
+The disposable real S3 formal-evaluation smoke described below was repeated
+with a local process-tree sampler and an independently started TensorBoard
+service with an empty log directory. TensorBoard was checked for HTTP readiness
+and stopped afterward. The smoke made no optimizer steps and passed for 300
+primary-validation queries, 3,000 pairs and one bounded tokenizer search.
+The test took 626.74 seconds, including 586.02 seconds in the formal path.
+
+The sampler used `ps` RSS for the test process and its descendants and the
+TensorBoard process and its descendants, sleeping 0.2 seconds between samples.
+Across 2,782 samples, the maximum concurrent sum was 1,817,214,976 bytes; the
+maximum test-tree sum was 1,725,415,424 bytes and the maximum TensorBoard-tree
+sum was 91,799,552 bytes. The tokenizer command was observed in six samples,
+with a maximum sampled RSS of 353,730,560 bytes. The test process reported
+1,520,238,592 bytes peak self RSS and 356,548,608 bytes for reaped children via
+`getrusage`; the latter is not a simultaneous total and may include other
+children. MPS driver allocation sampled after evaluation was 1,133,330,432
+bytes, not a peak.
+
+These are not a physical-memory or production-headroom measurement: summed RSS
+double-counts shared pages, sampling can miss peaks, the driver measurement may
+overlap process memory, and the empty-log TensorBoard is not a loaded run-owned
+service. This evaluates one disposable checkpoint, not training, guardrails,
+recovery or a full suite. The one search and two random/bootstrap repeats are
+smoke-only settings; no scientific inference follows.
+
+The smoke now also prints completed logical file sizes: evaluation artifacts
+totaled 20,117,350 bytes and all temporary files totaled 65,806,978 bytes,
+including the copied checkpoint and journal. These are not transient peaks,
+allocated disk space, or bounds for a suite. For comparison, on the external
+volume the disposable S3 checkpoint was 45,687,109 logical bytes and 46,137,344
+allocated bytes; its 1,908-byte journal occupied 524,288 bytes. Small-file
+allocation, retries, retained snapshots and journals, TensorBoard logs, other
+outputs and reserve must therefore be included in the prospective storage
+review. The temporary smoke used the internal filesystem, not the external
+suite destination. Available capacity changes and is not a reservation.
+
+For a clean run with E epochs, B batches per epoch, N frozen searches and
+D = floor(E/5) + [E mod 5 != 0], the existing workload preflight counts
+3*E*B optimizer steps, 36*E*B training pairs and reconstructed A views, and
+(3*D + 4)*N tokenizer searches. This excludes retries and does not estimate
+time, memory or storage. The existing record-bound storage preflight still
+requires explicit per-arm checkpoint bounds, other-output allowance and
+reserve; observed smoke sizes are not those bounds. Workload/storage fixtures
+and evaluation regressions passed (44 tests, one skipped, 19 subtests).
+
+An explicit matched training budget, frozen formal search settings, aggregate
+resource review and separate launch approval remain outstanding. Public
+train/resume remains blocked. S3-S2 encoder mu-cosine is the relevant matched
+representation comparison; the pair head and observable-event proxy are
+separate, and independent-seed replication and untouched final-test evaluation
+remain future gates.
+
 ## Local continuation: matched suite and evaluation recovery
 
 An opt-in disposable MPS smoke runs the prepared record through real input
