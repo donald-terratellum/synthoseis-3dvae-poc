@@ -2,6 +2,50 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: matched suite and evaluation recovery
+
+An opt-in disposable MPS smoke runs the prepared record through real input
+preflights, an interrupted S1 step and replay, and one committed 12-pair step
+for each matched arm. It completes final and selected formal evaluation, verifies
+recorded matched streams, measures selected reconstruction guardrails and
+compares S2 and both S3 selections against matched S1 and P0b. It publishes
+separate encoder mu-cosine comparisons and S3 pair-head checks. A subsequent
+evaluation-only run forbids training and optimizer steps, reuses the completed
+reports, and verifies their hashes and final checkpoint identities are unchanged.
+The run-owned TensorBoard service was stopped and temporary outputs were removed.
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_RUNNER_FULL_SUITE_SMOKE=1 \
+STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-05/manifest.json \
+STREAMED_REAL_PREFLIGHT_CHECKPOINT=checkpoints/geoaware_p0b_r2_seed20260926_r2/vae_best.pt \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_initialization.py \
+  -k real_prepared_matched_suite_and_evaluation_recovery_on_mps
+```
+
+The test passed in 8,114.22 seconds, with four optimizer calls including one
+discarded S1 step and its replay. The S1 P0b-only numeric reconstruction
+comparison and the S3 final pair-head metric gate were `FAIL`; these are
+one-step smoke outputs, not experimental conclusions. Two bootstrap repeats,
+one search region, one batch per arm and one-byte disk floors are smoke settings.
+Peak process RSS was 2,543,730,688 bytes; MPS driver allocation sampled afterward
+was 2,411,593,728 bytes. Neither is aggregate TensorBoard/tokenizer-subprocess
+memory, and the sampled MPS value is not a peak. Per-operation limits do not
+provide an overall watchdog or a production resource estimate.
+
+This verifies one disposable full train/resume/evaluate path, not long-run
+resource readiness, independent-seed replication, or an untouched final-test
+evaluation. S2-S1 isolates overlap and S3-S2 measures added directional
+event-coverage supervision; the event proxy is not proof of geological
+understanding, and the pair-head result is not an encoder result. Historical real
+patches remain post-selection guardrails only. Focused initialization, runner,
+epoch, metrics, guardrail, matching and evaluation regressions passed (173 tests,
+eight skipped, 83 subtests). An explicit training budget, aggregate resource
+review and separate launch approval remain outstanding; public train/resume
+execution remains blocked.
+
 ## Local continuation: record-bound S1 completion
 
 An opt-in disposable MPS integration smoke now connects the real prepared suite

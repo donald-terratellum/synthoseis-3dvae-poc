@@ -636,7 +636,19 @@ class ArmInitializationTests(unittest.TestCase):
     def test_real_prepared_s1_replay_formal_and_guardrail_on_mps(self):
         self._real_prepared_runner_smoke(continue_s1=True)
 
-    def _real_prepared_runner_smoke(self, *, continue_s1):
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_RUNNER_FULL_SUITE_SMOKE") == "1"
+        and os.environ.get("STREAMED_REAL_RUNNER_SMOKE_CONFIG")
+        and os.environ.get("STREAMED_REAL_RUNNER_VALIDATION_MANIFEST")
+        and os.environ.get("STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST")
+        and os.environ.get("STREAMED_REAL_PREFLIGHT_CHECKPOINT")
+        and torch.backends.mps.is_available(),
+        "Explicit disposable matched suite smoke configuration and MPS are required",
+    )
+    def test_real_prepared_matched_suite_and_evaluation_recovery_on_mps(self):
+        self._real_prepared_runner_smoke(continue_s1=True, complete_suite=True)
+
+    def _real_prepared_runner_smoke(self, *, continue_s1, complete_suite=False):
         config = json.loads(Path(os.environ["STREAMED_REAL_RUNNER_SMOKE_CONFIG"]).read_text())
         manifest_path = Path(os.environ["STREAMED_REAL_RUNNER_VALIDATION_MANIFEST"]).resolve()
         guardrail_path = Path(os.environ["STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST"]).resolve()
@@ -664,8 +676,8 @@ class ArmInitializationTests(unittest.TestCase):
 
                 def bounded_step(optimizer, *args, **kwargs):
                     optimizer_calls.append(1)
-                    if len(optimizer_calls) > 2:
-                        raise AssertionError("Disposable smoke exceeded two optimizer calls")
+                    if len(optimizer_calls) > (4 if complete_suite else 2):
+                        raise AssertionError("Disposable smoke exceeded its optimizer-call budget")
                     return original_step(optimizer, *args, **kwargs)
 
                 stack.enter_context(patch.object(torch.optim.AdamW, "step", autospec=True, side_effect=bounded_step))
@@ -773,25 +785,30 @@ class ArmInitializationTests(unittest.TestCase):
                         return real_train(*args, **kwargs)
 
                     print("Smoke: replaying S1 through real formal and guardrail completion.", flush=True)
-                    with patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
-                               side_effect=stop_before_s2), \
-                         patch.object(runner, "start_tensorboard", side_effect=start_service):
-                        with self.assertRaises(KeyboardInterrupt):
-                            runner.training_attempt(
-                                record_path, suite, resume_logs, logs, "disposable-s1-replay", resume=True,
-                                config_sha256=prepared["config_sha256"], epochs=1, batches_per_epoch=1,
-                                mps_memory_fraction=config["mps_memory_fraction"],
-                                min_suite_free_bytes=1, min_log_free_bytes=1,
-                            )
+                    with ExitStack() as resume_stack:
+                        if not complete_suite:
+                            resume_stack.enter_context(patch(
+                                "scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
+                                side_effect=stop_before_s2,
+                            ))
+                        resume_stack.enter_context(patch.object(runner, "start_tensorboard", side_effect=start_service))
+                        if not complete_suite:
+                            resume_stack.enter_context(self.assertRaises(KeyboardInterrupt))
+                        runner.training_attempt(
+                            record_path, suite, resume_logs, logs, "disposable-s1-replay", resume=True,
+                            config_sha256=prepared["config_sha256"], epochs=1, batches_per_epoch=1,
+                            mps_memory_fraction=config["mps_memory_fraction"],
+                            min_suite_free_bytes=1, min_log_free_bytes=1,
+                        )
                     self.assertEqual(json.loads((resume_logs / "run_manifest.json").read_text())["status"],
-                                     "interrupted")
+                                     "suite_complete_log_unconfirmed" if complete_suite else "interrupted")
                     checkpoint = suite / "S1" / "last.pt"
                     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
                     self.assertEqual((state["completed_epoch"], state["journal"]["cumulative_exposure"]), (1, 12))
                     with (suite / "S1" / "batch_metrics.csv").open(newline="") as stream:
                         rows = list(csv.DictReader(stream))
                     self.assertEqual(len(rows), 2)
-                    self.assertEqual(len(optimizer_calls), 2)
+                    self.assertEqual(len(optimizer_calls), 4 if complete_suite else 2)
                     self.assertEqual(rows[1]["replay_of_event"], stale[0]["event_id"])
                     self.assertTrue(math.isclose(float(rows[0]["total_loss"]), float(rows[1]["total_loss"]),
                                                  rel_tol=1e-6, abs_tol=1e-6))
@@ -824,13 +841,50 @@ class ArmInitializationTests(unittest.TestCase):
                     self.assertEqual(owners[0]["pid"], owners[1]["pid"])
                     for arm in ("S2", "S3"):
                         state = torch.load(suite / arm / "last.pt", map_location="cpu", weights_only=True)
-                        self.assertEqual(state["completed_epoch"], 0)
+                        self.assertEqual(state["completed_epoch"], int(complete_suite))
                         with (suite / arm / "batch_metrics.csv").open(newline="") as stream:
-                            self.assertEqual(list(csv.DictReader(stream)), [])
+                            self.assertEqual(len(list(csv.DictReader(stream))), int(complete_suite))
+                    if complete_suite:
+                        receipt = json.loads((resume_logs / "evaluation_receipt.json").read_text())
+                        self.assertEqual(receipt["status"], "REPORTS_COMPUTED_NOT_ADOPTION")
+                        cosine_path = suite / "mu_cosine_comparisons.json"
+                        head_path = suite / "pair_head_metric_checks.json"
+                        cosine = json.loads(cosine_path.read_text())
+                        head = json.loads(head_path.read_text())
+                        self.assertIn("S3_final_vs_S2_final", cosine["comparisons"])
+                        self.assertIn("S2_final_vs_S1_final", cosine["comparisons"])
+                        self.assertEqual(set(head["checks"]), {"final", "retrieval"})
+                        for arm, kinds in (("S2", ("reconstruction",)),
+                                           ("S3", ("reconstruction", "retrieval"))):
+                            for kind in kinds:
+                                directory = suite / arm / "evaluation" / f"guardrail-{kind}" / "comparisons"
+                                paths = list(directory.glob("*.json"))
+                                self.assertEqual(len(paths), 1)
+                                report = json.loads(paths[0].read_text())
+                                self.assertEqual(set(report["comparison"]["comparisons"]), {"S1", "P0b"})
+                        before = {arm: runner.file_hash(suite / arm / "last.pt") for arm in ("S1", "S2", "S3")}
+                        print("Smoke: recovering completed suite in evaluation-only mode.", flush=True)
+                        with patch.object(torch.optim.AdamW, "step",
+                                          side_effect=AssertionError("evaluation must not step")), \
+                             patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
+                                   side_effect=AssertionError("evaluation must not train")):
+                            recovered = evaluate_child(
+                                record_path, suite, config_sha256=prepared["config_sha256"],
+                                attempt_id="disposable-evaluation-recovery",
+                                mps_memory_fraction=config["mps_memory_fraction"],
+                            )
+                        self.assertEqual(recovered["status"], "REPORTS_COMPUTED_NOT_ADOPTION")
+                        self.assertEqual(recovered["report_sha256"], receipt["report_sha256"])
+                        self.assertEqual(recovered["final_checkpoints"], receipt["final_checkpoints"])
+                        self.assertEqual(before, {
+                            arm: runner.file_hash(suite / arm / "last.pt") for arm in ("S1", "S2", "S3")
+                        })
                 print(json.dumps({
-                    "status": ("DISPOSABLE_PREPARED_S1_COMPLETION_PASSED" if continue_s1
-                               else "DISPOSABLE_PREPARED_RUNNER_PREFLIGHT_PASSED"),
-                    "optimizer_steps": 2 if continue_s1 else 0, "searches": len(search["searches"]),
+                    "status": ("DISPOSABLE_MATCHED_SUITE_RECOVERY_PASSED" if complete_suite else
+                               "DISPOSABLE_PREPARED_S1_COMPLETION_PASSED" if continue_s1 else
+                               "DISPOSABLE_PREPARED_RUNNER_PREFLIGHT_PASSED"),
+                    "optimizer_steps": 4 if complete_suite else 2 if continue_s1 else 0,
+                    "searches": len(search["searches"]),
                     "p0b_only_numeric_status": comparison["comparison"]["status"] if continue_s1 else None,
                     "diagnostic_windows": len(diagnostics["windows"]),
                     "validation_manifest_sha256": manifest["manifest_sha256"],
