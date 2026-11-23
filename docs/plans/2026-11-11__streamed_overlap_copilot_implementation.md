@@ -2,6 +2,47 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: selected S3 reconstruction guardrail smoke
+
+An opt-in MPS smoke copies the one-step disposable S3 checkpoint, journal,
+recovery records and selection records into a temporary directory. It
+reconciles the journal, reselects the reconstruction checkpoint, verifies the
+historical P0b reference before and after measurement, and measures the
+selected snapshot on all 5,000 synthetic and 5,000 historical real guardrail
+patches. It compares those measurements numerically with P0b and forbids
+optimizer steps. The original checkpoint hash was unchanged; temporary files
+were removed.
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-05/manifest.json \
+STREAMED_REAL_EVALUATION_CHECKPOINT=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/disposable-integration-smoke-20261122-02/last.pt \
+STREAMED_REAL_PREFLIGHT_CHECKPOINT=checkpoints/geoaware_p0b_r2_seed20260926_r2/vae_best.pt \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_guardrails.py \
+  -k selected_s3_full_store_measurement_and_p0b_comparison_on_mps
+```
+
+The pipeline completed, with a P0b-only numeric comparison of `FAIL`; this is
+expected for a disposable one-step checkpoint, not an experiment outcome or
+adoption decision. The test took 335.56 seconds, including 334.34 seconds
+reported inside the fixture. Peak process RSS was 1,163,362,304 bytes; MPS
+driver allocation sampled afterward was 93,208,576 bytes, not a peak or
+aggregate resource measurement. The historical real data remain post-selection
+guardrails, not final-test data.
+
+This directly exercises selection, measurement and comparison, not
+`complete_selected_reconstruction` or full suite completion/recovery: the old
+disposable checkpoint lacks the newer guardrail binding. No matched S1 reference
+was available, and real-MPS repeatability/RNG preservation was not tested.
+Focused guardrail, checkpoint/selection, evaluation, epoch-runner, matching,
+initialization and runner regressions passed (170 tests, six skipped, 80
+subtests). Full matched-suite train/resume/formal-evaluate integration, selected
+guardrail orchestration with bound checkpoints, aggregate resource review,
+independent-seed replication, an explicit training budget and separate launch
+approval remain outstanding. Public train/resume execution remains blocked.
+
 ## Local continuation: real S3 formal evaluation pipeline
 
 An opt-in evaluation smoke copies the existing one-step disposable S3 checkpoint

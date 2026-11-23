@@ -1,7 +1,11 @@
 import copy
 import hashlib
 import json
+import os
+import resource
+import shutil
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -17,13 +21,15 @@ from scripts.streamed_overlap_epoch_runner import (
     HistoricalReconstruction, SelectedReconstruction, _verify_historical_reconstruction, _verify_reconstruction_inputs,
     complete_reconstruction_comparison, complete_selected_reconstruction,
 )
-from scripts.streamed_overlap_evaluation import _identity
+from scripts.streamed_overlap_evaluation import _checkpoint_state, _identity
 from scripts.streamed_overlap_guardrails import compare_reconstruction_guardrails
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_model import StreamedPairVAE
 from scripts.streamed_overlap_reconstruction import (
     freeze_reconstruction_manifest, measure_reconstruction,
 )
+from scripts.streamed_overlap_selection import select_checkpoints
+from scripts.streamed_overlap_smoke import _validate_config
 from scripts.train import SliceLPIPSLoss, build_checkpoint_payload
 from src.model import VAE3D
 
@@ -118,6 +124,94 @@ class GuardrailTests(unittest.TestCase):
         altered["checkpoint"]["experiment_seed"] = 3
         with self.assertRaisesRegex(ValueError, "matched experiment seed"):
             compare_reconstruction_guardrails(manifest, candidate, {"S1": altered})
+
+
+class RealSelectedReconstructionSmoke(unittest.TestCase):
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_RUNNER_SMOKE_CONFIG")
+        and os.environ.get("STREAMED_REAL_RUNNER_VALIDATION_MANIFEST")
+        and os.environ.get("STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST")
+        and os.environ.get("STREAMED_REAL_EVALUATION_CHECKPOINT")
+        and os.environ.get("STREAMED_REAL_PREFLIGHT_CHECKPOINT")
+        and torch.backends.mps.is_available(),
+        "Explicit disposable S3, historical reference and MPS smoke configuration are required",
+    )
+    def test_selected_s3_full_store_measurement_and_p0b_comparison_on_mps(self):
+        config = json.loads(Path(os.environ["STREAMED_REAL_RUNNER_SMOKE_CONFIG"]).read_text())
+        validation = Path(os.environ["STREAMED_REAL_RUNNER_VALIDATION_MANIFEST"]).resolve(strict=True)
+        guardrail_path = Path(os.environ["STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST"]).resolve(strict=True)
+        checkpoint = Path(os.environ["STREAMED_REAL_EVALUATION_CHECKPOINT"]).resolve(strict=True)
+        historical_checkpoint = Path(os.environ["STREAMED_REAL_PREFLIGHT_CHECKPOINT"]).resolve(strict=True)
+        if any("fake_data_validation_v2" in path.parts for path in
+               (validation, guardrail_path, checkpoint, historical_checkpoint)):
+            raise ValueError("Smoke inputs must exclude validation-v2.")
+        guardrail = json.loads(guardrail_path.read_text())
+        report_path = guardrail_path.parent / "p0b_measurement.json"
+        report = json.loads(report_path.read_text())
+        reference = report["checkpoint"]
+        historical = HistoricalReconstruction(
+            report_path, hashlib.sha256(report_path.read_bytes()).hexdigest(), historical_checkpoint,
+            reference["checkpoint_sha256"], reference["checkpoint_label"],
+        )
+        original_digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = _validate_config(config, root)
+            if any(path.is_relative_to(source) for path in
+                   (validation, guardrail_path, checkpoint, historical_checkpoint)):
+                raise ValueError("Smoke artifacts must be outside the source root.")
+            for name in ("last.pt", "best_reconstruction.pt", "batch_metrics.csv"):
+                shutil.copyfile(checkpoint.parent / name, root / name)
+            for name in ("recovery", "selection"):
+                shutil.copytree(checkpoint.parent / name, root / name)
+            journal = BatchJournal(root / "batch_metrics.csv", STEP_FIELDS, create=False)
+            try:
+                state, digest = _checkpoint_state(root / "last.pt")
+                self.assertEqual(digest, original_digest)
+                self.assertEqual((state["arm"], state["completed_epoch"], state["journal"]["logical_step"]),
+                                 ("S3", 1, 1))
+                watermark = state["journal"]
+                journal.reconcile(
+                    watermark=watermark["event_id"], attempt_id="disposable-guardrail-recovery",
+                    expected_step=watermark["logical_step"], expected_exposure=watermark["cumulative_exposure"],
+                )
+                selection = select_checkpoints(root / "last.pt", journal, validation, retrieval_report=None)
+                best = selection["best_reconstruction"]
+                self.assertIsNotNone(best)
+                selected = best["checkpoint"]
+                self.assertEqual(selected["checkpoint_sha256"], digest)
+                self.assertIsNone(selection["best_retrieval"])
+                snapshot = root / "selection" / "snapshots" / f"{digest}.pt"
+                torch.mps.set_per_process_memory_fraction(config["mps_memory_fraction"])
+                lpips = SliceLPIPSLoss().to("mps").eval()
+                print("Smoke: measuring selected S3 against both full historical guardrail stores.", flush=True)
+                with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+                    p0b = _verify_historical_reconstruction(historical, guardrail)
+                    candidate = measure_reconstruction(
+                        guardrail, snapshot, arm="S3", device="mps", lpips_loss_fn=lpips,
+                        max_wall_seconds=900, journal=journal, validation_manifest_path=validation,
+                    )
+                    comparison = compare_reconstruction_guardrails(guardrail, candidate, {"P0b": p0b})
+                    self.assertEqual(_verify_historical_reconstruction(historical, guardrail), p0b)
+                self.assertEqual(candidate["checkpoint"]["checkpoint_sha256"], digest)
+                self.assertEqual(candidate["checkpoint"]["journal_event_id"], watermark["event_id"])
+                self.assertEqual(len(candidate["datasets"]["synthetic"]), 5000)
+                self.assertEqual(len(candidate["datasets"]["real"]), 5000)
+                self.assertIn(comparison["status"], {"PASS_NUMERIC_ONLY", "FAIL"})
+                self.assertEqual(set(comparison["comparisons"]), {"P0b"})
+                self.assertEqual(hashlib.sha256(checkpoint.read_bytes()).hexdigest(), original_digest)
+                torch.mps.synchronize()
+                print(json.dumps({
+                    "status": "DISPOSABLE_S3_RECONSTRUCTION_PIPELINE_PASSED",
+                    "optimizer_steps": 0, "synthetic_patches": 5000, "historical_real_patches": 5000,
+                    "p0b_only_numeric_status": comparison["status"],
+                    "elapsed_seconds": time.monotonic() - started,
+                    "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                    "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
+                }, sort_keys=True), flush=True)
+            finally:
+                journal.close()
 
 
 class SelectedReconstructionTests(unittest.TestCase):
