@@ -2,6 +2,52 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: record-bound S1 replay and epoch validation
+
+An opt-in disposable MPS fixture now connects the internal record-bound runner
+to the real suite and S1 arm coordinator. It interrupts after one 12-pair
+optimizer step, resumes from the initial checkpoint, and verifies the journal's
+replay link and matching loss. The resumed epoch runs real training and
+validation monitors, verifies frozen primary-validation inputs, scores all 300
+eligible queries with encoder mu-cosine retrieval, and saves an epoch-one S1
+checkpoint. It deliberately stops before formal post-epoch evaluation. A
+subsequent evaluation-only attempt rejects the incomplete suite without training
+or changing the S1 checkpoint. The run-owned TensorBoard service was reused and
+stopped; temporary outputs were removed.
+
+This is not a full matched-suite or formal evaluation: S2 and S3 did not train
+in this fixture. Suite/evaluation configuration checks, historical-reference,
+validation-preflight, search, diagnostics and reconstruction-guardrail input
+checks were mocked; placeholder formal inputs were used. In particular, the
+coordinator's printed `RECONSTRUCTION_GUARDRAIL_INPUTS_VERIFIED` message is
+produced despite the mocked guardrail check and is **not evidence** of guardrail
+verification. The actual epoch validator independently verified its frozen
+inputs. Its one reconstruction query and one-batch epoch are smoke settings,
+not production settings or a scientific comparison.
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-04/manifest.json \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_initialization.py \
+  -k real_runner_interruption_resume_and_incomplete_evaluation_on_mps
+```
+
+The fixture took 366.24 seconds after input preparation, with 2,276,048,896
+bytes peak process RSS and 2,310,930,432 bytes MPS driver allocation sampled
+afterward. The latter is not peak MPS; neither is aggregate TensorBoard or
+tokenizer-process memory or a production forecast. The validator's 900-second
+smoke limit is not a process watchdog. Focused runner, initialization,
+epoch-runner, checkpoint, matching, step and metric regressions passed
+(154 tests, four skipped, 84 subtests).
+
+Full matched-suite train/resume/formal-evaluate validation, independent-seed
+replication, reconstruction guardrails, aggregate resource review and separate
+launch approval remain outstanding. Event coverage remains a proxy for
+geological semantics; this smoke cannot establish improved understanding.
+Public train/resume execution remains blocked.
+
 ## Local continuation: real matched-step and replay smoke
 
 An opt-in disposable MPS fixture now prepares the actual fresh S1/S2/S3

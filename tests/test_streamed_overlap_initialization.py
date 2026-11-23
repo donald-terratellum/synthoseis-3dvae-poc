@@ -1,4 +1,5 @@
 import copy
+import csv
 import hashlib
 import io
 import json
@@ -19,18 +20,20 @@ import numpy as np
 import torch
 
 from scripts import streamed_overlap_runner as runner
+from scripts import train as training
 from scripts.p7_control import capture_training_state
 from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_checkpoint import restore_epoch_state, save_epoch_state
 from scripts.streamed_overlap_epoch_runner import (
     ArmRuntime, HistoricalReconstruction, SelectedReconstruction, SuiteInitialization, _arm_runtime, _bind_suite_inputs,
-    run_arm_epochs, run_suite, run_suite_epochs, run_suite_from_record, suite_input_record,
+    prepare_epoch_inputs, run_arm_epochs, run_suite, run_suite_epochs, run_suite_from_record, suite_input_record,
 )
 from scripts.streamed_overlap_evaluation import StreamedEpochValidator
 from scripts.streamed_overlap_evaluate_child import evaluate as evaluate_child
 from scripts.streamed_overlap_initialization import (
     _publish_copy, prepare_arm_initial_checkpoints, prepare_suite_initial_checkpoints,
 )
+from scripts.streamed_overlap_integrity import load_manifest
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_matching import (
     ArmEvidence, _rngs_equal, save_suite_initialization, save_suite_run_metadata, verify_arm_initial_checkpoint,
@@ -38,6 +41,7 @@ from scripts.streamed_overlap_matching import (
     verify_suite_run_metadata,
 )
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
+from scripts.streamed_overlap_metrics import _eligible_queries
 from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_smoke import _validate_config
 from scripts.train import EarlyStoppingState, SliceLPIPSLoss, train_streamed_pair_step
@@ -458,6 +462,153 @@ class ArmInitializationTests(unittest.TestCase):
                 "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                 "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
             }, sort_keys=True), flush=True)
+
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_RUNNER_SMOKE_CONFIG")
+        and os.environ.get("STREAMED_REAL_RUNNER_VALIDATION_MANIFEST")
+        and os.environ.get("STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST")
+        and torch.backends.mps.is_available(),
+        "Explicit real-data runner smoke configuration and manifests are required",
+    )
+    def test_real_runner_interruption_resume_and_incomplete_evaluation_on_mps(self):
+        config = json.loads(Path(os.environ["STREAMED_REAL_RUNNER_SMOKE_CONFIG"]).read_text())
+        manifest_path = Path(os.environ["STREAMED_REAL_RUNNER_VALIDATION_MANIFEST"])
+        guardrail_path = Path(os.environ["STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST"])
+        suite = self.source.parent / "real-runner-smoke"
+        source = _validate_config(config, suite)
+        manifest = load_manifest(manifest_path)
+        guardrail = json.loads(guardrail_path.read_text())
+        seed = config["seed"]
+        matching = {
+            "schema": "streamed-matching-config-v1", "run_id": "disposable-runner-smoke",
+            "experiment_seed": seed, "model_seed": seed, "head_seed": (seed + 1) % 2**32,
+            "sampler_seed": seed, "monitor_seed": seed, "validation_seed": seed,
+            "final_epoch": 1, "batches_per_epoch": 1, "sparse_probability": config["sparse_probability"],
+        }
+        settings = {
+            "reconstruction_query_ids": [_eligible_queries(manifest)[0]["id"]],
+            "encode_batch_size": 4, "reconstruction_batch_size": 1, "max_wall_seconds": 900,
+        }
+        sampler = StreamedPairSampler(source, "train", seed)
+        hashes = {
+            "source": sampler.source_manifest_hash, "target": manifest["target_implementation_sha256"],
+            "validation_manifest": manifest["manifest_sha256"], "matching": content_hash(matching),
+        }
+        torch.mps.set_per_process_memory_fraction(config["mps_memory_fraction"])
+        batches, validator, lpips, observed = prepare_epoch_inputs(
+            manifest_path=manifest_path, source_root=source, hashes=hashes, guardrail_manifest=guardrail,
+            matching_config=matching, epoch_validation=settings,
+        )
+        hashes.update(observed)
+        inputs = {
+            "validate_epoch": validator, "manifest_path": manifest_path, "source_root": source,
+            "search_manifest": {}, "diagnostic_manifest": {},
+            "formal_config": {"final_epoch": 1, "diagnostic_max_wall_seconds": 900},
+            "guardrail_manifest": guardrail, "guardrail_config": {},
+            "historical": HistoricalReconstruction(
+                self.source.parent / "report", "e" * 64, self.source.parent / "checkpoint", "f" * 64, "smoke",
+            ), "matching_config": matching, "hashes": hashes,
+        }
+        record = suite_input_record(suite, **inputs)
+        digest = content_hash(record)
+        record_path = self.source.parent / "real-runner-inputs.json"
+        record_path.write_text(json.dumps(record))
+        logs = self.source.parent / "real-runner-logs"
+        logs.mkdir()
+        resume_logs = self.source.parent / "real-runner-resume-logs"
+        resume_logs.mkdir()
+        del inputs, batches, validator, lpips
+        options = {
+            "config_sha256": digest, "epochs": 1, "batches_per_epoch": 1,
+            "mps_memory_fraction": config["mps_memory_fraction"], "min_suite_free_bytes": 1,
+            "min_log_free_bytes": 1,
+        }
+        with socket.socket() as sock:
+            sock.bind((runner.HOST, 0))
+            port = sock.getsockname()[1]
+        start = runner.start_tensorboard
+        owners = []
+        monitor = training.monitor_streamed_pairs
+        calls = []
+
+        def start_service(run_dir, log_dir):
+            owner = start(run_dir, log_dir, port=port)
+            owners.append(owner)
+            return owner
+
+        def interrupt_monitor(*args, **kwargs):
+            calls.append("monitor")
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return monitor(*args, **kwargs)
+
+        mocked_preflights = {
+            "_validate_suite_inputs": Mock(return_value={"status": "SMOKE_PREFLIGHT_MOCKED"}),
+            "_validate_evaluation_bindings": Mock(), "_validate_formal_config": Mock(),
+            "_validate_reconstruction_config": Mock(), "_verify_historical_reconstruction": Mock(),
+            "verify_validation_preflight": Mock(), "verify_search_manifest": Mock(), "verify_diagnostics": Mock(),
+            "_verify_reconstruction_inputs": Mock(),
+        }
+        started = time.monotonic()
+        try:
+            with patch.multiple("scripts.streamed_overlap_epoch_runner", **mocked_preflights), \
+                 patch("scripts.streamed_overlap_epoch_runner.complete_epoch",
+                       side_effect=RuntimeError("formal evaluation intentionally stopped")) as formal, \
+                 patch.object(training, "monitor_streamed_pairs", side_effect=interrupt_monitor), \
+                 patch.object(runner, "start_tensorboard", side_effect=start_service):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.training_attempt(
+                        record_path, suite, logs, logs, matching["run_id"], resume=False, **options,
+                    )
+                self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"], "interrupted")
+                checkpoint = suite / "S1" / "last.pt"
+                self.assertEqual(torch.load(checkpoint, map_location="cpu", weights_only=True)["completed_epoch"], 0)
+                with (suite / "S1" / "batch_metrics.csv").open(newline="") as stream:
+                    stale = list(csv.DictReader(stream))
+                self.assertEqual(len(stale), 1)
+                formal.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "formal evaluation intentionally stopped"):
+                    runner.training_attempt(
+                        record_path, suite, resume_logs, logs, "retry", resume=True, **options,
+                    )
+                self.assertEqual(json.loads((resume_logs / "run_manifest.json").read_text())["status"], "failed")
+                state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                self.assertEqual(state["completed_epoch"], 1)
+                self.assertEqual(state["journal"]["cumulative_exposure"], 12)
+                validation = state["selection_state"]["_epoch_validation"]
+                self.assertEqual(validation["manifest_sha256"], manifest["manifest_sha256"])
+                self.assertTrue(math.isfinite(validation["metrics"]["mu_cosine_ndcg10"]))
+                with (suite / "S1" / "batch_metrics.csv").open(newline="") as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[1]["replay_of_event"], stale[0]["event_id"])
+                self.assertTrue(math.isclose(float(rows[0]["total_loss"]), float(rows[1]["total_loss"]),
+                                             rel_tol=1e-6, abs_tol=1e-6))
+                self.assertEqual(owners[0]["pid"], owners[1]["pid"])
+                formal.assert_called_once()
+                checkpoint_hash = runner.file_hash(checkpoint)
+                with patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
+                           side_effect=AssertionError("evaluation must not train")):
+                    with self.assertRaisesRegex(ValueError, "completed, configuration-matched"):
+                        run_suite_from_record(
+                            record_path, suite, expected_config_sha256=digest, resume=True,
+                            attempt_id="evaluation-smoke", evaluate_only=True,
+                        )
+                self.assertEqual(runner.file_hash(checkpoint), checkpoint_hash)
+                self.assertEqual(torch.load(suite / "S2" / "last.pt", map_location="cpu",
+                                            weights_only=True)["completed_epoch"], 0)
+                print(json.dumps({
+                    "status": "DISPOSABLE_RUNNER_REPLAY_VALIDATION_PASSED",
+                    "s1_optimizer_calls": 2, "committed_pairs": 12,
+                    "validation_queries": len(_eligible_queries(manifest)),
+                    "formal_evaluation": "not executed", "evaluation_only": "rejected incomplete suite",
+                    "elapsed_seconds": time.monotonic() - started,
+                    "max_rss_platform_units": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                    "mps_driver_allocated_bytes": torch.mps.driver_allocated_memory(),
+                }, sort_keys=True), flush=True)
+        finally:
+            if owners:
+                runner.stop_tensorboard(suite, logs)
 
     def test_evaluation_child_applies_mps_limit_and_never_enables_training(self):
         record = suite_input_record(self.suite_dir, **self.suite_inputs())
