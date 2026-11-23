@@ -702,6 +702,8 @@ class EpochCompletionTests(unittest.TestCase):
                    return_value={"completed_epoch": 4, "selection_state": {}}), \
              patch("scripts.streamed_overlap_epoch_runner.complete_epoch", side_effect=finish), \
              patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch", side_effect=train), \
+             patch("scripts.streamed_overlap_epoch_runner._log_epoch_reconstructions",
+                   side_effect=lambda *args, **kwargs: order.append(f"images-{kwargs['epoch']}")), \
              patch("scripts.streamed_overlap_epoch_runner.complete_matched_arm",
                    side_effect=lambda *args, **kwargs: order.append("match") or {"record": {"status": "matched"}}), \
              patch("scripts.streamed_overlap_epoch_runner.complete_selected_checkpoint",
@@ -727,9 +729,10 @@ class EpochCompletionTests(unittest.TestCase):
                 initial_checkpoint=self.root / "initial.pt",
                 suite_initialization=self.suite_initialization,
             )
-        self.assertEqual(order, ["evaluate", "train-5", "evaluate", "train-6", "evaluate", "match",
+        self.assertEqual(order, ["evaluate", "train-5", "images-5", "evaluate",
+                                 "train-6", "images-6", "evaluate", "match",
                                  "reconstruction", "retrieval", "compare-reconstruction", "compare-retrieval"])
-        self.assertEqual(result["last_epoch"]["done"], 5)
+        self.assertEqual(result["last_epoch"]["done"], 7)
         self.assertEqual(result["matched_streams"]["record"]["status"], "matched")
         self.assertEqual(set(result["selected_evaluations"]), {"reconstruction", "retrieval"})
         self.assertEqual(result["reconstruction_comparisons"]["retrieval"]["comparison"]["status"], "FAIL")

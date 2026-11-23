@@ -12,9 +12,12 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from torch.nn import functional as F
+from torch.utils.tensorboard import SummaryWriter
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from scripts.streamed_overlap_augmentation import ViewTransform
 from scripts.streamed_overlap_checkpoint import restore_epoch_state, save_epoch_state
+from scripts.streamed_overlap_epoch_runner import _log_epoch_reconstructions
 from scripts.streamed_overlap_journal import BatchJournal, STEP_FIELDS
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer
 from scripts.streamed_overlap_sampler import PairBatch, PairSpec
@@ -270,6 +273,42 @@ class StreamedStepTests(unittest.TestCase):
         second, _ = monitor_streamed_pairs(model, loss, "cpu", batches, writer, seed=7, step=101)
         self.assertEqual(first, second)
         self.assertTrue(any(event[0] == "monitor/validation/coverage" for event in writer.events))
+
+    def test_epoch_reconstructions_write_tensorboard_images_without_changing_training_rng(self):
+        devices = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device), tempfile.TemporaryDirectory() as directory:
+                model = StreamedPairVAE(
+                    VAE3D(base_ch=2, latent_dim=4, patch_shape=(8, 8, 8), encoder_arch="residual"), "S3",
+                ).to(device)
+                model.train()
+                model.vae.decoder.eval()
+                modes = [module.training for module in model.modules()]
+                batch = self.batch()
+                rng = torch.get_rng_state().clone()
+                mps_rng = torch.mps.get_rng_state().clone() if device == "mps" else None
+                numpy_rng = np.random.get_state()
+                python_rng = random.getstate()
+                with SummaryWriter(log_dir=directory) as writer:
+                    _log_epoch_reconstructions(
+                        model, {"train": batch, "validation": batch}, writer, seed=7, epoch=3, device=device,
+                    )
+                events = EventAccumulator(directory).Reload()
+                self.assertEqual(set(events.Tags()["images"]), {
+                    "reconstruction/train/input_prediction_target",
+                    "reconstruction/validation/input_prediction_target",
+                })
+                image = events.Images("reconstruction/validation/input_prediction_target")[0]
+                self.assertEqual((image.step, image.width, image.height), (3, 24, 8))
+                self.assertEqual([module.training for module in model.modules()], modes)
+                self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+                if mps_rng is not None:
+                    self.assertTrue(torch.equal(mps_rng, torch.mps.get_rng_state()))
+                numpy_after = np.random.get_state()
+                self.assertEqual(numpy_rng[0], numpy_after[0])
+                np.testing.assert_array_equal(numpy_rng[1], numpy_after[1])
+                self.assertEqual(numpy_rng[2:], numpy_after[2:])
+                self.assertEqual(python_rng, random.getstate())
 
     def test_monitor_failure_restores_training_rng_and_modes(self):
         class Writer:

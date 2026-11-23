@@ -47,7 +47,7 @@ from scripts.streamed_overlap_sampler import StreamedPairSampler
 from scripts.streamed_overlap_selection import _best, _records, select_checkpoints
 from scripts.train import (
     EarlyStoppingState, SliceLPIPSLoss, initialize_streamed_epoch_metrics, streamed_monitor_hash,
-    train_streamed_epoch,
+    streamed_inference_context, train_streamed_epoch,
 )
 from src.tokenizer.core.model_adapter import choose_torch_device
 
@@ -521,6 +521,29 @@ def _arm_runtime(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=6, min_lr=1e-5)
     with SummaryWriter(log_dir=str(tensorboard)) as writer:
         yield ArmRuntime(model, optimizer, scheduler, sampler, EarlyStoppingState(float("inf"), 0), writer)
+
+
+def _log_epoch_reconstructions(model, batches: dict, writer, *, seed: int, epoch: int, device: str) -> None:
+    """Log the same fixed input, prediction and target slices without advancing training RNG."""
+    with streamed_inference_context(model, device, seed):
+        for split in ("train", "validation"):
+            batch = batches[split]
+            inputs = torch.as_tensor(batch.input_a[:1], device=device)
+            outputs = model(inputs, torch.as_tensor(batch.input_b[:1], device=device))
+            prediction = outputs["reconstruction"]
+            if not isinstance(prediction, torch.Tensor) or not torch.isfinite(prediction).all():
+                raise ValueError("Monitor reconstruction must be a finite tensor.")
+            target = torch.as_tensor(batch.dense_a[:1], device=device)
+            middle = inputs.shape[2] // 2
+            image = torch.cat([
+                value[0, 0, middle].transpose(0, 1) for value in (inputs, prediction, target)
+            ], dim=1).detach().cpu()
+            if not torch.isfinite(image).all():
+                raise ValueError("Monitor reconstruction image must be finite.")
+            scale = image.abs().max().clamp_min(torch.finfo(image.dtype).eps)
+            writer.add_image(f"reconstruction/{split}/input_prediction_target",
+                             ((image / scale + 1) / 2).unsqueeze(0), epoch)
+    writer.flush()
 
 
 def suite_workload(matching_config: dict, search_manifest: dict) -> dict:
@@ -1045,6 +1068,7 @@ def run_arm_epochs(
             validate_epoch=validate_epoch, epoch_csv=epoch_csv, checkpoint_path=checkpoint_path,
             hashes=hashes, early_stopping=early_stopping, selection_state=selection_state,
         )
+        _log_epoch_reconstructions(model, monitor_batches, writer, seed=monitor_seed, epoch=epoch, device="mps")
         selection_state = {**selection_state, "_epoch_validation": validation}
         last_completion = finish()
     if last_completion is None:

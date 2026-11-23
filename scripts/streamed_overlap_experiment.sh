@@ -40,8 +40,8 @@ Only a verified run-owned PID can be reused or stopped; occupied ports are error
 No training or event generation occurs in these monitoring modes.
 
 Evaluation requires an existing completed suite and an explicit resource review.
-Train/resume are blocked pending integrated real-data validation, resource review
-and separate launch approval. Acknowledgements do not prove these.
+Train/resume require integrated real-data validation, resource review and
+separate launch approval. Acknowledgements do not prove these.
 Use --print-commands to inspect their proposed commands without launching.
 The MPS fraction is per process, not a combined memory limit.
 Audit output is LOCAL_TARGET_VALIDATION_PENDING.
@@ -100,12 +100,7 @@ while (($#)); do
 done
 
 case "$mode" in
-  train|resume)
-    if ((!print_only)); then
-      printf 'TRAINING_NOT_READY: integrated real-data validation, resource review and separate launch approval are outstanding; LOCAL_TARGET_VALIDATION_PENDING. No training authorized.\n' >&2
-      exit 2
-    fi ;;
-  audit|smoke|prepare|evaluate|tensorboard|tensorboard-status|tensorboard-stop) ;;
+  train|resume|audit|smoke|prepare|evaluate|tensorboard|tensorboard-status|tensorboard-stop) ;;
   *) printf 'Unknown or missing --mode. Use --help.\n' >&2; exit 2 ;;
 esac
 if [[ "$mode" != prepare && "$mode" != evaluate && "$mode" != train && "$mode" != resume && -n "$mps_memory_fraction" ]] \

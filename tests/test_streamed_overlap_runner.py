@@ -591,7 +591,7 @@ class AuditAttemptTests(unittest.TestCase):
                 self.assertIn("TRAINING_NOT_READY", result.stderr)
             self.assertEqual(list(Path(temporary).iterdir()), [])
 
-    def test_training_shell_previews_route_but_blocks_actual_launch(self):
+    def test_training_shell_previews_route_and_requires_acknowledgements(self):
         for mode in ("train", "resume"):
             with self.subTest(mode=mode):
                 run_id = f"training-preview-{mode}-fixture"
@@ -622,10 +622,63 @@ class AuditAttemptTests(unittest.TestCase):
                     )] + ["--print-commands"], capture_output=True, text=True, check=False,
                 )
                 self.assertEqual(without_acknowledgements.returncode, 0, without_acknowledgements.stderr)
-                result = subprocess.run(args, capture_output=True, text=True, check=False)
+                result = subprocess.run(
+                    [arg for arg in args if arg not in (
+                        "--acknowledge-training-approval", "--acknowledge-training-resources",
+                    )], capture_output=True, text=True, check=False,
+                )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("TRAINING_NOT_READY", result.stderr)
                 self.assertFalse((Path("logs") / run_id).exists())
+
+    def test_training_shell_captures_output_and_confirms_only_after_success(self):
+        Path("logs").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            config = root / "record.json"
+            config.write_text("{}")
+            calls = root / "calls"
+            python = root / "python-fixture"
+            python.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    print('fixture python'); sys.exit(0)\n"
+                "action = sys.argv[sys.argv.index('--action') + 1]\n"
+                "with open(os.environ['FIXTURE_CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "print('stdout ' + action, flush=True)\n"
+                "print('stderr ' + action, file=sys.stderr, flush=True)\n"
+                "sys.exit(int(os.environ.get('FIXTURE_FAILURE', '0')) if action in ('train-attempt', 'resume-attempt') else 0)\n"
+            )
+            python.chmod(0o755)
+            for mode, failure in (("train", False), ("train", True), ("resume", False), ("resume", True)):
+                with self.subTest(mode=mode, failure=failure), \
+                     tempfile.TemporaryDirectory(prefix="streamed-train-test-", dir="logs") as log_name:
+                    log_dir = Path(log_name)
+                    run_id = log_dir.name
+                    log_dir.rmdir()
+                    calls.unlink(missing_ok=True)
+                    env = {**os.environ, "PYTHON": str(python), "FIXTURE_CALLS": str(calls),
+                           "FIXTURE_FAILURE": "7" if failure else "0"}
+                    args = [
+                        "bash", "scripts/streamed_overlap_experiment.sh", "--mode", mode,
+                        "--run-id", run_id, "--config", str(config), "--run-dir", str(root / "suite"),
+                        "--config-sha256", "a" * 64, "--epochs", "2", "--batches-per-epoch", "3",
+                        "--mps-memory-fraction", "0.4", "--min-suite-free-bytes", "100",
+                        "--min-log-free-bytes", "200", "--acknowledge-training-approval",
+                        "--acknowledge-training-resources",
+                    ]
+                    if mode == "resume":
+                        args += ["--tensorboard-run-id", "original-training"]
+                    result = subprocess.run(args, env=env, capture_output=True, text=True, check=False)
+                    actions = [row[row.index("--action") + 1]
+                               for row in map(json.loads, calls.read_text().splitlines())]
+                    action = f"{mode}-attempt"
+                    self.assertEqual(actions, [action] if failure else [action, "confirm-training-log"])
+                    self.assertEqual(result.returncode, 7 if failure else 0)
+                    log = (log_dir / "training.log").read_text()
+                    self.assertIn(f"stdout {action}", log)
+                    self.assertIn(f"stderr {action}", log)
 
     def test_training_shell_preview_requires_resume_owner(self):
         args = [

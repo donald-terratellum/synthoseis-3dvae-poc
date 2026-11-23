@@ -2,6 +2,25 @@
 
 Updated: 2026-11-23.
 
+## Approved training launch
+
+The owner approved the prepared 60-epoch, 300-batch-per-epoch suite and its
+resource risks with MPS fraction 0.5, suite free-space floor 213,301,329,920
+bytes and log free-space floor 10,737,418,240 bytes. The shell requires both
+training-approval and resource-review acknowledgements and preserves the
+record-bound runner checks. The resource floors are not reservations or
+verified upper bounds. The semantic-label exploration below is not a launch
+prerequisite and the event-coverage proxy alone cannot establish improved
+geological understanding.
+
+The shell captures combined output in `logs/<run-id>/training.log`; monitor it
+with `tail -n 100 -F`. TensorBoard runs on the Mac mini at
+`http://127.0.0.1:6006/`. After each completed epoch, fixed train and
+validation monitor examples are logged under
+`reconstruction/{train,validation}/input_prediction_target` as a normalized
+side-by-side middle slice. Image inference restores model modes and training
+RNG state. Images are diagnostic, not checkpoint selection criteria.
+
 ## Local continuation: requested training budget for preparation
 
 The owner requested **60 epochs and 300 batches per epoch per arm for
@@ -65,16 +84,12 @@ counts, memory limit and disk allowances still need to be proposed and pinned.
 The existing suite-storage accounting retains 63, 63 and 64 checkpoints for
 S1, S2 and S3 respectively before transient copies and other outputs.
 
-The Mac reported 25,769,803,776 bytes physical memory; the external volume
+At preparation time the Mac reported 25,769,803,776 bytes physical memory; the external volume
 reported 947,730,944 KiB available and the local filesystem 110,776,940 KiB
 available. These are point-in-time capacities, not a reservation or proof
 of aggregate memory, storage or runtime headroom. The real-data integrated
-smoke has passed, but the public train/resume shell still has an unconditional
-execution block. Complete the concrete resource review and input binding,
-present the exact configuration and obtain separate launch approval before
-changing that gate or starting training. Additional semantic evaluation is not
-a prerequisite for this approved proxy experiment, but its results cannot on
-their own establish improved geological understanding.
+smoke had passed, but launch was not yet approved at that point. See the
+approved launch section above for the subsequent decision.
 
 ## Local continuation: exploratory semantic-label feasibility
 
