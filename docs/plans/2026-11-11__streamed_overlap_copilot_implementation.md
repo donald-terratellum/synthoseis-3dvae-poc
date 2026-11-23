@@ -2,6 +2,80 @@
 
 Updated: 2026-11-23.
 
+## Local continuation: requested training budget for preparation
+
+The owner requested **60 epochs and 300 batches per epoch per arm for
+preparation**, not a launch approval. The clean-run workload calculator reports
+18,000 optimizer steps, 216,000 training pairs/reconstructed A views and
+432,000 encoder views per arm. Across the three sequential arms it reports
+54,000 steps, 648,000 training pairs/reconstructed A views, 1,296,000 encoder
+views, 180 epoch validations and 540 monitor runs. It schedules 36 periodic plus
+four selected formal evaluations, 14 S3 diagnostics, and 40 tokenizer searches
+per frozen search region. Retries and recovery add work. These are counts, not
+an elapsed-time estimate or statistical power calculation.
+
+For preparation the owner accepted seed 20260926, a 0.5 sparse-input
+probability, 100 random-ranking repeats, 1,000 bootstrap repeats, two
+depth-cohort search regions and a five-voxel diagnostic threshold. A new
+record was prepared without training at
+`/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/streamed-overlap-60x300-seed20260926-prep-20261123-01/suite-inputs-60x300-20261123-01`;
+its logical configuration SHA-256 is
+`054cbbd38853c2a7753c19258b095520c4e236d438e8f0551ee62b3e25ba4a75`.
+Search binding reverified all 3,300 validation windows and 300 full-depth event
+regions. The two searches use distinct validation sources and `(64,64,128)`
+regions, stride 16 and 225 padded tokenizer windows each. Epoch reconstruction
+validation uses 20 query windows across ten sources and both depth cohorts.
+The preparation log is `logs/suite-inputs-60x300-20261123-01/training.log`; the
+runner marked it `preparation_complete_training_not_authorized`. The separate
+diagnostic manifest is bound, the historical guardrail runtime matches, and the
+suite directory does not yet exist. The settings file and private manifests
+remain in the same external preparation directory.
+
+One completed training step writes a separate provenance file. Two disposable
+S3 provenance files each used 524,288 allocated bytes on this destination, so
+54,000 such files would occupy about 28.31 GB (26.37 GiB) if allocation remains
+the same, excluding retries, directories and other files. An **illustrative**
+record-bound storage scenario using 100 MiB per checkpoint, 80 GiB for other
+output and a 100 GiB reserve required 213,301,329,920 bytes against
+970,464,428,032 bytes then available. Those allowances are not measured upper
+bounds, the example includes but does not independently prove sufficient space
+for provenance, and it does not reserve space or cover the separate log
+filesystem. Per-process MPS fraction 0.5 and 1,800-second evaluation limits
+are preparation settings, not aggregate memory or wall-time approval.
+
+A no-optimizer resource smoke ran the two pinned tokenizer searches against a
+copy of the disposable one-step S3 checkpoint and verified the original
+checkpoint remained unchanged. It passed in 234.62 seconds including input
+verification; completed search files occupied 25,720,981 logical bytes and
+25,931,776 allocated bytes on the internal temporary filesystem. Parent peak RSS
+was 1,249,361,920 bytes; sampled MPS driver allocation after completion was
+475,136 bytes. This does not include tokenizer-child peak, loaded TensorBoard,
+peak MPS memory, or external-volume allocation, and is not an end-to-end suite
+runtime forecast. The requested budget schedules 80 such tokenizer searches
+across 40 formal evaluation events, plus other work and retries.
+
+The previously reported E1 geology run used 450 batches per epoch, so this
+budget has the same number of optimizer steps as 40 such epochs; the earlier
+run had different data, objectives and initialization, so its runtime and
+outcome cannot be transferred to this streamed suite. The disposable full suite
+took 8,114 seconds for only one batch per arm plus its preflights, guardrails and
+smoke-only evaluations. The formal settings, number and extent of bounded
+searches, sparse-input mixture, thin-run diagnostic threshold, repetition
+counts, memory limit and disk allowances still need to be proposed and pinned.
+The existing suite-storage accounting retains 63, 63 and 64 checkpoints for
+S1, S2 and S3 respectively before transient copies and other outputs.
+
+The Mac reported 25,769,803,776 bytes physical memory; the external volume
+reported 947,730,944 KiB available and the local filesystem 110,776,940 KiB
+available. These are point-in-time capacities, not a reservation or proof
+of aggregate memory, storage or runtime headroom. The real-data integrated
+smoke has passed, but the public train/resume shell still has an unconditional
+execution block. Complete the concrete resource review and input binding,
+present the exact configuration and obtain separate launch approval before
+changing that gate or starting training. Additional semantic evaluation is not
+a prerequisite for this approved proxy experiment, but its results cannot on
+their own establish improved geological understanding.
+
 ## Local continuation: exploratory semantic-label feasibility
 
 The read-only `streamed_overlap_semantic_feasibility` samples existing primary
