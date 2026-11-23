@@ -1,6 +1,8 @@
 import copy
+from contextlib import redirect_stdout
 from dataclasses import asdict, replace
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -12,16 +14,19 @@ from scripts.streamed_overlap_audit import content_hash
 from scripts.streamed_overlap_epoch_runner import (
     SuiteInitialization, _suite_cosine_comparisons, _suite_pair_head_metric_checks,
 )
+from scripts.streamed_overlap_geometry_audit import audit_geometry
 from scripts.streamed_overlap_metrics import (
     calculate_rankings,
     compare_matched_cosine,
     event_coverage_diagnostics,
     linear_ndcg_at_10,
+    matched_cosine_cohort_diagnostics,
     paired_source_bootstrap,
     physical_overlap_diagnostics,
     retrieval_metric_gate,
     summarize_rankings,
 )
+from scripts.streamed_overlap_semantic_feasibility import sample_plan, summarize_sample
 
 
 def frozen_fixture():
@@ -83,6 +88,66 @@ def make_report(manifest, *, arm="S3", scorer="pair_head", experiment_seed=1, re
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_semantic_feasibility_samples_frozen_cross_source_windows(self):
+        manifest = frozen_fixture()
+        for query in manifest["queries"]:
+            for window in (query["window"], *(candidate["window"] for candidate in query["candidates"])):
+                window.update({"origin": [0, 0, 0], "shape": [2, 2, 2]})
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        groups = {}
+        for source in range(5):
+            groups[f"validation/source-{source}"] = {
+                "faulted_lithology": np.ones((2, 2, 2)),
+                "faults/faulted_channel_labels": np.zeros((2, 2, 2)),
+            }
+        groups["validation/other"] = {
+            "faulted_lithology": np.zeros((2, 2, 2)),
+            "faults/faulted_channel_labels": np.zeros((2, 2, 2), dtype=bool),
+        }
+        self.assertEqual(len(sample_plan(manifest)), 5)
+        result = summarize_sample(manifest, groups, max_wall_seconds=10)
+        self.assertEqual(result["queries_by_cohort"], {"shallower": 3, "deeper": 2})
+        self.assertEqual(result["cross_source_pairs"], 20)
+        self.assertEqual(result["sampled_windows"], 25)
+        self.assertEqual(result["query_sources_with_usable_pair"], 5)
+        self.assertEqual(result["cross_source_absolute_sand_fraction_difference"]["median"], 1.0)
+        self.assertEqual(result["windows_with_channel_voxels"], 0)
+        groups["validation/other"]["faulted_lithology"].fill(-1)
+        unavailable = summarize_sample(manifest, groups, max_wall_seconds=10)
+        self.assertEqual(unavailable["query_sources_with_usable_pair"], 0)
+        self.assertEqual(unavailable["cross_source_absolute_sand_fraction_difference"]["available_pairs"], 0)
+        self.assertIsNone(unavailable["cross_source_absolute_sand_fraction_difference"]["median"])
+        groups["validation/other"]["faulted_lithology"][0, 0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "Invalid"):
+            summarize_sample(manifest, groups, max_wall_seconds=10)
+
+    def test_geometry_oracle_audit_checks_manifest_and_measures_shortcut(self):
+        manifest = frozen_fixture()
+        for query in manifest["queries"]:
+            for candidate in query["candidates"]:
+                candidate["target"]["overlap"] = candidate["target"]["coverage"]
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        options = {
+            "expected_manifest_sha256": manifest["manifest_sha256"], "random_seed": 1, "random_repeats": 5,
+            "bootstrap_seed": 2, "bootstrap_repeats": 10,
+        }
+        result = audit_geometry(manifest, **options)
+        self.assertEqual(result["overlap_oracle_ndcg_at_10"], 1.0)
+        self.assertEqual(result["positive_coverage_pairs"], 600)
+        self.assertEqual(result["positive_coverage_pairs_with_zero_overlap"], 0)
+        with self.assertRaisesRegex(ValueError, "expected hash"):
+            audit_geometry(manifest, **{**options, "expected_manifest_sha256": "0" * 64})
+        manifest["queries"][0]["candidates"][3]["target"]["overlap"] = 0.1
+        manifest["manifest_sha256"] = content_hash({
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "zero overlap"):
+            audit_geometry(manifest, **{**options, "expected_manifest_sha256": manifest["manifest_sha256"]})
+
     def test_overlap_diagnostics_report_categories_bins_and_matched_baselines(self):
         manifest = frozen_fixture()
         for query in manifest["queries"]:
@@ -263,6 +328,32 @@ class RankingMetricTests(unittest.TestCase):
         comparison = compare_matched_cosine(candidate, s2, bootstrap_seed=4, bootstrap_repeats=20)
         self.assertGreater(comparison["mean_ndcg_gain_over_s2"], 0)
 
+    def test_matched_cosine_cohorts_expose_opposite_depth_effects(self):
+        manifest = frozen_fixture()
+        candidate = make_report(manifest, scorer="mu_cosine")
+        baseline = make_report(manifest, arm="S2", scorer="mu_cosine")
+        candidate = replace(candidate, rows=tuple(
+            replace(row, ndcg=0.7 if row.cohort == "shallower" else 0.3) for row in candidate.rows
+        ))
+        baseline = replace(baseline, rows=tuple(
+            replace(row, ndcg=0.5) for row in reversed(baseline.rows)
+        ))
+        result = matched_cosine_cohort_diagnostics(candidate, baseline, bootstrap_seed=4, bootstrap_repeats=20)
+        self.assertAlmostEqual(result["overall"]["mean_ndcg_gain_over_s2"], 0.0)
+        self.assertAlmostEqual(result["cohorts"]["shallower"]["mean_ndcg_difference"], 0.2)
+        self.assertAlmostEqual(result["cohorts"]["deeper"]["mean_ndcg_difference"], -0.2)
+        self.assertEqual(result["cohorts"]["deeper"]["sources"], 5)
+        self.assertAlmostEqual(result["cohorts"]["deeper"]["paired_source_bootstrap_95"][1], -0.2)
+        mismatched = replace(baseline, experiment_seed=2)
+        with self.assertRaisesRegex(ValueError, "matched-seed"):
+            matched_cosine_cohort_diagnostics(candidate, mismatched, bootstrap_seed=4, bootstrap_repeats=20)
+        short = replace(candidate, rows=tuple(row for row in candidate.rows if row.cohort != "deeper"))
+        with self.assertRaisesRegex(ValueError, "eligibility floors"):
+            matched_cosine_cohort_diagnostics(
+                short, replace(baseline, rows=tuple(row for row in baseline.rows if row.cohort != "deeper")),
+                bootstrap_seed=4, bootstrap_repeats=20,
+            )
+
     def test_suite_reports_selected_cosine_comparisons_and_detects_changed_report(self):
         manifest = frozen_fixture()
         config = {"random_seed": 17, "random_repeats": 5, "bootstrap_seed": 4, "bootstrap_repeats": 20}
@@ -326,7 +417,13 @@ class RankingMetricTests(unittest.TestCase):
                     }
                     matched["sha256"] = content_hash(matched)
                     results[arm]["matched_streams"] = {"record": matched}
-            result = _suite_cosine_comparisons(results, suite, manifest, config)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = _suite_cosine_comparisons(results, suite, manifest, config)
+            diagnostic = json.loads(output.getvalue())
+            self.assertEqual(diagnostic["schema"], "streamed-final-encoder-cohort-diagnostics-v1")
+            self.assertEqual(diagnostic["sources"]["S3_final"], result["sources"]["S3_final"])
+            self.assertLess(diagnostic["diagnostics"]["cohorts"]["shallower"]["mean_ndcg_difference"], 0)
             self.assertGreater(result["comparisons"]["S2_reconstruction_vs_S1_reconstruction"][
                 "mean_ndcg_gain_over_s1"], 0)
             self.assertLess(result["comparisons"]["S3_reconstruction_vs_S2_reconstruction"][

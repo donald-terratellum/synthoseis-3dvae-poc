@@ -1,6 +1,104 @@
 # Copilot handoff: streamed overlap and directional semantic retrieval
 
-Updated: 2026-11-22.
+Updated: 2026-11-23.
+
+## Local continuation: exploratory semantic-label feasibility
+
+The read-only `streamed_overlap_semantic_feasibility` samples existing primary
+validation windows, selecting one eligible query per sorted source before label
+inspection, alternating depth cohorts, and including all frozen cross-source
+candidates. It uses the existing corrected lithology/channel masks, not the
+event-coverage target or an encoder. The command was:
+
+```sh
+.venv/bin/python -m scripts.streamed_overlap_semantic_feasibility \
+  --source-root /Volumes/CrucialX9/fake_data \
+  --manifest /Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+  --manifest-sha256 13a5ef4f27c1ec0ab9da53168ee1e765f2e8cc94c74e3761c3e573e9c4c9d6c7 \
+  --max-wall-seconds 300
+```
+
+In this small, nonrepresentative sample, 25 query sources yielded 100
+cross-source pairs and 125 sampled windows. Of those windows, 105 contained rock;
+22 query sources had at least one pair with rock in both windows. Corrected sand
+fraction of rock ranged from 0 to 0.9515, with median 0.1669. Across 76 usable
+pairs, absolute fraction differences ranged from 0 to 0.9245, median 0.1309.
+Only three sampled windows, from three sources, contained any channel voxels.
+These are correlated window observations, not 125 independent realizations or
+evidence that a channel task has adequate class support.
+
+The manifest hash and validation source inventory were checked. The sampled
+lithology/channel arrays were not fingerprint-verified, and saved-source
+generation provenance and seismic-to-label agreement remain limited as described
+in the target proposal. The sample does not establish a valid geological target,
+source-level statistical power, or train/test yield. The 300-second limit is
+checked between reads, not a hard watchdog. No training, final-test read, model
+evaluation, new retrieval gate, or production approval occurred.
+
+An option for owner review is a fixed-encoder, source-disjoint supervised probe
+of corrected sand fraction, with matched S2 and S3 encoders and the same
+predeclared probe fitting, input preprocessing and evaluation protocol. This
+would test a different coarse geological property than event coverage, but
+not geological understanding generally. Alternatively, a cross-source
+similarity evaluation would need an independently justified relevance rule;
+the current zero cross-source coverage labels cannot supply it. In either
+case, source-level splits, no-rock handling, baseline/control models, checkpoint
+selection, source-cluster uncertainty, independent-seed replication, adequate
+yield, and final-test isolation must be specified before scoring. Do not select
+thresholds, fit probes, repurpose final-test data, or alter the approved gate
+based on this exploratory sample without the separate scientific decision.
+
+Semantic-feasibility, diagnostics, metrics, runner, initialization and recovery
+regressions passed: 125 tests, six skipped and 65 subtests. Train/resume remains
+blocked pending a training budget, formal settings, aggregate resource review
+and separate launch approval.
+
+## Local continuation: encoder interpretation and geometry shortcut
+
+The matched final S3-S2 encoder mu-cosine comparison now also prints exploratory
+shallower/deeper query-cohort differences and paired source-cluster intervals in
+the combined run log, with the frozen manifest and checkpoint/report identities.
+These are query-weighted, unadjusted exploratory intervals, not a new success
+gate. The existing immutable comparison report and pair-head criteria are
+unchanged, so evaluation recovery does not rewrite those reports. A depth
+breakdown does not resolve a geometry shortcut.
+
+The new read-only geometry audit ranks the frozen validation candidates using
+their **ground-truth physical overlap**, not an encoder or a deployable model:
+
+```sh
+.venv/bin/python -m scripts.streamed_overlap_geometry_audit \
+  --manifest /Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+  --manifest-sha256 13a5ef4f27c1ec0ab9da53168ee1e765f2e8cc94c74e3761c3e573e9c4c9d6c7 \
+  --random-seed 20261123 --random-repeats 100 \
+  --bootstrap-seed 20261123 --bootstrap-repeats 1000
+```
+
+The hash-checked manifest contains 300 eligible queries from 25 sources: 900
+same-source overlapping, 900 same-source disjoint and 1,200 cross-source pairs.
+All 900 positive-coverage pairs overlap. The overlap oracle's NDCG@10 was **1.0
+for every query**, versus a descriptive repeated-random mean of 0.60358; its
+query-weighted gain was 0.39642 with source-cluster interval [0.39467, 0.39806].
+The three positive overlaps per query are 0.5, 0.75 and 0.875, and their coverage
+increased strictly in that order for every query. This reads the frozen labels,
+not the source cubes; it does not reverify source fingerprints. The audit's
+seeds and repeats are exploratory and do not replace frozen formal settings.
+
+Consequently this validation ranking cannot distinguish improved geological
+semantics from better recognition of spatial correspondence or overlap.
+Matched S3-S2 still measures the added task's effect on this encoder **proxy**;
+it does not by itself establish geological semantic understanding. Different-source
+candidates are zero-target negatives, not evidence about cross-volume analogs.
+Before claiming semantic improvement, a separately designed, predeclared
+geometry-controlled evaluation with suitable independent geological labels and
+held-out sources is needed; its feasibility, design and criteria require owner
+review, not retrospective alteration of the approved retrieval gate or use of
+the untouched final test for development.
+
+The geometry audit, comparison and recovery regressions passed: 119 tests,
+six skipped and 65 subtests. No training or model evaluation was run. Budget,
+formal settings, aggregate resource review and separate launch approval remain
+open; train/resume stays blocked.
 
 ## Local continuation: formal resource and storage evidence
 

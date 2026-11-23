@@ -436,6 +436,39 @@ def compare_matched_cosine(
     }
 
 
+def matched_cosine_cohort_diagnostics(
+    candidate: RankingReport, baseline: RankingReport, *, bootstrap_seed: int, bootstrap_repeats: int,
+) -> dict:
+    """Explore depth-cohort encoder differences without changing the retrieval gate."""
+    overall = compare_matched_cosine(
+        candidate, baseline, bootstrap_seed=bootstrap_seed, bootstrap_repeats=bootstrap_repeats,
+    )
+    matched = _matched_rows(candidate, baseline)
+    cohorts = {}
+    for cohort in COHORTS:
+        pairs = [(row, reference) for row, reference in zip(candidate.rows, matched) if row.cohort == cohort]
+        rows = tuple(row for row, _ in pairs)
+        if len(rows) < MIN_COHORT_QUERIES or len({row.source_id for row in rows}) < MIN_COHORT_SOURCES:
+            raise ValueError("Matched cosine diagnostics require the frozen cohort eligibility floors.")
+        differences = [row.ndcg - reference.ndcg for row, reference in pairs]
+        cohorts[cohort] = {
+            "queries": len(rows),
+            "sources": len({row.source_id for row in rows}),
+            "mean_ndcg_difference": float(np.mean(differences)),
+            "paired_source_bootstrap_95": list(paired_source_bootstrap(
+                rows, differences, seed=bootstrap_seed, repeats=bootstrap_repeats,
+            )),
+        }
+    return {
+        "overall": overall,
+        "cohorts": cohorts,
+        "limitation": (
+            "Exploratory query-weighted depth cohorts; intervals are not multiplicity-adjusted. "
+            "Event-coverage proxy only, not a geological-understanding or adoption test."
+        ),
+    }
+
+
 def retrieval_metric_gate(
     primary: RankingReport, *, bootstrap_seed: int, bootstrap_repeats: int,
     replication: RankingReport | None,

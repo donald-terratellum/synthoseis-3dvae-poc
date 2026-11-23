@@ -35,7 +35,8 @@ from scripts.streamed_overlap_matching import (
     verify_matched_arm_records, verify_saved_suite_initialization, verify_suite_run_metadata,
 )
 from scripts.streamed_overlap_metrics import (
-    QueryRanking, RankingReport, _eligible_queries, compare_matched_cosine, retrieval_metric_gate, summarize_rankings,
+    QueryRanking, RankingReport, _eligible_queries, compare_matched_cosine, matched_cosine_cohort_diagnostics,
+    retrieval_metric_gate, summarize_rankings,
 )
 from scripts.streamed_overlap_model import StreamedPairVAE, build_optimizer, fresh_e1_model
 from scripts.streamed_overlap_reconstruction import (
@@ -1273,6 +1274,16 @@ def _suite_cosine_comparisons(results: dict, initialization: SuiteInitialization
             raise ValueError("Saved cosine comparison differs from current evaluation.")
     else:
         _save_report(path.parent, path.name, result)
+    print(json.dumps({
+        "schema": "streamed-final-encoder-cohort-diagnostics-v1",
+        "manifest_sha256": manifest["manifest_sha256"],
+        "sources": {key: sources[key] for key in ("S3_final", "S2_final")},
+        "diagnostics": matched_cosine_cohort_diagnostics(
+            rankings["S3_final"], rankings["S2_final"],
+            bootstrap_seed=formal_config["bootstrap_seed"],
+            bootstrap_repeats=formal_config["bootstrap_repeats"],
+        ),
+    }, sort_keys=True, allow_nan=False), flush=True)
     return result
 
 
