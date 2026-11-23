@@ -2,6 +2,52 @@
 
 Updated: 2026-11-22.
 
+## Local continuation: record-bound S1 completion
+
+An opt-in disposable MPS integration smoke now connects the real prepared suite
+and its validation, search, diagnostics and historical guardrail preflights to
+an S1 interruption and resume. It interrupts after the first optimizer call,
+replays the same 12-pair step, verifies its journal link and loss, then completes
+the epoch and primary validation. The real final-epoch and selected-checkpoint
+formal paths each score all 300 eligible queries with encoder mu-cosine and run
+one bounded tokenizer search. The selected, guardrail-bound S1 checkpoint is
+measured on all 5,000 synthetic and 5,000 historical real patches and compared
+with P0b through the actual completion orchestration. The smoke stops before
+S2 trains; S2 and S3 remain at epoch zero with empty journals. It reuses and
+stops its owned TensorBoard service and removes the temporary suite.
+
+```sh
+PYTORCH_ENABLE_MPS_FALLBACK=0 \
+STREAMED_REAL_RUNNER_FULL_S1_SMOKE=1 \
+STREAMED_REAL_RUNNER_SMOKE_CONFIG=scripts/streamed_overlap_smoke.example.json \
+STREAMED_REAL_RUNNER_VALIDATION_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/validation-manifest-seed-20260926-20261121-v4/validation_manifest.json \
+STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST=/Volumes/CrucialX9/3dvae-poc_checkpoints/streamed_overlap/historical-reconstruction-guardrail-20261122-05/manifest.json \
+STREAMED_REAL_PREFLIGHT_CHECKPOINT=checkpoints/geoaware_p0b_r2_seed20260926_r2/vae_best.pt \
+  .venv/bin/python -m pytest -q -s tests/test_streamed_overlap_initialization.py \
+  -k real_prepared_s1_replay_formal_and_guardrail_on_mps
+```
+
+The test passed in 2,489.66 seconds; it made exactly two S1 optimizer calls,
+one committed. The P0b-only numeric comparison was `FAIL`, not an experiment
+outcome or adoption decision. Peak process RSS was 1,991,131,136 bytes and MPS
+driver allocation sampled afterward was 2,327,707,648 bytes. The latter is not
+a peak and neither includes aggregate TensorBoard/tokenizer-subprocess memory.
+The limits are per operation, not a whole-process watchdog; the one-batch
+budget, one search, two random/bootstrap repeats and one-byte disk floors are
+smoke-only settings, not production resource approval.
+
+This validates the S1 path, not matched S1/S2/S3 completion, the S3 pair-head
+path, or evaluation-only recovery of a completed suite. It cannot answer whether
+event-coverage supervision improves the encoder's geological representations:
+coverage is an observable-event proxy, and the intended comparison is S3 vs
+matched S2 with encoder mu-cosine reported separately from the trained head.
+Historical real patches are post-selection reconstruction guardrails, not the
+untouched final test. Focused runner, initialization, epoch, guardrail,
+evaluation, matching and checkpoint regressions passed (170 tests, seven
+skipped, 80 subtests). Full matched-suite integration, aggregate resource
+review, independent-seed replication, an explicit training budget and separate
+launch approval remain outstanding; public train/resume execution stays blocked.
+
 ## Local continuation: selected S3 reconstruction guardrail smoke
 
 An opt-in MPS smoke copies the one-step disposable S3 checkpoint, journal,

@@ -622,6 +622,21 @@ class ArmInitializationTests(unittest.TestCase):
         "Explicit real-data preflight smoke configuration and historical checkpoint are required",
     )
     def test_real_prepared_runner_preflights_before_optimizer_on_mps(self):
+        self._real_prepared_runner_smoke(continue_s1=False)
+
+    @unittest.skipUnless(
+        os.environ.get("STREAMED_REAL_RUNNER_FULL_S1_SMOKE") == "1"
+        and os.environ.get("STREAMED_REAL_RUNNER_SMOKE_CONFIG")
+        and os.environ.get("STREAMED_REAL_RUNNER_VALIDATION_MANIFEST")
+        and os.environ.get("STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST")
+        and os.environ.get("STREAMED_REAL_PREFLIGHT_CHECKPOINT")
+        and torch.backends.mps.is_available(),
+        "Explicit disposable S1 integration smoke configuration and MPS are required",
+    )
+    def test_real_prepared_s1_replay_formal_and_guardrail_on_mps(self):
+        self._real_prepared_runner_smoke(continue_s1=True)
+
+    def _real_prepared_runner_smoke(self, *, continue_s1):
         config = json.loads(Path(os.environ["STREAMED_REAL_RUNNER_SMOKE_CONFIG"]).read_text())
         manifest_path = Path(os.environ["STREAMED_REAL_RUNNER_VALIDATION_MANIFEST"]).resolve()
         guardrail_path = Path(os.environ["STREAMED_REAL_RUNNER_GUARDRAIL_MANIFEST"]).resolve()
@@ -642,7 +657,22 @@ class ArmInitializationTests(unittest.TestCase):
             "final_epoch": 1, "batches_per_epoch": 1, "sparse_probability": config["sparse_probability"],
         }
         started = time.monotonic()
-        with patch.object(torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step")):
+        with ExitStack() as stack:
+            optimizer_calls = []
+            if continue_s1:
+                original_step = torch.optim.AdamW.step
+
+                def bounded_step(optimizer, *args, **kwargs):
+                    optimizer_calls.append(1)
+                    if len(optimizer_calls) > 2:
+                        raise AssertionError("Disposable smoke exceeded two optimizer calls")
+                    return original_step(optimizer, *args, **kwargs)
+
+                stack.enter_context(patch.object(torch.optim.AdamW, "step", autospec=True, side_effect=bounded_step))
+            else:
+                stack.enter_context(patch.object(
+                    torch.optim.AdamW, "step", side_effect=AssertionError("optimizer must not step"),
+                ))
             print("Smoke: freezing disposable search and diagnostics inputs.", flush=True)
             groups = open_validation_sources(source, manifest)
             search = freeze_search_manifest(
@@ -707,9 +737,12 @@ class ArmInitializationTests(unittest.TestCase):
 
             print("Smoke: running actual suite preflights, stopping at the first arm.", flush=True)
             try:
-                with patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
-                           side_effect=KeyboardInterrupt) as train, \
-                     patch.object(runner, "start_tensorboard", side_effect=start_service):
+                if continue_s1:
+                    interruption = patch.object(training, "monitor_streamed_pairs", side_effect=KeyboardInterrupt)
+                else:
+                    interruption = patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
+                                         side_effect=KeyboardInterrupt)
+                with interruption as interrupted, patch.object(runner, "start_tensorboard", side_effect=start_service):
                     with self.assertRaises(KeyboardInterrupt):
                         runner.training_attempt(
                             record_path, suite, logs, logs, matching["run_id"], resume=False,
@@ -717,18 +750,88 @@ class ArmInitializationTests(unittest.TestCase):
                             mps_memory_fraction=config["mps_memory_fraction"],
                             min_suite_free_bytes=1, min_log_free_bytes=1,
                         )
-                train.assert_called_once()
+                interrupted.assert_called_once()
                 self.assertEqual(json.loads((logs / "run_manifest.json").read_text())["status"], "interrupted")
                 self.assertTrue(runner.ready(owners[0]))
                 for arm in ("S1", "S2", "S3"):
                     state = torch.load(suite / arm / "last.pt", map_location="cpu", weights_only=True)
                     self.assertEqual(state["completed_epoch"], 0)
                     with (suite / arm / "batch_metrics.csv").open(newline="") as stream:
-                        self.assertEqual(list(csv.DictReader(stream)), [])
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual(len(rows), int(continue_s1 and arm == "S1"))
                 self.assertFalse((logs / "evaluation_receipt.json").exists())
+                if continue_s1:
+                    with (suite / "S1" / "batch_metrics.csv").open(newline="") as stream:
+                        stale = list(csv.DictReader(stream))
+                    resume_logs = self.source.parent / "real-preflight-resume-logs"
+                    resume_logs.mkdir()
+                    real_train = training.train_streamed_epoch
+
+                    def stop_before_s2(*args, **kwargs):
+                        if args[0].arm != "S1":
+                            raise KeyboardInterrupt
+                        return real_train(*args, **kwargs)
+
+                    print("Smoke: replaying S1 through real formal and guardrail completion.", flush=True)
+                    with patch("scripts.streamed_overlap_epoch_runner.train_streamed_epoch",
+                               side_effect=stop_before_s2), \
+                         patch.object(runner, "start_tensorboard", side_effect=start_service):
+                        with self.assertRaises(KeyboardInterrupt):
+                            runner.training_attempt(
+                                record_path, suite, resume_logs, logs, "disposable-s1-replay", resume=True,
+                                config_sha256=prepared["config_sha256"], epochs=1, batches_per_epoch=1,
+                                mps_memory_fraction=config["mps_memory_fraction"],
+                                min_suite_free_bytes=1, min_log_free_bytes=1,
+                            )
+                    self.assertEqual(json.loads((resume_logs / "run_manifest.json").read_text())["status"],
+                                     "interrupted")
+                    checkpoint = suite / "S1" / "last.pt"
+                    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                    self.assertEqual((state["completed_epoch"], state["journal"]["cumulative_exposure"]), (1, 12))
+                    with (suite / "S1" / "batch_metrics.csv").open(newline="") as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual(len(rows), 2)
+                    self.assertEqual(len(optimizer_calls), 2)
+                    self.assertEqual(rows[1]["replay_of_event"], stale[0]["event_id"])
+                    self.assertTrue(math.isclose(float(rows[0]["total_loss"]), float(rows[1]["total_loss"]),
+                                                 rel_tol=1e-6, abs_tol=1e-6))
+                    evaluation = suite / "S1" / "evaluation"
+                    records = []
+                    for directory in (
+                        evaluation / "completed", evaluation / "selected-reconstruction" / "completed",
+                        evaluation / "guardrail-reconstruction" / "completed",
+                    ):
+                        paths = list(directory.glob("*.json"))
+                        self.assertEqual(len(paths), 1)
+                        records.append(json.loads(paths[0].read_text()))
+                    for directory, record in zip(
+                        (evaluation, evaluation / "selected-reconstruction"), records[:2],
+                    ):
+                        retrieval = json.loads((directory / record["artifacts"]["retrieval"]["path"]).read_text())
+                        self.assertEqual(set(retrieval["scorers"]), {"mu_cosine"})
+                        self.assertEqual(len(retrieval["scorers"]["mu_cosine"]["rows"]),
+                                         len(_eligible_queries(manifest)))
+                    measurement = json.loads((
+                        evaluation / "guardrail-reconstruction" / records[2]["measurement"]["path"]
+                    ).read_text())
+                    self.assertEqual(len(measurement["datasets"]["synthetic"]), 5000)
+                    self.assertEqual(len(measurement["datasets"]["real"]), 5000)
+                    comparisons = list((evaluation / "guardrail-reconstruction" / "comparisons").glob("*.json"))
+                    self.assertEqual(len(comparisons), 1)
+                    comparison = json.loads(comparisons[0].read_text())
+                    self.assertEqual(set(comparison["comparison"]["comparisons"]), {"P0b"})
+                    self.assertIn(comparison["comparison"]["status"], {"PASS_NUMERIC_ONLY", "FAIL"})
+                    self.assertEqual(owners[0]["pid"], owners[1]["pid"])
+                    for arm in ("S2", "S3"):
+                        state = torch.load(suite / arm / "last.pt", map_location="cpu", weights_only=True)
+                        self.assertEqual(state["completed_epoch"], 0)
+                        with (suite / arm / "batch_metrics.csv").open(newline="") as stream:
+                            self.assertEqual(list(csv.DictReader(stream)), [])
                 print(json.dumps({
-                    "status": "DISPOSABLE_PREPARED_RUNNER_PREFLIGHT_PASSED",
-                    "optimizer_steps": 0, "searches": len(search["searches"]),
+                    "status": ("DISPOSABLE_PREPARED_S1_COMPLETION_PASSED" if continue_s1
+                               else "DISPOSABLE_PREPARED_RUNNER_PREFLIGHT_PASSED"),
+                    "optimizer_steps": 2 if continue_s1 else 0, "searches": len(search["searches"]),
+                    "p0b_only_numeric_status": comparison["comparison"]["status"] if continue_s1 else None,
                     "diagnostic_windows": len(diagnostics["windows"]),
                     "validation_manifest_sha256": manifest["manifest_sha256"],
                     "elapsed_seconds": time.monotonic() - started,
